@@ -27,6 +27,24 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const TARGET = Object.freeze({ x: 5.2, y: 1.8, z: 2.0 });
 
+function nextPaint() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function readFileWithProgress(file, onProgress) {
+  if (typeof FileReader === 'undefined') return file.arrayBuffer();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onprogress = (event) => {
+      if (event.lengthComputable && event.total) onProgress?.(event.loaded / event.total);
+    };
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('读取模型文件失败'));
+    reader.onabort = () => reject(new Error('读取模型文件已取消'));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
 export class ModelPreview {
   constructor(canvas, onStats) {
     this.canvas = canvas;
@@ -71,6 +89,7 @@ export class ModelPreview {
     this.controls.target.set(0, 0.8, 0);
     this.controls.minDistance = 2;
     this.controls.maxDistance = 40;
+    this.orbitLocks = new Set();
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0x7d8ca3, 2.25);
     this.scene.add(hemi);
@@ -254,11 +273,17 @@ export class ModelPreview {
     this.scene.add(sprite);
   }
 
-  async load(file) {
-    const bytes = await file.arrayBuffer();
+  async load(file, onProgress = null) {
+    const report = (progress, label, indeterminate = false) => onProgress?.({ progress, label, indeterminate });
+    report(0.04, '正在读取模型文件');
+    const bytes = await readFileWithProgress(file, (ratio) => report(0.04 + ratio * 0.22, '正在读取模型文件'));
+    report(0.3, '正在解析模型与纹理', true);
+    await nextPaint();
     const gltf = await new Promise((resolve, reject) => {
       new GLTFLoader().parse(bytes, '', resolve, reject);
     });
+    report(0.64, '正在建立预览场景');
+    await nextPaint();
     this.disposeModel();
     this.original = bytes.slice(0);
     this.deviceMode = false;
@@ -266,11 +291,14 @@ export class ModelPreview {
     this.loadedAnimations = gltf.animations || [];
     this.model.name = 'CS_Car';
     this.scene.add(this.model);
+    report(0.72, '正在分析模型朝向');
     const orientation = inferModelFront(this.model);
     this.rotation = { x: 0, y: orientation.rotationY, z: 0 };
     this.normalize();
     this.frameObject();
-    await this.indexNodes(gltf);
+    report(0.82, '正在建立部件索引');
+    await this.indexNodes(gltf, (ratio) => report(0.82 + ratio * 0.1, '正在建立部件索引'));
+    report(0.94, '正在统计模型信息');
     const stats = collectStats(gltf, file.size);
     this.onStats?.(stats);
     return { gltf, bytes, stats, orientation };
@@ -280,19 +308,22 @@ export class ModelPreview {
    * 建立 glTF 节点索引 → Three 对象的映射。
    * 用 parser.getDependency 而不是按名字匹配，因为节点名可能重复或缺失。
    */
-  async indexNodes(gltf) {
+  async indexNodes(gltf, onProgress = null) {
     this.nodeObjects = [];
     this.nodeObjectSet = null;
     this.selectionMeshes = new Map();
     this.gltfJson = gltf.parser?.json || null;
     const nodes = gltf.parser?.json?.nodes || [];
+    const progressStride = Math.max(1, Math.ceil(nodes.length / 80));
     for (let i = 0; i < nodes.length; i++) {
       try {
         this.nodeObjects[i] = await gltf.parser.getDependency('node', i);
       } catch {
         this.nodeObjects[i] = null;
       }
+      if ((i + 1) % progressStride === 0 || i === nodes.length - 1) onProgress?.((i + 1) / nodes.length);
     }
+    if (!nodes.length) onProgress?.(1);
     this.nodeObjects.forEach((_, nodeIndex) => {
       this.meshesOfNode(nodeIndex).forEach((mesh, primitiveIndex) => {
         if (!mesh?.geometry) return;
@@ -384,11 +415,15 @@ export class ModelPreview {
   /** 精细选面工作台：selection 以原始节点/primitive/triangle ordinal 保存。 */
   setTriangleSelection(enabled, selection, options = {}) {
     if (!enabled) {
+      const pointerId = this.selectionPointer?.pointerId;
       this.selectionState = null;
       this.selectionPointer = null;
       this.canvas.style.cursor = '';
       this.clearSelectionOverlay();
-      this.controls.enabled = true;
+      this.setOrbitLocked('triangle-selection', false);
+      if (pointerId !== undefined && this.canvas.hasPointerCapture?.(pointerId)) {
+        this.canvas.releasePointerCapture(pointerId);
+      }
       return;
     }
     this.selectionState = {
@@ -406,34 +441,53 @@ export class ModelPreview {
     this.emitSelectionStatus('ready');
     if (this.selectionPointerWired) return;
     this.selectionPointerWired = true;
-    let downAt = null;
     this.canvas.addEventListener('pointerdown', (event) => {
       if (!this.selectionState) return;
-      downAt = [event.clientX, event.clientY];
-      this.selectionPointer = { active: true, busy: false, pointerId: event.pointerId };
+      const painting = this.selectionState.mode === 'brush' && this.hasSelectableSurfaceAt(event.clientX, event.clientY);
+      this.selectionPointer = {
+        active: true,
+        busy: false,
+        painting,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+      };
+      // 智能点选只把短点击识别为选面，拖动仍交给 OrbitControls。
+      // 画笔从空白处起笔时同样用于转动视角，只有落在模型上才锁定相机并涂选。
+      if (!painting) return;
       this.canvas.setPointerCapture?.(event.pointerId);
-      this.controls.enabled = false;
-      if (this.selectionState.mode === 'brush') this.applyBrushAt(event.clientX, event.clientY);
+      this.setOrbitLocked('triangle-selection', true);
+      this.applyBrushAt(event.clientX, event.clientY);
     });
     this.canvas.addEventListener('pointermove', (event) => {
       if (!this.selectionState || !this.selectionPointer?.active) return;
-      if (this.selectionState.mode !== 'brush') return;
+      if (this.selectionState.mode !== 'brush' || !this.selectionPointer.painting) return;
       if (this.selectionPointer.busy) return;
       this.selectionPointer.busy = true;
       this.applyBrushAt(event.clientX, event.clientY).finally(() => {
         if (this.selectionPointer) this.selectionPointer.busy = false;
       });
     });
-    this.canvas.addEventListener('pointerup', (event) => {
-      if (!this.selectionState || !downAt) return;
-      const moved = Math.hypot(event.clientX - downAt[0], event.clientY - downAt[1]);
-      const mode = this.selectionState.mode;
+    const finishPointer = (event, cancelled = false) => {
       const pointer = this.selectionPointer;
+      if (!pointer || (event.pointerId !== undefined && event.pointerId !== pointer.pointerId)) return;
+      const moved = Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY);
+      const mode = this.selectionState.mode;
       this.selectionPointer = null;
-      this.controls.enabled = true;
-      if (mode === 'smart' && moved <= 7) this.selectSmartTriangle(event.clientX, event.clientY);
-      if (pointer?.pointerId !== undefined) this.canvas.releasePointerCapture?.(pointer.pointerId);
-      downAt = null;
+      this.setOrbitLocked('triangle-selection', false);
+      if (this.canvas.hasPointerCapture?.(pointer.pointerId)) this.canvas.releasePointerCapture(pointer.pointerId);
+      if (!cancelled && mode === 'smart' && moved <= 7) this.selectSmartTriangle(event.clientX, event.clientY);
+    };
+    this.canvas.addEventListener('pointerup', (event) => {
+      if (!this.selectionState) return;
+      finishPointer(event);
+    });
+    this.canvas.addEventListener('pointercancel', (event) => finishPointer(event, true));
+    // OrbitControls owns the normal pointer capture for smart clicks and releases
+    // it before pointerup reaches this listener; only a painting gesture needs
+    // capture-loss recovery here.
+    this.canvas.addEventListener('lostpointercapture', (event) => {
+      if (this.selectionPointer?.painting) finishPointer(event, true);
     });
   }
 
@@ -539,6 +593,24 @@ export class ModelPreview {
       return { ...hit, mesh: hit.object, triangle, meta: this.selectionMeshes.get(hit.object) };
     }
     return null;
+  }
+
+  hasSelectableSurfaceAt(clientX, clientY) {
+    if (!this.model) return false;
+    const rect = this.canvas.getBoundingClientRect();
+    const pointer = new THREE.Vector2(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    const raycaster = new THREE.Raycaster();
+    raycaster.firstHitOnly = true;
+    raycaster.setFromCamera(pointer, this.camera);
+    return raycaster.intersectObject(this.model, true).some((hit) => (
+      !hit.object.userData?.selectionOverlay
+      && this.selectionMeshes.has(hit.object)
+      && hit.object.visible
+      && hit.object.parent?.visible !== false
+    ));
   }
 
   async selectSmartTriangle(clientX, clientY) {
@@ -897,6 +969,43 @@ export class ModelPreview {
 
   /* ---------- 区域框选 ---------- */
 
+  setOrbitLocked(owner, locked) {
+    if (locked) this.orbitLocks.add(owner);
+    else this.orbitLocks.delete(owner);
+    this.controls.enabled = this.orbitLocks.size === 0;
+  }
+
+  wireTransformGizmo(gizmo, onCommit) {
+    let disposed = false;
+    const handleDragging = (event) => {
+      this.setOrbitLocked(gizmo, Boolean(event.value));
+      if (!event.value && !disposed) onCommit?.();
+    };
+    const recover = () => {
+      if (disposed) return;
+      if (gizmo.dragging) gizmo.pointerUp(null);
+      this.setOrbitLocked(gizmo, false);
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState !== 'visible') recover();
+    };
+    gizmo.addEventListener('dragging-changed', handleDragging);
+    this.canvas.addEventListener('pointercancel', recover);
+    this.canvas.addEventListener('lostpointercapture', recover);
+    window.addEventListener('blur', recover);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      disposed = true;
+      if (gizmo.dragging) gizmo.pointerUp(null);
+      this.setOrbitLocked(gizmo, false);
+      gizmo.removeEventListener('dragging-changed', handleDragging);
+      this.canvas.removeEventListener('pointercancel', recover);
+      this.canvas.removeEventListener('lostpointercapture', recover);
+      window.removeEventListener('blur', recover);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }
+
   /**
    * 显示可拖拽缩放的选区盒。盒子挂在场景根，位置与尺寸就是世界坐标
    * （= 车机最终空间），与 listParts 的包围盒、打包时的切分空间一致。
@@ -926,22 +1035,19 @@ export class ModelPreview {
     // 触屏上手柄太小很难点中，放大一档
     if (window.matchMedia?.('(pointer: coarse)').matches) gizmo.setSize(1.4);
     gizmo.attach(box);
-    // 拖拽 gizmo 时必须停掉轨道控制，否则会同时旋转视角
-    gizmo.addEventListener('dragging-changed', (event) => {
-      this.controls.enabled = !event.value;
-      if (!event.value) {
-        // 缩放手柄拖过零点会得到负值，视觉上盒子照样存在但 min/max 颠倒，必须归正
-        box.scale.set(
-          Math.max(Math.abs(box.scale.x), 1e-4),
-          Math.max(Math.abs(box.scale.y), 1e-4),
-          Math.max(Math.abs(box.scale.z), 1e-4),
-        );
-        onChange?.(this.getRegionBounds());
-      }
+    // 仅在真正拖动手柄时停掉轨道控制；触摸被系统取消时也会自动恢复。
+    const cleanupGizmo = this.wireTransformGizmo(gizmo, () => {
+      // 缩放手柄拖过零点会得到负值，视觉上盒子照样存在但 min/max 颠倒，必须归正
+      box.scale.set(
+        Math.max(Math.abs(box.scale.x), 1e-4),
+        Math.max(Math.abs(box.scale.y), 1e-4),
+        Math.max(Math.abs(box.scale.z), 1e-4),
+      );
+      onChange?.(this.getRegionBounds());
     });
     const helper = gizmo.getHelper ? gizmo.getHelper() : gizmo;
     this.scene.add(helper);
-    this.regionBox = { box, gizmo, helper, onChange };
+    this.regionBox = { box, gizmo, helper, onChange, cleanupGizmo };
     onChange?.(this.getRegionBounds());
   }
 
@@ -962,14 +1068,14 @@ export class ModelPreview {
 
   hideRegionBox() {
     if (!this.regionBox) return;
-    const { box, gizmo, helper } = this.regionBox;
+    const { box, gizmo, helper, cleanupGizmo } = this.regionBox;
+    cleanupGizmo?.();
     gizmo.detach();
     gizmo.dispose?.();
     helper.removeFromParent();
     box.removeFromParent();
     box.geometry.dispose();
     box.material.dispose();
-    this.controls.enabled = true;
     this.regionBox = null;
   }
 
@@ -1151,16 +1257,14 @@ export class ModelPreview {
       gizmo.setMode('translate');
       if (window.matchMedia?.('(pointer: coarse)').matches) gizmo.setSize(1.4);
       gizmo.attach(marker);
-      gizmo.addEventListener('dragging-changed', (event) => {
-        this.controls.enabled = !event.value;
-        if (!event.value) {
-          this.pivotMarker?.onChange?.([marker.position.x, marker.position.y, marker.position.z]);
-        }
+      const cleanupGizmo = this.wireTransformGizmo(gizmo, () => {
+        this.pivotMarker?.onChange?.([marker.position.x, marker.position.y, marker.position.z]);
       });
       const helper = gizmo.getHelper ? gizmo.getHelper() : gizmo;
       this.scene.add(helper);
       this.pivotMarker.gizmo = gizmo;
       this.pivotMarker.helper = helper;
+      this.pivotMarker.cleanupGizmo = cleanupGizmo;
     }
   }
 
@@ -1183,7 +1287,8 @@ export class ModelPreview {
 
   hidePivotMarker() {
     if (!this.pivotMarker) return;
-    const { marker, gizmo, helper } = this.pivotMarker;
+    const { marker, gizmo, helper, cleanupGizmo } = this.pivotMarker;
+    cleanupGizmo?.();
     gizmo?.detach();
     gizmo?.dispose?.();
     helper?.removeFromParent();

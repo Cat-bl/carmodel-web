@@ -4,6 +4,7 @@ import { makeBydCar, makeVehiclePreviewGlb } from './package.js';
 import { SLOT_BY_ID, defaultParams, slotGroups, suggestRegion } from './bindings.js';
 import {
   createIcons,
+  ArrowLeft,
   ArrowLeftRight,
   BoxSelect,
   CheckCircle2,
@@ -93,6 +94,14 @@ app.innerHTML = `
             <strong>导入 GLB 车模</strong>
             <span>点击或拖入文件，最大 32MB</span>
           </label>
+          <div class="import-progress" id="import-progress" role="status" aria-live="polite" aria-valuemin="0" aria-valuemax="100" hidden>
+            <div class="import-progress-copy">
+              <span class="spinner" aria-hidden="true"></span>
+              <strong id="import-progress-label">正在读取模型</strong>
+              <span id="import-progress-percent">0%</span>
+            </div>
+            <div class="import-progress-track" aria-hidden="true"><span id="import-progress-bar"></span></div>
+          </div>
           <input id="model-file" class="visually-hidden" type="file" accept=".glb,model/gltf-binary" />
           <div class="selection-hud" id="selection-hud" hidden></div>
         </div>
@@ -149,7 +158,10 @@ app.innerHTML = `
         </section>
 
         <section class="inspector-panel" data-panel="binding">
-          <div class="inspector-title"><div><span>联动</span><h2 id="binding-editor-title">选择一个联动槽位</h2></div></div>
+          <div class="inspector-title binding-inspector-title">
+            <button class="icon-btn inspector-back" id="binding-back" type="button" title="返回联动列表" hidden><i data-lucide="arrow-left"></i></button>
+            <div><span>联动</span><h2 id="binding-editor-title">选择一个联动槽位</h2></div>
+          </div>
           <div class="inspector-scroll" id="binding-editor-host">
             <div class="inspector-placeholder"><i data-lucide="mouse-pointer-2"></i><span>从左侧选择灯光、车轮或开合槽位</span></div>
           </div>
@@ -194,6 +206,8 @@ const ui = Object.fromEntries([
   'binding-groups', 'binding-summary', 'binding-editor-host', 'binding-editor-title', 'demo-all',
   'delete-start', 'delete-panel', 'delete-summary', 'undo', 'redo', 'dirty-state',
   'workspace-triangles', 'workspace-selection', 'workspace-mode', 'workspace-index',
+  'import-progress', 'import-progress-label', 'import-progress-percent', 'import-progress-bar',
+  'binding-back',
 ].map((id) => [id, document.getElementById(id)]));
 // 空状态本身就是拖入区域；兼容旧逻辑保留 drop-zone 别名。
 ui['drop-zone'] ||= ui['empty-state'];
@@ -203,8 +217,15 @@ let current = null;
 let dirty = false;
 let activePanel = 'model';
 
+window.addEventListener('beforeunload', (event) => {
+  const importing = document.querySelector('.editor-shell')?.classList.contains('is-importing');
+  if (!current && !importing) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
+
 const lucideIcons = {
-  ArrowLeftRight, BoxSelect, CheckCircle2, Download, Eye, Gauge, Layers3, Maximize2, MousePointer2,
+  ArrowLeft, ArrowLeftRight, BoxSelect, CheckCircle2, Download, Eye, Gauge, Layers3, Maximize2, MousePointer2,
   Paintbrush, Play, Redo2, RotateCcw, Settings2, Sparkles, Square, Trash2, Undo2, Upload, Wrench,
 };
 
@@ -219,6 +240,7 @@ function setDirty(value = true) {
 }
 
 function setActivePanel(panel) {
+  if (panel !== 'model' && deleteDraft) cancelDeleteDraft(false);
   activePanel = panel;
   document.querySelectorAll('.inspector-panel').forEach((element) => {
     element.classList.toggle('active', element.dataset.panel === panel);
@@ -246,18 +268,20 @@ renderIcons();
 
 function wireMobileInspectorDrag() {
   const inspector = document.querySelector('.inspector');
+  const workspace = document.querySelector('.editor-workspace');
   document.querySelectorAll('.inspector-title').forEach((handle) => {
     handle.addEventListener('pointerdown', (event) => {
       if (!window.matchMedia('(max-width: 860px)').matches) return;
+      if (!current) return;
       if (event.target.closest('button, label, input, select')) return;
       const pointerId = event.pointerId;
       handle.setPointerCapture?.(pointerId);
       const move = (moveEvent) => {
         const landscape = window.matchMedia('(orientation: landscape)').matches;
-        const dockHeight = landscape ? 45 : 54;
         const minHeight = landscape ? 104 : 180;
         const maxRatio = landscape ? 0.62 : 0.74;
-        const height = Math.max(minHeight, Math.min(window.innerHeight * maxRatio, window.innerHeight - moveEvent.clientY - dockHeight));
+        const workspaceRect = workspace.getBoundingClientRect();
+        const height = Math.max(minHeight, Math.min(workspaceRect.height * maxRatio, workspaceRect.bottom - moveEvent.clientY));
         inspector.style.height = `${height}px`;
       };
       const stop = () => {
@@ -278,7 +302,23 @@ wireMobileInspectorDrag();
 const stepElements = [...document.querySelectorAll('.steps .step')];
 /** 步骤条随实际进度点亮：0 导入前 → 3 模型就绪（可调整/联动/检查）→ 4 已生成 */
 function updateSteps(stage) {
+  document.querySelector('.editor-shell').dataset.stage = String(stage);
   stepElements.forEach((element, index) => element.classList.toggle('active', index <= stage));
+}
+
+function updateImportProgress({ progress = 0, label = '正在读取模型', indeterminate = false } = {}) {
+  const percent = Math.max(0, Math.min(100, Math.round(progress * 100)));
+  ui['import-progress'].hidden = false;
+  ui['import-progress'].classList.toggle('indeterminate', indeterminate);
+  ui['import-progress'].setAttribute('aria-valuenow', String(percent));
+  ui['import-progress-label'].textContent = label;
+  ui['import-progress-percent'].textContent = indeterminate ? '处理中' : `${percent}%`;
+  ui['import-progress-bar'].style.width = `${percent}%`;
+}
+
+function finishImportProgress() {
+  ui['import-progress'].hidden = true;
+  ui['import-progress'].classList.remove('indeterminate');
 }
 
 ui['model-file'].addEventListener('change', (event) => loadFile(event.target.files?.[0]));
@@ -333,10 +373,18 @@ ui['mobile-generate'].addEventListener('click', () => ui.generate.click());
 ui['demo-all'].addEventListener('click', () => { demoAll(); });
 ui.redo.addEventListener('click', redo);
 document.querySelectorAll('[data-panel-target]').forEach((element) => {
-  element.addEventListener('click', () => setActivePanel(element.dataset.panelTarget));
+  element.addEventListener('click', () => {
+    const target = element.dataset.panelTarget;
+    if (element.classList.contains('dock-task') && target === 'binding' && activePanel === 'binding' && openSlot) {
+      closeBindingEditor();
+      return;
+    }
+    setActivePanel(target);
+  });
 });
 document.querySelector('.command-check')?.addEventListener('click', () => setActivePanel('check'));
 document.getElementById('mobile-generate-shortcut')?.addEventListener('click', generatePackage);
+ui['binding-back'].addEventListener('click', closeBindingEditor);
 
 let deviceGlbCache = null;
 let deviceGlbCacheKey = '';
@@ -401,9 +449,14 @@ async function loadFile(file) {
   }
   ui['file-name'].textContent = file.name;
   ui['analysis-state'].textContent = '解析中…';
+  ui['model-file'].disabled = true;
+  document.querySelector('.editor-shell').classList.add('is-importing');
+  ui['empty-state'].hidden = true;
+  updateImportProgress({ progress: 0.02, label: '准备读取模型' });
   setStatuses([['warn', '…', '正在解析模型，请稍候']]);
   try {
-    const loaded = await preview.load(file);
+    const loaded = await preview.load(file, updateImportProgress);
+    updateImportProgress({ progress: 0.96, label: '正在初始化编辑工具' });
     current = { file, ...loaded };
     setDirty(false);
     ui['rotation-x'].value = 0;
@@ -430,6 +483,7 @@ async function loadFile(file) {
     setActivePanel('model');
     updateSteps(3);
     validateStats(loaded.stats, loaded.orientation);
+    updateImportProgress({ progress: 1, label: '模型导入完成' });
   } catch (error) {
     console.error(error);
     current = null;
@@ -437,7 +491,13 @@ async function loadFile(file) {
     ui['analysis-state'].textContent = '解析失败';
     setControls(false);
     updateSteps(0);
+    ui['empty-state'].hidden = false;
     setStatuses([['bad', '×', `无法读取此 GLB：${error.message || '文件结构无效'}`]]);
+  } finally {
+    ui['model-file'].disabled = false;
+    ui['model-file'].value = '';
+    document.querySelector('.editor-shell').classList.remove('is-importing');
+    finishImportProgress();
   }
 }
 
@@ -1562,6 +1622,8 @@ function renderBindings() {
   ui['binding-groups'].innerHTML = html.join('');
   ui['binding-summary'].textContent = bindings.size ? `已配置 ${bindings.size} 项` : '未配置';
   ui['demo-all'].disabled = !current || bindings.size === 0;
+  ui['binding-back'].hidden = !openSlot;
+  document.querySelector('.binding-inspector-title').classList.toggle('has-back', Boolean(openSlot));
   if (demoRun) setDemoButton(true);
   else setDemoButton(false);
   if (openSlot) {
@@ -1577,6 +1639,17 @@ function renderBindings() {
   renderIcons();
   wireBindingEditor();
   if (openSlot) restorePartTreeScroll(SLOT_BY_ID.get(openSlot));
+}
+
+function closeBindingEditor() {
+  if (!openSlot) return;
+  stopDemo();
+  stopFineSelection();
+  openSlot = null;
+  regionMode = 'translate';
+  closePreviewTools();
+  renderBindings();
+  setActivePanel('binding');
 }
 
 function wireBindingEditor() {
