@@ -552,6 +552,8 @@ let previewSelectionRadius = 28;
 let previewSelectionAngle = 38;
 let treeQuery = '';
 let expandedGroups = new Set();
+const partTreeScrollBySlot = new Map();
+let pendingPartTreeReveal = null;
 
 /** parts 与两层部件分组一起刷新，并给每一项算好中文方位标签 */
 function refreshParts() {
@@ -1166,7 +1168,10 @@ function sourceNameOf(chosen, whole) {
 }
 
 /** 树勾选变化的唯一入口：为空删除绑定，否则重建绑定并保留已调好的参数 */
-function setBindingNodes(slot, nodeIndices) {
+function setBindingNodes(slot, nodeIndices, { revealNodeIndex = null } = {}) {
+  if (Number.isInteger(revealNodeIndex)) {
+    pendingPartTreeReveal = { slotId: slot.id, nodeIndex: revealNodeIndex };
+  }
   snapshot();
   const chosen = parts.filter((part) => nodeIndices.includes(part.nodeIndex));
   if (chosen.length === 0) {
@@ -1219,7 +1224,7 @@ function partTreeHtml(slot, binding) {
     const single = group.leaves.length === 1;
     rows.push(`
       <div class="pt-group">
-        <div class="pt-row${allPicked || (single && pickedCount) ? ' picked' : ''}" data-hover="${group.leaves.map((l) => l.nodeIndex).join(',')}">
+        <div class="pt-row${allPicked || (single && pickedCount) ? ' picked' : ''}" data-group-row="${group.key}"${single ? ` data-node-index="${group.leaves[0].nodeIndex}"` : ''} data-hover="${group.leaves.map((l) => l.nodeIndex).join(',')}">
           <input type="checkbox" data-group="${group.key}"${allPicked ? ' checked' : ''}${somePicked ? ' data-mixed="1"' : ''}${free.length === 0 ? ' disabled' : ''} aria-label="选择 ${escapeHtml(group.name)}" />
           ${single ? '<span class="pt-toggle"></span>'
             : `<button type="button" class="pt-toggle" data-toggle="${group.key}" aria-label="展开">${expanded ? '▾' : '▸'}</button>`}
@@ -1230,7 +1235,7 @@ function partTreeHtml(slot, binding) {
         ${expanded && !single ? `<div class="pt-leaves">${leaves.map((leaf) => {
           const usedBy = claimed.get(leaf.nodeIndex);
           return `
-          <div class="pt-row leaf${selected.has(leaf.nodeIndex) ? ' picked' : ''}" data-hover="${leaf.nodeIndex}">
+          <div class="pt-row leaf${selected.has(leaf.nodeIndex) ? ' picked' : ''}" data-node-index="${leaf.nodeIndex}" data-hover="${leaf.nodeIndex}">
             <input type="checkbox" data-leaf="${leaf.nodeIndex}"${selected.has(leaf.nodeIndex) ? ' checked' : ''}${usedBy ? ' disabled' : ''} aria-label="选择 ${escapeHtml(leaf.name)}" />
             <span class="pt-name">${escapeHtml(leaf.name)}</span>
             ${leaf.place ? `<span class="pt-tag">${leaf.place}</span>` : ''}
@@ -1241,20 +1246,46 @@ function partTreeHtml(slot, binding) {
   }
   const total = selected.size;
   return `
-    <div class="part-tree">${rows.join('') || '<p class="hint" style="margin:8px">没有匹配的部件</p>'}</div>
+    <div class="part-tree" data-slot-id="${slot.id}">${rows.join('') || '<p class="hint" style="margin:8px">没有匹配的部件</p>'}</div>
     <div class="pt-foot">
       <span>已选 ${total ? `${total} 块` : '0 块（勾选或点模型）'}</span>
       ${total ? `<button type="button" class="btn small" id="part-clear">清空</button>` : ''}
     </div>`;
 }
 
-function renderPartTree() {
+function capturePartTreeScroll() {
+  const tree = document.querySelector('.part-tree[data-slot-id]');
+  if (!tree?.dataset.slotId) return;
+  partTreeScrollBySlot.set(tree.dataset.slotId, tree.scrollTop);
+}
+
+function restorePartTreeScroll(slot) {
+  const tree = document.querySelector(`.part-tree[data-slot-id="${slot.id}"]`);
+  if (!tree) return;
+  const reveal = pendingPartTreeReveal?.slotId === slot.id ? pendingPartTreeReveal : null;
+  if (!reveal) {
+    tree.scrollTop = partTreeScrollBySlot.get(slot.id) || 0;
+    return;
+  }
+
+  pendingPartTreeReveal = null;
+  const row = tree.querySelector(`[data-node-index="${reveal.nodeIndex}"]`);
+  if (!row) return;
+  const targetTop = row.offsetTop - (tree.clientHeight - row.offsetHeight) / 2;
+  tree.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+  partTreeScrollBySlot.set(slot.id, Math.max(0, targetTop));
+}
+
+function renderPartTree({ resetScroll = false } = {}) {
   if (!openSlot) return;
   const wrap = document.getElementById('part-tree-wrap');
   if (!wrap) return;
   const slot = SLOT_BY_ID.get(openSlot);
+  capturePartTreeScroll();
+  if (resetScroll) partTreeScrollBySlot.set(slot.id, 0);
   wrap.innerHTML = partTreeHtml(slot, bindings.get(openSlot));
   wirePartTree(slot);
+  restorePartTreeScroll(slot);
 }
 
 function wirePartTree(slot) {
@@ -1344,7 +1375,8 @@ function onPickNode(slot, nodeIndex) {
     if (allIn) selected.delete(leaf.nodeIndex);
     else selected.add(leaf.nodeIndex);
   }
-  setBindingNodes(slot, [...selected]);
+  if (group && group.leaves.length > 1) expandedGroups.add(group.key);
+  setBindingNodes(slot, [...selected], { revealNodeIndex: nodeIndex });
 }
 
 function bindingEditor(slot) {
@@ -1507,6 +1539,7 @@ function escapeHtml(text) {
 }
 
 function renderBindings() {
+  capturePartTreeScroll();
   const ready = Boolean(current);
   const html = [];
   for (const [group, slots] of slotGroups()) {
@@ -1543,6 +1576,7 @@ function renderBindings() {
   }
   renderIcons();
   wireBindingEditor();
+  if (openSlot) restorePartTreeScroll(SLOT_BY_ID.get(openSlot));
 }
 
 function wireBindingEditor() {
@@ -1561,7 +1595,7 @@ function wireBindingEditor() {
   if (search) {
     search.addEventListener('input', () => {
       treeQuery = search.value;
-      renderPartTree();
+      renderPartTree({ resetScroll: true });
     });
   }
   document.getElementById('part-pick')?.addEventListener('click', () => togglePickMode(slot));
