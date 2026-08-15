@@ -145,3 +145,32 @@ npm install
 npm run dev
 ```
 
+## 发布到 GitHub Pages
+
+项目已经配置 GitHub Actions。将代码推送到 `main` 分支后，GitHub 会自动构建并发布 `dist` 目录。
+
+第一次使用时，在 GitHub 仓库中打开：
+
+```text
+Settings → Pages → Build and deployment → Source → GitHub Actions
+```
+
+工作流完成后，访问地址为：
+
+```text
+https://cat-bl.github.io/carmodel-web/
+```
+
+也可以在仓库的 `Actions` 页面手动运行 `Deploy to GitHub Pages`。
+
+### 为什么不能直接双击 dist/index.html
+
+`npm run build` 生成的是需要通过网页服务器访问的静态网站。直接双击会使用 `file://` 协议，浏览器会拦截 JavaScript 模块或模型模板文件，因此可能出现白屏。
+
+本地预览请使用：
+
+```bash
+npm run preview
+```
+
+然后打开终端显示的 `http://127.0.0.1:4173/`。发布到 GitHub Pages 后通过 `https://` 访问即可正常运行。
