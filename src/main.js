@@ -605,6 +605,7 @@ let pickingFor = null;
 let selectionEditingSlot = null;
 let selectionHistory = [];
 let selectionLast = emptySelection();
+let selectionLastStrokeId = null;
 let previewSelectionMode = 'smart';
 let previewSelectionOperation = 'add';
 let previewSelectionVisibleOnly = true;
@@ -1811,16 +1812,21 @@ function createSelectionBinding(slot, previous) {
   selectionEditingSlot = slot.id;
   selectionHistory = [];
   selectionLast = structuredClone(next.selection);
+  selectionLastStrokeId = null;
   renderBindings();
   startFineSelection(slot, { preserveState: true });
 }
 
-function updateSelectionBinding(slot, selection, stats) {
+function updateSelectionBinding(slot, selection, stats, change = {}) {
   const binding = bindings.get(slot.id);
   if (!binding) return;
   const nextSelection = structuredClone(selection || emptySelection());
   const previous = selectionLast || emptySelection();
-  if (JSON.stringify(previous) !== JSON.stringify(nextSelection)) selectionHistory.push(structuredClone(previous));
+  if (JSON.stringify(previous) !== JSON.stringify(nextSelection)) {
+    const strokeId = change.strokeId ?? null;
+    if (strokeId === null || strokeId !== selectionLastStrokeId) selectionHistory.push(structuredClone(previous));
+    selectionLastStrokeId = strokeId;
+  }
   selectionLast = structuredClone(nextSelection);
   binding.selection = nextSelection;
   binding.nodeIndices = [...new Set((nextSelection.groups || []).map((group) => group.nodeIndex))];
@@ -1832,14 +1838,13 @@ function updateSelectionBinding(slot, selection, stats) {
   if (slot.kind === 'spin' && !binding.pivotCustom && stats?.pivot) {
     binding.pivot = stats.pivot;
     syncPivotInputs(binding);
-    syncPivotTools(slot, binding);
+    if (selectionEditingSlot !== slot.id) syncPivotTools(slot, binding);
   }
   binding.sourceName = stats?.triangles ? `精细选面（${stats.triangles.toLocaleString()} 面）` : '精细选面（未完成）';
   markDevicePreviewStale();
   setDirty();
   updateWorkspaceSelection(stats);
   updateBindingRow(slot, binding);
-  preview.previewBinding(slot, binding);
 }
 
 function updateBindingRow(slot, binding) {
@@ -1878,10 +1883,16 @@ function updateSelectionSummary(stats) {
 function startFineSelection(slot, { preserveState = false } = {}) {
   const binding = bindings.get(slot?.id);
   if (!slot || !binding?.selection || preview.deviceMode) return;
+  // 编辑选区必须始终命中原始网格；动画预览会隐藏原件并换成临时切分网格。
+  preview.stopBindingPreview();
+  preview.clearHighlight();
+  preview.hideRegionBox();
+  preview.hidePivotMarker();
   selectionEditingSlot = slot.id;
   if (!preserveState) {
     selectionHistory = [];
     selectionLast = structuredClone(binding.selection);
+    selectionLastStrokeId = null;
   }
   preview.setTriangleSelection(true, binding.selection, {
     mode: previewSelectionMode,
@@ -1889,7 +1900,7 @@ function startFineSelection(slot, { preserveState = false } = {}) {
     brushRadius: previewSelectionRadius,
     angle: previewSelectionAngle,
     visibleOnly: previewSelectionVisibleOnly,
-    onChange: (selection, stats) => updateSelectionBinding(slot, selection, stats),
+    onChange: (selection, stats, change) => updateSelectionBinding(slot, selection, stats, change),
     onStatus: ({ state, stats }) => {
       ui['workspace-index'].textContent = state === 'building' ? '正在构建 BVH 索引…' : 'BVH 索引就绪';
       updateSelectionSummary(stats);
@@ -1904,6 +1915,7 @@ function stopFineSelection() {
   selectionEditingSlot = null;
   selectionHistory = [];
   selectionLast = emptySelection();
+  selectionLastStrokeId = null;
   preview.setTriangleSelection(false);
   ui['workspace-index'].textContent = '精细索引未启用';
   ui['workspace-mode'].textContent = openSlot ? '联动预览' : '浏览模式';
@@ -1949,6 +1961,7 @@ function wireFineSelection(slot) {
     if (!previous) return;
     const stats = preview.selectionStats(previous);
     selectionLast = structuredClone(previous);
+    selectionLastStrokeId = null;
     const binding = bindings.get(slot.id);
     if (binding) {
       binding.selection = structuredClone(previous);
@@ -1961,7 +1974,7 @@ function wireFineSelection(slot) {
         brushRadius: previewSelectionRadius,
         angle: previewSelectionAngle,
         visibleOnly: previewSelectionVisibleOnly,
-        onChange: (selection, nextStats) => updateSelectionBinding(slot, selection, nextStats),
+        onChange: (selection, nextStats, change) => updateSelectionBinding(slot, selection, nextStats, change),
         onStatus: ({ state, stats: nextStats }) => {
           ui['workspace-index'].textContent = state === 'building' ? '正在构建 BVH 索引…' : 'BVH 索引就绪';
           updateSelectionSummary(nextStats);
@@ -1971,7 +1984,6 @@ function wireFineSelection(slot) {
       updateWorkspaceSelection(stats);
       markDevicePreviewStale();
       setDirty();
-      preview.previewBinding(slot, binding);
     }
   });
   document.getElementById('selection-clear')?.addEventListener('click', () => {
@@ -1981,10 +1993,11 @@ function wireFineSelection(slot) {
     selectionHistory.push(previous);
     const next = emptySelection();
     selectionLast = structuredClone(next);
+    selectionLastStrokeId = null;
     binding.selection = next;
     binding.nodeIndices = [];
     binding.sourceName = '精细选面（未完成）';
-    preview.setTriangleSelection(true, next, { mode: previewSelectionMode, operation: previewSelectionOperation, brushRadius: previewSelectionRadius, angle: previewSelectionAngle, visibleOnly: previewSelectionVisibleOnly, onChange: (selection, stats) => updateSelectionBinding(slot, selection, stats), onStatus: ({ state, stats }) => { ui['workspace-index'].textContent = state === 'building' ? '正在构建 BVH 索引…' : 'BVH 索引就绪'; updateSelectionSummary(stats); } });
+    preview.setTriangleSelection(true, next, { mode: previewSelectionMode, operation: previewSelectionOperation, brushRadius: previewSelectionRadius, angle: previewSelectionAngle, visibleOnly: previewSelectionVisibleOnly, onChange: (selection, stats, change) => updateSelectionBinding(slot, selection, stats, change), onStatus: ({ state, stats }) => { ui['workspace-index'].textContent = state === 'building' ? '正在构建 BVH 索引…' : 'BVH 索引就绪'; updateSelectionSummary(stats); } });
     updateSelectionSummary({ groups: 0, triangles: 0 });
     updateWorkspaceSelection({ groups: 0, triangles: 0 });
     markDevicePreviewStale();
@@ -2178,6 +2191,10 @@ function playCurrentBinding() {
   const slot = SLOT_BY_ID.get(openSlot);
   const binding = bindings.get(openSlot);
   if (!slot || !binding) return;
+  if (selectionEditingSlot === openSlot) {
+    preview.stopBindingPreview();
+    return;
+  }
   // 框选时已经有选区盒了，再叠一个高亮框只会互相干扰
   if (!binding.region && !binding.selection) preview.highlightPart(binding.nodeIndices);
   preview.previewBinding(slot, binding);

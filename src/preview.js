@@ -67,6 +67,7 @@ export class ModelPreview {
     this.selectionState = null;
     this.selectionPointer = null;
     this.selectionStatus = null;
+    this.selectionStrokeSerial = 0;
     this.clock = new THREE.Clock();
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
@@ -441,53 +442,104 @@ export class ModelPreview {
     this.emitSelectionStatus('ready');
     if (this.selectionPointerWired) return;
     this.selectionPointerWired = true;
+    const runPaint = (pointer, clientX, clientY) => {
+      if (!this.selectionState || this.selectionPointer !== pointer || !pointer.painting || pointer.cancelled) return;
+      pointer.lastX = clientX;
+      pointer.lastY = clientY;
+      pointer.paintX = clientX;
+      pointer.paintY = clientY;
+      pointer.busy = true;
+      this.applyBrushAt(clientX, clientY, { strokeId: pointer.strokeId }).finally(() => {
+        if (this.selectionPointer !== pointer) return;
+        pointer.busy = false;
+        if (pointer.cancelled) {
+          this.selectionPointer = null;
+        } else if (pointer.pending) {
+          const [targetX, targetY] = pointer.pending;
+          const dx = targetX - pointer.paintX;
+          const dy = targetY - pointer.paintY;
+          const distance = Math.hypot(dx, dy);
+          const spacing = Math.max(4, (this.selectionState?.brushRadius || 28) * 0.65);
+          if (distance <= spacing) pointer.pending = null;
+          const ratio = distance > spacing ? spacing / distance : 1;
+          runPaint(pointer, pointer.paintX + dx * ratio, pointer.paintY + dy * ratio);
+        } else if (!pointer.active) {
+          this.selectionPointer = null;
+        }
+      });
+    };
+    const paintAt = (pointer, clientX, clientY) => {
+      if (!this.selectionState || this.selectionPointer !== pointer || !pointer.painting || pointer.cancelled) return;
+      pointer.lastX = clientX;
+      pointer.lastY = clientY;
+      if (pointer.busy) {
+        // BVH 首次建立或大选区刷新期间保留最新位置，完成后沿路径自动补点。
+        pointer.pending = [clientX, clientY];
+        return;
+      }
+      runPaint(pointer, clientX, clientY);
+    };
     this.canvas.addEventListener('pointerdown', (event) => {
       if (!this.selectionState) return;
       const painting = this.selectionState.mode === 'brush' && this.hasSelectableSurfaceAt(event.clientX, event.clientY);
-      this.selectionPointer = {
+      const pointer = {
         active: true,
         busy: false,
         painting,
+        pending: null,
+        cancelled: false,
+        strokeId: painting ? ++this.selectionStrokeSerial : null,
         pointerId: event.pointerId,
         startX: event.clientX,
         startY: event.clientY,
+        lastX: event.clientX,
+        lastY: event.clientY,
       };
+      this.selectionPointer = pointer;
       // 智能点选只把短点击识别为选面，拖动仍交给 OrbitControls。
       // 画笔从空白处起笔时同样用于转动视角，只有落在模型上才锁定相机并涂选。
       if (!painting) return;
       this.canvas.setPointerCapture?.(event.pointerId);
       this.setOrbitLocked('triangle-selection', true);
-      this.applyBrushAt(event.clientX, event.clientY);
+      paintAt(pointer, event.clientX, event.clientY);
     });
     this.canvas.addEventListener('pointermove', (event) => {
       if (!this.selectionState || !this.selectionPointer?.active) return;
       if (this.selectionState.mode !== 'brush' || !this.selectionPointer.painting) return;
-      if (this.selectionPointer.busy) return;
-      this.selectionPointer.busy = true;
-      this.applyBrushAt(event.clientX, event.clientY).finally(() => {
-        if (this.selectionPointer) this.selectionPointer.busy = false;
-      });
+      paintAt(this.selectionPointer, event.clientX, event.clientY);
     });
     const finishPointer = (event, cancelled = false) => {
       const pointer = this.selectionPointer;
       if (!pointer || (event.pointerId !== undefined && event.pointerId !== pointer.pointerId)) return;
-      const moved = Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY);
+      const clientX = Number.isFinite(event.clientX) ? event.clientX : pointer.lastX;
+      const clientY = Number.isFinite(event.clientY) ? event.clientY : pointer.lastY;
+      const moved = Math.hypot(clientX - pointer.startX, clientY - pointer.startY);
       const mode = this.selectionState.mode;
-      this.selectionPointer = null;
+      pointer.active = false;
+      pointer.cancelled = cancelled;
+      if (cancelled) pointer.pending = null;
       this.setOrbitLocked('triangle-selection', false);
       if (this.canvas.hasPointerCapture?.(pointer.pointerId)) this.canvas.releasePointerCapture(pointer.pointerId);
-      if (!cancelled && mode === 'smart' && moved <= 7) this.selectSmartTriangle(event.clientX, event.clientY);
+      if (mode === 'smart') {
+        this.selectionPointer = null;
+        if (!cancelled && moved <= 7) this.selectSmartTriangle(clientX, clientY);
+      } else if (!pointer.busy && !pointer.pending) {
+        this.selectionPointer = null;
+      }
     };
     this.canvas.addEventListener('pointerup', (event) => {
       if (!this.selectionState) return;
       finishPointer(event);
     });
     this.canvas.addEventListener('pointercancel', (event) => finishPointer(event, true));
-    // OrbitControls owns the normal pointer capture for smart clicks and releases
-    // it before pointerup reaches this listener; only a painting gesture needs
-    // capture-loss recovery here.
+    // 正常 pointerup 也会先触发 lostpointercapture，延迟到微任务后再判断，
+    // 这样只恢复真正丢失的手势，不会误取消一次正常点击或画笔收尾。
     this.canvas.addEventListener('lostpointercapture', (event) => {
-      if (this.selectionPointer?.painting) finishPointer(event, true);
+      const pointer = this.selectionPointer;
+      if (!pointer) return;
+      queueMicrotask(() => {
+        if (this.selectionPointer === pointer && pointer.active) finishPointer(event, true);
+      });
     });
   }
 
@@ -614,24 +666,27 @@ export class ModelPreview {
   }
 
   async selectSmartTriangle(clientX, clientY) {
-    if (!this.selectionState) return;
+    const state = this.selectionState;
+    if (!state) return;
     const hit = await this.pickTriangleAt(clientX, clientY);
-    if (!hit) return;
+    if (!hit || this.selectionState !== state) return;
     const topology = this.selectionTopology.get(hit.mesh.geometry) || buildTriangleTopology(hit.mesh.geometry);
     this.selectionTopology.set(hit.mesh.geometry, topology);
-    const triangles = connectedTriangles(topology, hit.triangle, this.selectionState.angle);
+    const triangles = connectedTriangles(topology, hit.triangle, state.angle);
     this.applySelectionOperation(hit.meta, triangles);
   }
 
-  async applyBrushAt(clientX, clientY) {
-    if (!this.selectionState) return;
+  async applyBrushAt(clientX, clientY, change = {}) {
+    const state = this.selectionState;
+    if (!state) return;
     const hit = await this.pickTriangleAt(clientX, clientY);
-    if (!hit) return;
+    if (!hit || this.selectionState !== state) return;
     const geometry = hit.mesh.geometry;
     const tree = await this.ensureSelectionBvh(hit.mesh);
+    if (this.selectionState !== state) return;
     const rect = this.canvas.getBoundingClientRect();
     const distance = hit.distance || this.camera.position.distanceTo(hit.point);
-    const worldRadius = Math.max(0.002, distance * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * 2 * this.selectionState.brushRadius / rect.height);
+    const worldRadius = Math.max(0.002, distance * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * 2 * state.brushRadius / rect.height);
     const inverse = hit.mesh.matrixWorld.clone().invert();
     const sphere = new THREE.Sphere(hit.point.clone().applyMatrix4(inverse), worldRadius);
     const candidates = new Set();
@@ -647,13 +702,13 @@ export class ModelPreview {
         const projected = worldCenter.clone().project(this.camera);
         const sx = rect.left + ((projected.x + 1) / 2) * rect.width;
         const sy = rect.top + ((1 - projected.y) / 2) * rect.height;
-        if (Math.hypot(sx - clientX, sy - clientY) > this.selectionState.brushRadius) return false;
-        if (this.selectionState.visibleOnly && !this.isTriangleVisible(hit.mesh, index, worldCenter)) return false;
+        if (Math.hypot(sx - clientX, sy - clientY) > state.brushRadius) return false;
+        if (state.visibleOnly && !this.isTriangleVisible(hit.mesh, index, worldCenter)) return false;
         candidates.add(index);
         return false;
       },
     });
-    this.applySelectionOperation(hit.meta, candidates);
+    this.applySelectionOperation(hit.meta, candidates, change);
   }
 
   isTriangleVisible(mesh, triangleIndex, worldCenter) {
@@ -670,14 +725,14 @@ export class ModelPreview {
     return !hit || hit.distance >= distance - 1e-4;
   }
 
-  applySelectionOperation(meta, triangles) {
+  applySelectionOperation(meta, triangles, change = {}) {
     if (!triangles?.size || !this.selectionState) return;
     const key = selectionKey(meta.nodeIndex, meta.primitiveIndex);
     if (!this.selectionState.map.has(key)) this.selectionState.map.set(key, new Set());
     applyTriangleOperation(this.selectionState.map.get(key), triangles, this.selectionState.operation);
     if (this.selectionState.map.get(key).size === 0) this.selectionState.map.delete(key);
     this.updateSelectionOverlay();
-    this.selectionState.onChange?.(selectionFromMap(this.selectionState.map), this.selectionStats());
+    this.selectionState.onChange?.(selectionFromMap(this.selectionState.map), this.selectionStats(), change);
     this.emitSelectionStatus('ready');
   }
 
