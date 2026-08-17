@@ -7,6 +7,7 @@ import {
   animationNamesOf,
   SLOT_BY_ID,
   defaultParams,
+  normalizeIdleDelaySeconds,
   normalizeOtherPlayback,
   playbackDurationOf,
   slotForMode,
@@ -1371,6 +1372,9 @@ function setSourceAnimationBinding(slot, value) {
     sourceName: `模型动画：${animation.name}`,
     nodeIndices: [...animation.nodeIndices],
     playback: normalizeOtherPlayback(slot, existing?.playback),
+    ...(slot.id === 'CS_Idle' ? {
+      triggerDelaySeconds: normalizeIdleDelaySeconds(existing?.triggerDelaySeconds),
+    } : {}),
   });
   setDirty();
   markDevicePreviewStale();
@@ -2375,6 +2379,7 @@ function otherBindingEditor(slot, binding) {
   const playback = normalizeOtherPlayback(slot, binding?.playback);
   const sourceAnimation = sourceAnimationByIndex(selected);
   const effectiveDuration = playbackDurationOf(sourceAnimation?.duration, playback);
+  const idleDelay = normalizeIdleDelaySeconds(binding?.triggerDelaySeconds);
   let animationControl;
   if (bindableAnimations.length === 0) {
     animationControl = `
@@ -2400,6 +2405,10 @@ function otherBindingEditor(slot, binding) {
        <section class="other-playback-config" aria-label="播放设置">
          <div class="other-playback-title"><i data-lucide="settings-2"></i><strong>播放设置</strong></div>
          <div class="other-playback-grid">
+           ${slot.id === 'CS_Idle' ? `<div class="field">
+             <label for="bind-trigger-delay">停车后触发</label>
+             <div class="input-suffix"><input id="bind-trigger-delay" type="number" min="1" max="600" step="1" value="${idleDelay}" /><span>秒</span></div>
+           </div>` : ''}
            <div class="field">
              <label for="bind-playback-mode">播放方式</label>
              <select id="bind-playback-mode">
@@ -2722,7 +2731,7 @@ function wireBindingEditor() {
     });
     for (const id of [
       'bind-playback-mode', 'bind-playback-direction', 'bind-playback-end',
-      'bind-playback-speed', 'bind-playback-start', 'bind-playback-end-range',
+      'bind-playback-speed', 'bind-playback-start', 'bind-playback-end-range', 'bind-trigger-delay',
     ]) {
       document.getElementById(id)?.addEventListener('change', () => updateOtherPlaybackBinding(slot));
     }
@@ -3269,6 +3278,11 @@ function updateOtherPlaybackBinding(slot) {
       end: (Number(document.getElementById('bind-playback-end-range')?.value) || 100) / 100,
     },
   });
+  const delayInput = document.getElementById('bind-trigger-delay');
+  if (delayInput) {
+    binding.triggerDelaySeconds = normalizeIdleDelaySeconds(delayInput.value);
+    delayInput.value = binding.triggerDelaySeconds;
+  }
   setDirty();
   markDevicePreviewStale();
   document.getElementById('bind-playback-speed').value = binding.playback.speed;

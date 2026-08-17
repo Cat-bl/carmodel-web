@@ -42,6 +42,7 @@ export const BINDING_SLOTS = [
 
   { id: 'CS_WF', label: '前轮（左右一对）', group: '转动', kind: 'spin', axis: 'z' },
   { id: 'CS_WB', label: '后轮（左右一对）', group: '转动', kind: 'spin', axis: 'z' },
+  { id: 'CS_Idle', label: '待机', group: '移动', kind: 'spin' },
 
   { id: 'CS_LF', label: '左前门', group: '开合', kind: 'hinge', axis: 'y', angle: -45, hinge: 'front' },
   { id: 'CS_RF', label: '右前门', group: '开合', kind: 'hinge', axis: 'y', angle: 45, hinge: 'front' },
@@ -55,6 +56,7 @@ export const SLOT_BY_ID = new Map(BINDING_SLOTS.map((slot) => [slot.id, slot]));
 
 const OTHER_SLOT_PRESENTATION = {
   CS_WF: { label: '前进', group: '移动', trigger: '车辆开始或停止行驶时触发' },
+  CS_Idle: { trigger: '车辆持续静止指定时间后触发，开始行驶时结束' },
   CS_LDirection: { trigger: '左转向灯打开时触发' },
   CS_RDirection: { trigger: '右转向灯打开时触发' },
   CS_Emergency: { trigger: '双闪打开时触发' },
@@ -111,6 +113,11 @@ export function playbackDurationOf(sourceDuration, playback, { cycle = true } = 
   return cycle && normalized.mode === 'pingpong' ? oneWay * 2 : oneWay;
 }
 
+export function normalizeIdleDelaySeconds(value) {
+  const seconds = Number(value);
+  return Number.isFinite(seconds) ? Math.min(600, Math.max(1, Math.round(seconds))) : 5;
+}
+
 const OTHER_ACTION_OPTIONS = {
   lamp: [{ value: 'lamp', label: '发光 / 换色' }],
   blink: [
@@ -149,12 +156,14 @@ const PAGE_HIDDEN_SLOT_IDS = new Set([
 // “其他模型”只需要感知车辆是否正在行驶。地图会同时派发前、后轮事件，
 // 因此统一复用 CS_WF 作为“前进”，隐藏 CS_WB，避免同一骨骼动作被播放两次。
 const OTHER_HIDDEN_SLOT_IDS = new Set(['CS_WB']);
+const OTHER_ONLY_SLOT_IDS = new Set(['CS_Idle']);
 
 export function slotGroups(modelType = 'vehicle') {
   const groups = new Map();
   for (const baseSlot of BINDING_SLOTS) {
     const slot = slotForMode(baseSlot, modelType);
     if (PAGE_HIDDEN_SLOT_IDS.has(slot.id)) continue;
+    if (modelType !== 'other' && OTHER_ONLY_SLOT_IDS.has(slot.id)) continue;
     if (modelType === 'other' && OTHER_HIDDEN_SLOT_IDS.has(slot.id)) continue;
     if (!groups.has(slot.group)) groups.set(slot.group, []);
     groups.get(slot.group).push(slot);

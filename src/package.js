@@ -4,6 +4,7 @@ import {
   SLOT_BY_ID,
   animationNamesOf,
   buildKeyframes,
+  normalizeIdleDelaySeconds,
   normalizeOtherPlayback,
   parseColor,
 } from './bindings.js';
@@ -103,7 +104,14 @@ async function makeAnimatedOtherBydCar({
     baked, transform, bindings, deletions,
   );
   await resizeEmbeddedImages(state, exportQuality.textureMaxSize);
-  await simplifyMeshToTarget(state, exportQuality.triangleTarget);
+  const simplified = await simplifyMeshToTarget(state, exportQuality.triangleTarget);
+  if (simplified > 0) {
+    normalizeSkinnedMeshesForVehicle(state);
+    markMeshBufferTargets(state);
+    pruneUnusedAccessors(state);
+    repackBin(state);
+    assertVehicleSkinCompatibility(state);
+  }
   const normalized = buildGlb(state.json, state.bin);
   const outputStats = collectGlbStats(state.json);
   const mainTexture = await extractMainTexture(state);
@@ -970,6 +978,278 @@ function writeAccessor(state, data, componentType, type, extra) {
   return state.json.accessors.length - 1;
 }
 
+const VEHICLE_ARRAY_BUFFER = 34962;
+const VEHICLE_ELEMENT_ARRAY_BUFFER = 34963;
+const VEHICLE_SKIN_ATTRIBUTES = ['POSITION', 'NORMAL', 'TEXCOORD_0', 'COLOR_0'];
+
+function writeVehicleAccessor(state, data, componentType, type, target, extra) {
+  const accessorIndex = writeAccessor(state, data, componentType, type, extra);
+  const accessor = state.json.accessors[accessorIndex];
+  state.json.bufferViews[accessor.bufferView].target = target;
+  return accessorIndex;
+}
+
+function positionBounds(data) {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let at = 0; at < data.length; at += 3) {
+    for (let axis = 0; axis < 3; axis++) {
+      min[axis] = Math.min(min[axis], data[at + axis]);
+      max[axis] = Math.max(max[axis], data[at + axis]);
+    }
+  }
+  return { min, max };
+}
+
+function copyVertices(source, components, sourceVertices) {
+  const output = new source.constructor(sourceVertices.length * components);
+  for (let next = 0; next < sourceVertices.length; next++) {
+    const previous = sourceVertices[next];
+    for (let component = 0; component < components; component++) {
+      output[next * components + component] = source[previous * components + component];
+    }
+  }
+  return output;
+}
+
+function splitTriangleIndices(indices, vertexCount) {
+  if (indices.length % 3 !== 0) throw new Error('蒙皮网格的三角形索引数量无效');
+  const chunks = [];
+  let sourceVertices = [];
+  let outputIndices = [];
+  let remap = new Map();
+  const flush = () => {
+    if (outputIndices.length === 0) return;
+    chunks.push({ sourceVertices, indices: Uint16Array.from(outputIndices) });
+    sourceVertices = [];
+    outputIndices = [];
+    remap = new Map();
+  };
+
+  for (let at = 0; at < indices.length; at += 3) {
+    const triangle = [Number(indices[at]), Number(indices[at + 1]), Number(indices[at + 2])];
+    if (triangle.some((index) => !Number.isInteger(index) || index < 0 || index >= vertexCount)) {
+      throw new Error('蒙皮网格包含越界顶点索引');
+    }
+    const needed = triangle.reduce((count, index) => count + (remap.has(index) ? 0 : 1), 0);
+    if (outputIndices.length && remap.size + needed > 65535) flush();
+    for (const index of triangle) {
+      let mapped = remap.get(index);
+      if (mapped === undefined) {
+        mapped = sourceVertices.length;
+        remap.set(index, mapped);
+        sourceVertices.push(index);
+      }
+      outputIndices.push(mapped);
+    }
+  }
+  flush();
+  return chunks;
+}
+
+function readSkinInfluences(state, primitive, skin, vertexCount) {
+  if (!Array.isArray(skin.joints) || skin.joints.length === 0) {
+    throw new Error('蒙皮网格引用了空骨架');
+  }
+  if (skin.joints.length > 256) {
+    throw new Error(`车机最多支持 256 个骨骼关节，当前模型包含 ${skin.joints.length} 个`);
+  }
+  const sets = [];
+  for (let setIndex = 0; ; setIndex++) {
+    const jointsIndex = primitive.attributes?.[`JOINTS_${setIndex}`];
+    const weightsIndex = primitive.attributes?.[`WEIGHTS_${setIndex}`];
+    if (!Number.isInteger(jointsIndex) && !Number.isInteger(weightsIndex)) break;
+    if (!Number.isInteger(jointsIndex) || !Number.isInteger(weightsIndex)) {
+      throw new Error(`蒙皮网格的 JOINTS_${setIndex}/WEIGHTS_${setIndex} 不成对`);
+    }
+    const joints = readAccessorData(state, jointsIndex);
+    const weights = readAttributeAsFloat(state, weightsIndex);
+    if (!joints || !weights || joints.comps !== 4 || weights.comps !== 4
+      || joints.data.length !== vertexCount * 4 || weights.data.length !== vertexCount * 4) {
+      throw new Error(`蒙皮网格的第 ${setIndex + 1} 组骨骼权重无效`);
+    }
+    sets.push({ joints: joints.data, weights: weights.data });
+  }
+  if (sets.length === 0) throw new Error('蒙皮网格缺少 JOINTS_0/WEIGHTS_0');
+
+  const joints = new Uint8Array(vertexCount * 4);
+  const weights = new Float32Array(vertexCount * 4);
+  for (let vertex = 0; vertex < vertexCount; vertex++) {
+    const influences = [];
+    for (const set of sets) {
+      for (let component = 0; component < 4; component++) {
+        const joint = Number(set.joints[vertex * 4 + component]);
+        const weight = Number(set.weights[vertex * 4 + component]);
+        if (!Number.isInteger(joint) || joint < 0 || joint >= skin.joints.length
+          || !Number.isFinite(weight) || weight < 0) {
+          throw new Error('蒙皮网格包含无效骨骼索引或权重');
+        }
+        if (weight > 0) influences.push({ joint, weight });
+      }
+    }
+    influences.sort((left, right) => right.weight - left.weight);
+    const selected = influences.slice(0, 4);
+    const total = selected.reduce((sum, influence) => sum + influence.weight, 0);
+    if (total <= 1e-8) selected.push({ joint: 0, weight: 1 });
+    const normalizedTotal = total > 1e-8 ? total : 1;
+    for (let component = 0; component < Math.min(4, selected.length); component++) {
+      joints[vertex * 4 + component] = selected[component].joint;
+      weights[vertex * 4 + component] = selected[component].weight / normalizedTotal;
+    }
+  }
+  return { joints, weights };
+}
+
+function vehicleSkinPrimitiveData(state, primitive, skin) {
+  if ((primitive.mode ?? 4) !== 4) throw new Error('车机蒙皮模型只支持三角形网格');
+  const position = readAttributeAsFloat(state, primitive.attributes?.POSITION);
+  if (!position || position.comps !== 3 || position.data.length < 3) {
+    throw new Error('蒙皮网格缺少有效 POSITION');
+  }
+  const vertexCount = position.data.length / 3;
+  const attributes = [{ name: 'POSITION', data: position.data, components: 3, type: 'VEC3' }];
+  for (const name of VEHICLE_SKIN_ATTRIBUTES.slice(1)) {
+    const accessorIndex = primitive.attributes?.[name];
+    if (!Number.isInteger(accessorIndex)) continue;
+    const attribute = readAttributeAsFloat(state, accessorIndex);
+    const validComponents = name === 'TEXCOORD_0' ? [2] : name === 'COLOR_0' ? [3, 4] : [3];
+    if (!attribute || !validComponents.includes(attribute.comps)
+      || attribute.data.length !== vertexCount * attribute.comps) {
+      throw new Error(`蒙皮网格的 ${name} 顶点属性无效`);
+    }
+    attributes.push({
+      name, data: attribute.data, components: attribute.comps, type: `VEC${attribute.comps}`,
+    });
+  }
+  const influences = readSkinInfluences(state, primitive, skin, vertexCount);
+  attributes.push({ name: 'JOINTS_0', data: influences.joints, components: 4, type: 'VEC4', componentType: 5121 });
+  attributes.push({ name: 'WEIGHTS_0', data: influences.weights, components: 4, type: 'VEC4' });
+
+  let indices;
+  if (Number.isInteger(primitive.indices)) {
+    const source = readAccessorData(state, primitive.indices);
+    if (!source || source.comps !== 1) throw new Error('蒙皮网格的索引数据无效');
+    indices = source.data;
+  } else {
+    indices = new Uint32Array(vertexCount);
+    for (let index = 0; index < vertexCount; index++) indices[index] = index;
+  }
+  return { attributes, chunks: splitTriangleIndices(indices, vertexCount) };
+}
+
+function writeVehicleSkinPrimitive(state, primitive, data, chunk) {
+  const attributes = {};
+  for (const attribute of data.attributes) {
+    const values = copyVertices(attribute.data, attribute.components, chunk.sourceVertices);
+    const extra = attribute.name === 'POSITION' ? positionBounds(values) : undefined;
+    attributes[attribute.name] = writeVehicleAccessor(
+      state,
+      values,
+      attribute.componentType || 5126,
+      attribute.type,
+      VEHICLE_ARRAY_BUFFER,
+      extra,
+    );
+  }
+  const indices = writeVehicleAccessor(
+    state, chunk.indices, 5123, 'SCALAR', VEHICLE_ELEMENT_ARRAY_BUFFER,
+  );
+  const { attributes: ignoredAttributes, indices: ignoredIndices, targets: ignoredTargets,
+    extensions: ignoredExtensions, ...rest } = primitive;
+  return { ...rest, mode: 4, attributes, indices };
+}
+
+/**
+ * AutoDice 的 glTF 读取范围比标准窄：APK 内 51 个蒙皮 primitive 都使用
+ * UINT16 索引、UINT8 关节、非交错独立 bufferView。统一转换后再交给车机，
+ * 避免合法但未被该版本原生引擎覆盖的顶点布局在 CreateResource 阶段崩溃。
+ */
+function normalizeSkinnedMeshesForVehicle(state) {
+  const { json } = state;
+  const skinsByMesh = new Map();
+  for (const node of json.nodes || []) {
+    if (!Number.isInteger(node.skin) || !Number.isInteger(node.mesh)) continue;
+    const skin = json.skins?.[node.skin];
+    if (!skin) throw new Error('蒙皮节点引用了不存在的 skin');
+    const previous = skinsByMesh.get(node.mesh);
+    if (previous && JSON.stringify(previous.joints) !== JSON.stringify(skin.joints)) {
+      throw new Error('同一网格绑定了不同骨架，车机无法安全加载');
+    }
+    skinsByMesh.set(node.mesh, skin);
+  }
+
+  for (const [meshIndex, skin] of skinsByMesh) {
+    const mesh = json.meshes?.[meshIndex];
+    if (!mesh) throw new Error('蒙皮节点引用了不存在的 mesh');
+    const primitives = [];
+    for (const primitive of mesh.primitives || []) {
+      const data = vehicleSkinPrimitiveData(state, primitive, skin);
+      for (const chunk of data.chunks) {
+        primitives.push(writeVehicleSkinPrimitive(state, primitive, data, chunk));
+      }
+    }
+    if (primitives.length === 0) throw new Error('蒙皮网格没有可导出的三角面');
+    mesh.primitives = primitives;
+  }
+  for (const skin of json.skins || []) delete skin.skeleton;
+}
+
+function markMeshBufferTargets(state) {
+  const { json } = state;
+  for (const mesh of json.meshes || []) {
+    for (const primitive of mesh.primitives || []) {
+      for (const accessorIndex of Object.values(primitive.attributes || {})) {
+        const accessor = json.accessors?.[accessorIndex];
+        const view = json.bufferViews?.[accessor?.bufferView];
+        if (view) view.target = VEHICLE_ARRAY_BUFFER;
+      }
+      if (Number.isInteger(primitive.indices)) {
+        const accessor = json.accessors?.[primitive.indices];
+        const view = json.bufferViews?.[accessor?.bufferView];
+        if (view) view.target = VEHICLE_ELEMENT_ARRAY_BUFFER;
+      }
+    }
+  }
+}
+
+function dedupeAnimationInputs(state) {
+  const { json } = state;
+  for (const animation of json.animations || []) {
+    const inputs = new Map();
+    for (const sampler of animation.samplers || []) {
+      const input = readAccessorData(state, sampler.input);
+      if (!input || input.comps !== 1) continue;
+      const key = `${input.accessor.componentType}|${Array.from(input.data).join(',')}`;
+      if (inputs.has(key)) sampler.input = inputs.get(key);
+      else inputs.set(key, sampler.input);
+    }
+  }
+}
+
+function assertVehicleSkinCompatibility(state) {
+  const { json } = state;
+  for (const node of json.nodes || []) {
+    if (!Number.isInteger(node.skin) || !Number.isInteger(node.mesh)) continue;
+    for (const primitive of json.meshes?.[node.mesh]?.primitives || []) {
+      const indices = json.accessors?.[primitive.indices];
+      const joints = json.accessors?.[primitive.attributes?.JOINTS_0];
+      const weights = json.accessors?.[primitive.attributes?.WEIGHTS_0];
+      if (indices?.componentType !== 5123 || indices.type !== 'SCALAR'
+        || joints?.componentType !== 5121 || joints.type !== 'VEC4'
+        || weights?.componentType !== 5126 || weights.type !== 'VEC4') {
+        throw new Error('蒙皮网格未能转换为车机兼容的顶点格式');
+      }
+      for (const accessorIndex of [...Object.values(primitive.attributes || {}), primitive.indices]) {
+        const accessor = json.accessors?.[accessorIndex];
+        const view = json.bufferViews?.[accessor?.bufferView];
+        if (!view || Number.isInteger(view.byteStride)) {
+          throw new Error('蒙皮网格仍包含车机不兼容的交错顶点数据');
+        }
+      }
+    }
+  }
+}
+
 function insideRegion(region, x, y, z) {
   return x >= region.min[0] && x <= region.max[0]
     && y >= region.min[1] && y <= region.max[1]
@@ -1518,7 +1798,13 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions)
     outputAnimations.push(...event.animations);
     const spec = event.spec;
     const { playback, ...eventSpec } = spec;
-    eventBindings[slot.id] = { part: 'CS_Car', ...eventSpec };
+    eventBindings[slot.id] = {
+      part: 'CS_Car',
+      ...eventSpec,
+      ...(slot.id === 'CS_Idle' ? {
+        triggerDelayMs: normalizeIdleDelaySeconds(binding.triggerDelaySeconds) * 1000,
+      } : {}),
+    };
   }
   json.animations = outputAnimations.length ? outputAnimations : undefined;
 
@@ -1542,6 +1828,10 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions)
 
   dedupeMaterials(state);
   await bakeDirectionalGradient(state, bake, new Set());
+  normalizeSkinnedMeshesForVehicle(state);
+  dedupeAnimationInputs(state);
+  markMeshBufferTargets(state);
+  assertVehicleSkinCompatibility(state);
   pruneOrphanNodes(state);
   pruneUnusedMeshes(state);
   pruneUnusedTextures(state);
@@ -2717,6 +3007,13 @@ export async function makeVehiclePreviewGlb(
     ? (await normalizeAnimatedOtherGlb(baked, transform, bindings, deletions)).state
     : await normalizeParsedGlb(baked, transform, bindings, [], deletions);
   await resizeEmbeddedImages(normalized, exportQuality.textureMaxSize);
-  await simplifyMeshToTarget(normalized, exportQuality.triangleTarget);
+  const simplified = await simplifyMeshToTarget(normalized, exportQuality.triangleTarget);
+  if (modelType === 'other' && simplified > 0) {
+    normalizeSkinnedMeshesForVehicle(normalized);
+    markMeshBufferTargets(normalized);
+    pruneUnusedAccessors(normalized);
+    repackBin(normalized);
+    assertVehicleSkinCompatibility(normalized);
+  }
   return buildGlb(normalized.json, normalized.bin);
 }
