@@ -31,11 +31,12 @@ export async function prepareModelImport(file, onProgress = null) {
   }
 
   let scene;
+  let animations = [];
   let sourceFormat;
   let modelName = baseName(file.name);
   if (extension === 'fbx') {
     report(0.26, '正在解析 FBX 模型', true);
-    scene = (await parseFbx(sourceBytes, null, '', warnings)).scene;
+    ({ scene, animations } = await parseFbx(sourceBytes, null, '', warnings));
     sourceFormat = 'fbx';
   } else if (extension === 'zip') {
     report(0.22, '正在解压模型资源', true);
@@ -46,11 +47,11 @@ export async function prepareModelImport(file, onProgress = null) {
     if (primary.extension === 'gltf') {
       sourceFormat = 'gltf';
       report(0.5, '正在解析 glTF 与关联资源', true);
-      scene = (await parseGltf(primary, archive)).scene;
+      ({ scene, animations } = await parseGltf(primary, archive));
     } else if (primary.extension === 'fbx') {
       sourceFormat = 'fbx-zip';
       report(0.5, '正在解析 FBX 与关联贴图', true);
-      scene = (await parseFbx(primary.bytes, archive, directoryOf(primary.path), warnings)).scene;
+      ({ scene, animations } = await parseFbx(primary.bytes, archive, directoryOf(primary.path), warnings));
     } else {
       sourceFormat = 'obj-zip';
       report(0.5, '正在解析 OBJ、MTL 与贴图', true);
@@ -63,7 +64,7 @@ export async function prepareModelImport(file, onProgress = null) {
   }
 
   report(0.72, '正在转换为内嵌资源 GLB', true);
-  const bytes = await exportSceneToGlb(scene);
+  const bytes = await exportSceneToGlb(scene, animations);
   report(0.98, '格式转换完成');
   return {
     bytes,
@@ -95,7 +96,8 @@ async function parseGltf(primary, archive) {
     if (!resource) throw new Error(`glTF 缺少贴图：${image.uri}`);
     image.uri = bytesToDataUri(resource.bytes, mimeTypeFor(resource.path));
   }
-  return { scene: (await new GLTFLoader().parseAsync(JSON.stringify(json), '')).scene };
+  const gltf = await new GLTFLoader().parseAsync(JSON.stringify(json), '');
+  return { scene: gltf.scene, animations: gltf.animations || [] };
 }
 
 async function parseFbx(bytes, archive, basePath, warnings) {
@@ -109,7 +111,7 @@ async function parseFbx(bytes, archive, basePath, warnings) {
     throw new Error(`FBX 解析失败：${error.message || '文件结构无效'}`);
   }
   await tracker.finish();
-  return { scene };
+  return { scene, animations: scene.animations || [] };
 }
 
 async function parseObj(primary, archive, warnings) {
@@ -134,10 +136,10 @@ async function parseObj(primary, archive, warnings) {
     throw new Error(`OBJ 解析失败：${error.message || '文件结构无效'}`);
   }
   await tracker.finish();
-  return { scene };
+  return { scene, animations: [] };
 }
 
-async function exportSceneToGlb(scene) {
+async function exportSceneToGlb(scene, animations = []) {
   if (!scene) throw new Error('模型没有可转换的场景');
   let meshCount = 0;
   const materialCache = new Map();
@@ -155,7 +157,7 @@ async function exportSceneToGlb(scene) {
   scene.updateMatrixWorld(true);
   try {
     const result = await new GLTFExporter().parseAsync(scene, {
-      binary: true, onlyVisible: false, trs: false, maxTextureSize: Infinity, animations: [],
+      binary: true, onlyVisible: false, trs: false, maxTextureSize: Infinity, animations,
     });
     return new Uint8Array(result);
   } catch (error) {

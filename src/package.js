@@ -1,6 +1,12 @@
 import JSZip from 'jszip';
 import { MeshoptSimplifier } from 'meshoptimizer';
-import { SLOT_BY_ID, animationNamesOf, buildKeyframes, parseColor } from './bindings.js';
+import {
+  SLOT_BY_ID,
+  animationNamesOf,
+  buildKeyframes,
+  normalizeOtherPlayback,
+  parseColor,
+} from './bindings.js';
 import { createCarShadowCanvas, shadowFootprint } from './shadow.js';
 import { selectedTriangles } from './selection.js';
 
@@ -12,7 +18,9 @@ const LAMP_SLOT_IDS = new Set(
   [...SLOT_BY_ID.values()].filter((slot) => slot.kind === 'lamp' || slot.kind === 'blink').map((slot) => slot.id),
 );
 
-export async function makeBydCar({ sourceBytes, sourceName, transform, stats, bindings, deletions, quality }) {
+export async function makeBydCar(options) {
+  if (options?.modelType === 'other') return makeAnimatedOtherBydCar(options);
+  const { sourceBytes, sourceName, transform, stats, bindings, deletions, quality } = options;
   const exportQuality = normalizeExportQuality(quality);
   const parsed = parseGlb(sourceBytes);
   const baked = await bakeMaterialsForVehicle(parsed);
@@ -31,6 +39,7 @@ export async function makeBydCar({ sourceBytes, sourceName, transform, stats, bi
   const manifest = {
     format: 'com.byd.launchermap.bydcar',
     formatVersion: 1,
+    modelType: 'vehicle',
     name: sourceName.replace(/\.glb$/i, ''),
     generator: 'byd-car-converter-web/0.1.0',
     target: 'lane-car-v1',
@@ -65,6 +74,9 @@ export async function makeBydCar({ sourceBytes, sourceName, transform, stats, bi
   if (bindings?.length) {
     manifest.bindings = bindings.map((binding) => ({
       slot: binding.slotId, source: binding.sourceName || '', region: Boolean(binding.region),
+      ...(Number.isInteger(binding.sourceAnimationIndex) ? {
+        sourceAnimation: binding.sourceAnimationName || `#${binding.sourceAnimationIndex}`,
+      } : {}),
     }));
   }
 
@@ -74,6 +86,74 @@ export async function makeBydCar({ sourceBytes, sourceName, transform, stats, bi
   for (const file of files) {
     zip.file(file.path, file.bytes, { compression: 'STORE', createFolders: false });
   }
+  const bytes = await zip.generateAsync({ type: 'uint8array', compression: 'STORE' });
+  return { bytes, manifest, dat, glb: normalized };
+}
+
+async function makeAnimatedOtherBydCar({
+  sourceBytes, sourceName, transform, stats, bindings, deletions, quality,
+}) {
+  const exportQuality = normalizeExportQuality(quality);
+  const parsed = parseGlb(sourceBytes);
+  if (parsed.json.extensionsRequired?.length) {
+    throw new Error(`该模型依赖暂不支持的 glTF 扩展：${parsed.json.extensionsRequired.join(', ')}`);
+  }
+  const baked = await bakeMaterialsForVehicle(parsed);
+  const { state, eventBindings } = await normalizeAnimatedOtherGlb(
+    baked, transform, bindings, deletions,
+  );
+  await resizeEmbeddedImages(state, exportQuality.textureMaxSize);
+  await simplifyMeshToTarget(state, exportQuality.triangleTarget);
+  const normalized = buildGlb(state.json, state.bin);
+  const outputStats = collectGlbStats(state.json);
+  const mainTexture = await extractMainTexture(state);
+  const shadowTexture = extractNamedTexture(state, 'CS_Shadow');
+  const dat = await wrapCarSelf(normalized);
+  const datHash = await sha256(dat);
+  const glbHash = await sha256(normalized);
+  const manifest = {
+    format: 'com.byd.launchermap.bydcar',
+    formatVersion: 1,
+    modelType: 'other',
+    name: sourceName.replace(/\.(?:glb|gltf|fbx|obj|zip)$/i, ''),
+    generator: 'byd-car-converter-web/0.1.0',
+    target: 'lane-car-v1',
+    eventBindings,
+    model: {
+      path: 'payload/CarSelf.dat',
+      size: dat.byteLength,
+      sha256: datHash,
+      glbSize: normalized.byteLength,
+      glbSha256: glbHash,
+      scene: 0,
+      rootNode: 'CS_Car',
+      stats,
+      outputStats,
+      quality: exportQuality,
+    },
+  };
+  if (bindings?.length) {
+    manifest.bindings = bindings.map((binding) => ({
+      slot: binding.slotId,
+      source: binding.sourceName || '',
+      sourceAnimation: binding.sourceAnimationName || `#${binding.sourceAnimationIndex}`,
+      playback: normalizeOtherPlayback(SLOT_BY_ID.get(binding.slotId), binding.playback),
+    }));
+  }
+  const files = [
+    { path: 'payload/Texture/CarSelf_Main.png', bytes: mainTexture.bytes },
+    { path: 'payload/Texture/CS_Shadow.png', bytes: shadowTexture.bytes },
+  ];
+  manifest.resources = [];
+  for (const file of files) {
+    manifest.resources.push({
+      path: file.path, size: file.bytes.byteLength, sha256: await sha256(file.bytes),
+    });
+  }
+  const zip = new JSZip();
+  zip.file('manifest.json', JSON.stringify(manifest, null, 2), { createFolders: false });
+  zip.file('payload/CarSelf.dat', dat, { compression: 'STORE', createFolders: false });
+  for (const file of files) zip.file(file.path, file.bytes, { compression: 'STORE', createFolders: false });
   const bytes = await zip.generateAsync({ type: 'uint8array', compression: 'STORE' });
   return { bytes, manifest, dat, glb: normalized };
 }
@@ -134,10 +214,9 @@ function reflectStrength(metal, roughness) {
 async function bakeMaterialsForVehicle(parsed) {
   const json = structuredClone(parsed.json);
   const state = { json, bin: parsed.bin };
-  if (!Array.isArray(json.materials)) return state;
 
   const bakedCache = new Map();
-  for (const material of json.materials) {
+  for (const material of json.materials || []) {
     const pbr = material.pbrMetallicRoughness || (material.pbrMetallicRoughness = {});
 
     const sheen = material.extensions?.KHR_materials_sheen;
@@ -231,6 +310,7 @@ async function bakeMaterialsForVehicle(parsed) {
     material.emissiveFactor = [0, 0, 0];
     delete material.extensions;
   }
+  ensureMeshNormals(state);
   return state;
 }
 
@@ -659,6 +739,66 @@ function readAttributeAsFloat(state, accessorIndex) {
   return { data, comps: raw.comps, accessor: raw.accessor };
 }
 
+/**
+ * glTF 允许三角网格省略 NORMAL，Three.js 的 PBR 材质会临时使用屏幕空间
+ * 平面法线，但车机的简单光照需要文件中存在真实法线。这里在保持原顶点、索引、
+ * 蒙皮权重和三角形编号不变的前提下补齐法线；共享顶点会得到相邻面的平滑平均。
+ */
+function ensureMeshNormals(state) {
+  for (const mesh of state.json.meshes || []) {
+    for (const primitive of mesh.primitives || []) {
+      if ((primitive.mode ?? 4) !== 4 || Number.isInteger(primitive.attributes?.NORMAL)) continue;
+      const position = readAttributeAsFloat(state, primitive.attributes?.POSITION);
+      if (!position || position.comps !== 3 || position.data.length < 9) continue;
+      const vertexCount = position.data.length / 3;
+      const indices = Number.isInteger(primitive.indices)
+        ? readAccessorData(state, primitive.indices)?.data
+        : null;
+      const indexCount = indices?.length || vertexCount;
+      const normals = new Float32Array(position.data.length);
+      for (let at = 0; at + 2 < indexCount; at += 3) {
+        const a = indices ? indices[at] : at;
+        const b = indices ? indices[at + 1] : at + 1;
+        const c = indices ? indices[at + 2] : at + 2;
+        if (a >= vertexCount || b >= vertexCount || c >= vertexCount) continue;
+        const ax = position.data[a * 3];
+        const ay = position.data[a * 3 + 1];
+        const az = position.data[a * 3 + 2];
+        const abx = position.data[b * 3] - ax;
+        const aby = position.data[b * 3 + 1] - ay;
+        const abz = position.data[b * 3 + 2] - az;
+        const acx = position.data[c * 3] - ax;
+        const acy = position.data[c * 3 + 1] - ay;
+        const acz = position.data[c * 3 + 2] - az;
+        const nx = aby * acz - abz * acy;
+        const ny = abz * acx - abx * acz;
+        const nz = abx * acy - aby * acx;
+        normals[a * 3] += nx;
+        normals[a * 3 + 1] += ny;
+        normals[a * 3 + 2] += nz;
+        normals[b * 3] += nx;
+        normals[b * 3 + 1] += ny;
+        normals[b * 3 + 2] += nz;
+        normals[c * 3] += nx;
+        normals[c * 3 + 1] += ny;
+        normals[c * 3 + 2] += nz;
+      }
+      for (let index = 0; index < vertexCount; index++) {
+        const at = index * 3;
+        const length = Math.hypot(normals[at], normals[at + 1], normals[at + 2]);
+        if (length > 1e-12) {
+          normals[at] /= length;
+          normals[at + 1] /= length;
+          normals[at + 2] /= length;
+        } else {
+          normals[at + 1] = 1;
+        }
+      }
+      primitive.attributes.NORMAL = writeAccessor(state, normals, 5126, 'VEC3');
+    }
+  }
+}
+
 /** 列主序 mat4 左上 3x3 的行列式；负值说明该变换带镜像（会翻转三角形环绕方向） */
 function det3(m) {
   return m[0] * (m[5] * m[10] - m[6] * m[9])
@@ -714,6 +854,58 @@ function transformPoint(m, x, y, z) {
     m[1] * x + m[5] * y + m[9] * z + m[13],
     m[2] * x + m[6] * y + m[10] * z + m[14],
   ];
+}
+
+function transformVector(m, x, y, z) {
+  return [
+    m[0] * x + m[4] * y + m[8] * z,
+    m[1] * x + m[5] * y + m[9] * z,
+    m[2] * x + m[6] * y + m[10] * z,
+  ];
+}
+
+function quatNormalize(q) {
+  const length = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
+  return q.map((value) => value / length);
+}
+
+function quatInverse(q) {
+  const normalized = quatNormalize(q);
+  return [-normalized[0], -normalized[1], -normalized[2], normalized[3]];
+}
+
+function quatMultiply(a, b) {
+  return quatNormalize([
+    a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+    a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+    a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+    a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+  ]);
+}
+
+function quatFromMat4(matrix) {
+  const sx = Math.hypot(matrix[0], matrix[1], matrix[2]) || 1;
+  const sy = Math.hypot(matrix[4], matrix[5], matrix[6]) || 1;
+  const sz = Math.hypot(matrix[8], matrix[9], matrix[10]) || 1;
+  const m00 = matrix[0] / sx, m01 = matrix[4] / sy, m02 = matrix[8] / sz;
+  const m10 = matrix[1] / sx, m11 = matrix[5] / sy, m12 = matrix[9] / sz;
+  const m20 = matrix[2] / sx, m21 = matrix[6] / sy, m22 = matrix[10] / sz;
+  const trace = m00 + m11 + m22;
+  let q;
+  if (trace > 0) {
+    const s = Math.sqrt(trace + 1) * 2;
+    q = [(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, s / 4];
+  } else if (m00 > m11 && m00 > m22) {
+    const s = Math.sqrt(1 + m00 - m11 - m22) * 2;
+    q = [s / 4, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s];
+  } else if (m11 > m22) {
+    const s = Math.sqrt(1 + m11 - m00 - m22) * 2;
+    q = [(m01 + m10) / s, s / 4, (m12 + m21) / s, (m02 - m20) / s];
+  } else {
+    const s = Math.sqrt(1 + m22 - m00 - m11) * 2;
+    q = [(m02 + m20) / s, (m12 + m21) / s, s / 4, (m10 - m01) / s];
+  }
+  return quatNormalize(q);
 }
 
 function parentMapOf(json) {
@@ -927,6 +1119,437 @@ function sourceNodeIndicesOf(binding) {
   return [...new Set(indices.filter(Number.isInteger))];
 }
 
+function collectSubtreeMeshNodes(json, rootIndex) {
+  const nodeIndices = [];
+  let hasSkin = false;
+  const seen = new Set();
+  const visit = (nodeIndex) => {
+    if (seen.has(nodeIndex)) return;
+    seen.add(nodeIndex);
+    const node = json.nodes?.[nodeIndex];
+    if (!node) return;
+    if (Number.isInteger(node.skin)) hasSkin = true;
+    if (Number.isInteger(node.mesh)) nodeIndices.push(nodeIndex);
+    for (const child of node.children || []) visit(child);
+  };
+  visit(rootIndex);
+  return { nodeIndices, hasSkin };
+}
+
+function sourceAnimationDescriptor(state, binding, bake, slot) {
+  const { json } = state;
+  if (animationNamesOf(slot).length === 0) {
+    throw new Error(`${slot.label}：该车机事件不支持动画绑定`);
+  }
+  const animation = json.animations?.[binding.sourceAnimationIndex];
+  if (!animation) throw new Error(`${slot.label}：找不到已绑定的模型动画`);
+  const channels = animation.channels || [];
+  if (channels.length !== 1) throw new Error(`${slot.label}：模型动画必须只有一个动作轨道`);
+  const channel = channels[0];
+  const path = channel.target?.path;
+  const targetNodeIndex = channel.target?.node;
+  const sampler = animation.samplers?.[channel.sampler];
+  if (!Number.isInteger(targetNodeIndex)
+    || !['translation', 'rotation', 'scale'].includes(path)
+    || !sampler
+    || sampler.interpolation === 'CUBICSPLINE'
+    || Array.isArray(json.nodes?.[targetNodeIndex]?.matrix)) {
+    throw new Error(`${slot.label}：该模型动画不符合车机可绑定要求`);
+  }
+
+  const { nodeIndices, hasSkin } = collectSubtreeMeshNodes(json, targetNodeIndex);
+  if (hasSkin || nodeIndices.length === 0) {
+    throw new Error(`${slot.label}：骨骼动画和没有网格的动作暂不支持绑定`);
+  }
+  const input = readAccessorData(state, sampler.input);
+  const output = readAccessorData(state, sampler.output);
+  const expectedComps = path === 'rotation' ? 4 : 3;
+  if (!input || !output || input.comps !== 1 || output.comps !== expectedComps
+    || input.data.length < 2 || output.data.length !== input.data.length * expectedComps) {
+    throw new Error(`${slot.label}：模型动画关键帧数据无效`);
+  }
+  const sourceTimes = Array.from(input.data, Number);
+  if (!sourceTimes.every(Number.isFinite)
+    || sourceTimes.some((time, index) => index > 0 && time <= sourceTimes[index - 1])) {
+    throw new Error(`${slot.label}：模型动画时间轴无效`);
+  }
+  const startTime = sourceTimes[0];
+  const times = sourceTimes.map((time) => time - startTime);
+
+  const target = json.nodes[targetNodeIndex];
+  const staticValue = path === 'translation'
+    ? (target.translation || [0, 0, 0])
+    : path === 'rotation'
+      ? (target.rotation || [0, 0, 0, 1])
+      : (target.scale || [1, 1, 1]);
+  const parents = parentMapOf(json);
+  const parentIndex = parents.get(targetNodeIndex);
+  const parentWorld = parentIndex === undefined
+    ? mat4FromNode({})
+    : worldMatrixOf(json, parentIndex, parents);
+  const bakedParentWorld = mat4Multiply(bake, parentWorld);
+  const bakedTargetWorld = mat4Multiply(bake, worldMatrixOf(json, targetNodeIndex, parents));
+  const pivot = transformPoint(bakedTargetWorld, 0, 0, 0);
+  const values = [];
+
+  if (path === 'translation') {
+    for (let at = 0; at < output.data.length; at += 3) {
+      const delta = [
+        output.data[at] - staticValue[0],
+        output.data[at + 1] - staticValue[1],
+        output.data[at + 2] - staticValue[2],
+      ];
+      const offset = transformVector(bakedParentWorld, delta[0], delta[1], delta[2]);
+      values.push(pivot[0] + offset[0], pivot[1] + offset[1], pivot[2] + offset[2]);
+    }
+  } else if (path === 'rotation') {
+    const parentRotation = quatFromMat4(bakedParentWorld);
+    const parentInverse = quatInverse(parentRotation);
+    const staticInverse = quatInverse(staticValue);
+    for (let at = 0; at < output.data.length; at += 4) {
+      const animated = quatNormalize([
+        output.data[at], output.data[at + 1], output.data[at + 2], output.data[at + 3],
+      ]);
+      const localDelta = quatMultiply(animated, staticInverse);
+      values.push(...quatMultiply(quatMultiply(parentRotation, localDelta), parentInverse));
+    }
+  } else {
+    for (let at = 0; at < output.data.length; at += 3) {
+      const ratio = [0, 1, 2].map((axis) => output.data[at + axis] / staticValue[axis]);
+      if (!ratio.every(Number.isFinite) || Math.max(...ratio) - Math.min(...ratio) > 1e-4) {
+        throw new Error(`${slot.label}：只支持相对静态姿态的等比缩放动画`);
+      }
+      values.push(...ratio);
+    }
+  }
+
+  if (!values.every(Number.isFinite)) throw new Error(`${slot.label}：模型动画包含无效数值`);
+  return {
+    nodeIndices,
+    pivot,
+    path,
+    times,
+    values,
+    interpolation: sampler.interpolation || 'LINEAR',
+  };
+}
+
+function reverseKeyframes(times, values, components) {
+  const duration = times[times.length - 1] || 0;
+  const reversedTimes = times.map((_, index) => duration - times[times.length - 1 - index]);
+  const reversedValues = [];
+  for (let frame = times.length - 1; frame >= 0; frame--) {
+    const start = frame * components;
+    for (let component = 0; component < components; component++) reversedValues.push(values[start + component]);
+  }
+  return { times: reversedTimes, values: reversedValues };
+}
+
+function validateAnimatedOtherClip(state, animation, slot) {
+  const { json } = state;
+  if (!animation || !Array.isArray(animation.channels) || animation.channels.length === 0) {
+    throw new Error(`${slot.label}：找不到已绑定的模型动画`);
+  }
+  for (const channel of animation.channels) {
+    const target = channel.target || {};
+    const sampler = animation.samplers?.[channel.sampler];
+    const input = json.accessors?.[sampler?.input];
+    const output = json.accessors?.[sampler?.output];
+    if (!Number.isInteger(target.node) || !json.nodes?.[target.node]
+      || !['translation', 'rotation', 'scale'].includes(target.path)
+      || !sampler || sampler.interpolation === 'CUBICSPLINE'
+      || input?.componentType !== 5126 || input?.type !== 'SCALAR'
+      || output?.componentType !== 5126
+      || Array.isArray(json.nodes[target.node].matrix)) {
+      throw new Error(`${slot.label}：该动画包含车机尚未验证的轨道结构`);
+    }
+  }
+}
+
+function reverseAnimationClip(state, source, name) {
+  const reversed = structuredClone(source);
+  reversed.name = name;
+  reversed.samplers = (source.samplers || []).map((sampler) => {
+    if (sampler.interpolation === 'CUBICSPLINE') throw new Error(`${name}：暂不支持反转 CUBICSPLINE 动画`);
+    const input = readAccessorData(state, sampler.input);
+    const output = readAccessorData(state, sampler.output);
+    if (!input || !output || input.comps !== 1 || input.data.length < 2
+      || output.data.length % input.data.length !== 0) {
+      throw new Error(`${name}：动画关键帧数据无效`);
+    }
+    const frameCount = input.data.length;
+    const components = output.data.length / frameCount;
+    const end = Number(input.data[frameCount - 1]);
+    const start = Number(input.data[0]);
+    const times = new Float32Array(frameCount);
+    const values = new Float32Array(output.data.length);
+    for (let frame = 0; frame < frameCount; frame++) {
+      const sourceFrame = frameCount - 1 - frame;
+      times[frame] = end - Number(input.data[sourceFrame]);
+      for (let component = 0; component < components; component++) {
+        values[frame * components + component] = output.data[sourceFrame * components + component];
+      }
+    }
+    if (start !== 0) {
+      // The subtraction above intentionally normalizes the reversed clip to t=0.
+    }
+    return {
+      ...sampler,
+      input: writeAccessor(state, times, 5126, 'SCALAR', { min: [0], max: [end - start] }),
+      output: writeAccessor(state, values, 5126, output.accessor.type),
+    };
+  });
+  return reversed;
+}
+
+function quatSlerp(a, b, amount) {
+  let ax = a[0], ay = a[1], az = a[2], aw = a[3];
+  let bx = b[0], by = b[1], bz = b[2], bw = b[3];
+  let cosine = ax * bx + ay * by + az * bz + aw * bw;
+  if (cosine < 0) {
+    cosine = -cosine;
+    bx = -bx; by = -by; bz = -bz; bw = -bw;
+  }
+  if (cosine > 0.9995) {
+    const result = [
+      ax + amount * (bx - ax), ay + amount * (by - ay),
+      az + amount * (bz - az), aw + amount * (bw - aw),
+    ];
+    const length = Math.hypot(...result) || 1;
+    return result.map((value) => value / length);
+  }
+  const theta = Math.acos(Math.min(1, Math.max(-1, cosine)));
+  const sine = Math.sin(theta) || 1;
+  const first = Math.sin((1 - amount) * theta) / sine;
+  const second = Math.sin(amount * theta) / sine;
+  return [
+    ax * first + bx * second, ay * first + by * second,
+    az * first + bz * second, aw * first + bw * second,
+  ];
+}
+
+function animationDurationOf(state, animation) {
+  let duration = 0;
+  for (const channel of animation?.channels || []) {
+    const sampler = animation.samplers?.[channel.sampler];
+    const input = readAccessorData(state, sampler?.input);
+    if (input?.data?.length) duration = Math.max(duration, Number(input.data[input.data.length - 1]) || 0);
+  }
+  return duration;
+}
+
+function sampleAnimationValue(input, output, path, time, interpolation) {
+  const times = input.data;
+  const components = output.comps;
+  const frameCount = times.length;
+  let frame = 0;
+  while (frame + 1 < frameCount && Number(times[frame + 1]) <= time) frame++;
+  const next = Math.min(frame + 1, frameCount - 1);
+  const leftTime = Number(times[frame]);
+  const rightTime = Number(times[next]);
+  const amount = rightTime > leftTime ? Math.min(1, Math.max(0, (time - leftTime) / (rightTime - leftTime))) : 0;
+  const left = Array.from(output.data.slice(frame * components, (frame + 1) * components), Number);
+  if (next === frame || interpolation === 'STEP') return left;
+  const right = Array.from(output.data.slice(next * components, (next + 1) * components), Number);
+  if (path === 'rotation') return quatSlerp(left, right, amount);
+  return left.map((value, index) => value + (right[index] - value) * amount);
+}
+
+function trimmedAnimationClip(state, source, startRatio, endRatio, speed, name) {
+  const duration = animationDurationOf(state, source);
+  const start = duration * startRatio;
+  const end = duration * endRatio;
+  const output = { name, samplers: [], channels: [] };
+  for (const channel of source.channels || []) {
+    const target = channel.target || {};
+    const sampler = source.samplers?.[channel.sampler];
+    const input = readAccessorData(state, sampler?.input);
+    const values = readAccessorData(state, sampler?.output);
+    const path = target.path;
+    if (!input || !values || !sampler || !['translation', 'rotation', 'scale'].includes(path)
+      || input.comps !== 1 || input.data.length < 2 || values.data.length % input.data.length !== 0) {
+      throw new Error(`${name}：动画关键帧数据无效`);
+    }
+    const points = [start];
+    for (const time of input.data) {
+      if (time > start && time < end) points.push(Number(time));
+    }
+    if (end > start && points[points.length - 1] !== end) points.push(end);
+    const components = values.data.length / input.data.length;
+    const times = new Float32Array(points.length);
+    const sampled = new Float32Array(points.length * components);
+    for (let frame = 0; frame < points.length; frame++) {
+      times[frame] = (points[frame] - start) / speed;
+      const value = sampleAnimationValue(input, values, path, points[frame], sampler.interpolation || 'LINEAR');
+      for (let component = 0; component < components; component++) sampled[frame * components + component] = value[component];
+    }
+    const samplerIndex = output.samplers.length;
+    output.samplers.push({
+      input: writeAccessor(state, times, 5126, 'SCALAR', { min: [times[0]], max: [times[times.length - 1]] }),
+      output: writeAccessor(state, sampled, 5126, values.accessor.type),
+      interpolation: sampler.interpolation || 'LINEAR',
+    });
+    output.channels.push({ sampler: samplerIndex, target: { node: target.node, path } });
+  }
+  return output;
+}
+
+function pingPongAnimationClip(state, source, name) {
+  const output = structuredClone(source);
+  output.name = name;
+  output.samplers = (source.samplers || []).map((sampler) => {
+    const input = readAccessorData(state, sampler.input);
+    const values = readAccessorData(state, sampler.output);
+    const components = values.data.length / input.data.length;
+    const duration = Number(input.data[input.data.length - 1]) || 0;
+    const frameCount = input.data.length;
+    const times = new Float32Array(frameCount * 2 - 1);
+    const reversedValues = new Float32Array(values.data.length * 2 - components);
+    for (let frame = 0; frame < frameCount; frame++) {
+      times[frame] = input.data[frame];
+      for (let component = 0; component < components; component++) {
+        reversedValues[frame * components + component] = values.data[frame * components + component];
+      }
+    }
+    for (let frame = 0; frame < frameCount - 1; frame++) {
+      const sourceFrame = frameCount - 2 - frame;
+      times[frameCount + frame] = duration + (duration - input.data[sourceFrame]);
+      for (let component = 0; component < components; component++) {
+        reversedValues[(frameCount + frame) * components + component] = values.data[sourceFrame * components + component];
+      }
+    }
+    return {
+      ...sampler,
+      input: writeAccessor(state, times, 5126, 'SCALAR', { min: [0], max: [duration * 2] }),
+      output: writeAccessor(state, reversedValues, 5126, values.accessor.type),
+    };
+  });
+  return output;
+}
+
+function holdAnimationClip(state, source, name) {
+  const output = structuredClone(source);
+  output.name = name;
+  output.samplers = (source.samplers || []).map((sampler) => {
+    const input = readAccessorData(state, sampler.input);
+    const values = readAccessorData(state, sampler.output);
+    const components = values.data.length / input.data.length;
+    const tail = values.data.slice(values.data.length - components);
+    const repeated = new Float32Array(components * 2);
+    repeated.set(tail);
+    repeated.set(tail, components);
+    return {
+      ...sampler,
+      input: writeAccessor(state, new Float32Array([0, 1]), 5126, 'SCALAR', { min: [0], max: [1] }),
+      output: writeAccessor(state, repeated, 5126, values.accessor.type),
+      interpolation: 'LINEAR',
+    };
+  });
+  return output;
+}
+
+function eventAnimationSet(state, source, slot, binding) {
+  const playback = normalizeOtherPlayback(slot, binding?.playback);
+  const base = `BYD_EVT_${slot.id}`;
+  const range = playback.range;
+  const trimmed = trimmedAnimationClip(state, source, range.start, range.end, playback.speed, `${base}_SOURCE`);
+  let active = playback.direction === 'reverse'
+    ? reverseAnimationClip(state, trimmed, `${base}_ACTIVE`)
+    : trimmed;
+  const mode = playback.mode === 'pingpong' ? 'pingpong' : playback.mode;
+  if (mode === 'pingpong') active = pingPongAnimationClip(state, active, `${base}_PINGPONG`);
+  const on = structuredClone(active);
+  on.name = `${base}_${mode === 'loop' || mode === 'pingpong' ? (mode === 'pingpong' ? 'PINGPONG' : 'LOOP') : 'ON'}`;
+  const oneWay = animationDurationOf(state, trimmed);
+  const activeDuration = animationDurationOf(state, active);
+  const needHold = playback.mode === 'hold' || ['hold', 'finish'].includes(playback.endMode);
+  const hold = needHold ? holdAnimationClip(state, active, `${base}_HOLD`) : null;
+  const off = playback.endMode === 'reverse'
+    ? reverseAnimationClip(state, active, `${base}_OFF`)
+    : null;
+  const spec = {
+    on: on.name,
+    off: off?.name || '',
+    hold: hold?.name || '',
+    onMode: playback.mode === 'once' || playback.mode === 'hold' ? 'once' : 'loop',
+    offMode: off ? 'once' : 'stop',
+    onRepeat: playback.mode === 'once' || playback.mode === 'hold' ? 1 : -1,
+    offRepeat: 1,
+    onDurationMs: Math.max(1, Math.round(activeDuration * 1000)),
+    offDurationMs: Math.max(1, Math.round(animationDurationOf(state, off || active) * 1000)),
+    cycleDurationMs: Math.max(1, Math.round((playback.mode === 'pingpong' ? activeDuration : oneWay) * 1000)),
+    activeEnd: playback.mode === 'hold' ? 'hold' : playback.mode === 'once' ? 'reset' : 'none',
+    endMode: playback.endMode,
+    playback,
+  };
+  return { animations: [on, ...(off ? [off] : []), ...(hold ? [hold] : [])], spec };
+}
+
+async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions) {
+  const state = { json: structuredClone(parsed.json), bin: parsed.bin };
+  const { json } = state;
+  const sceneIndex = Number.isInteger(json.scene) ? json.scene : 0;
+  const scene = json.scenes?.[sceneIndex];
+  if (!scene?.nodes?.length) throw new Error('默认场景不存在或为空');
+  const sourceRoots = [...scene.nodes];
+  const sourceAnimations = json.animations || [];
+
+  for (let nodeIndex = 0; nodeIndex < (json.nodes || []).length; nodeIndex++) {
+    const node = json.nodes[nodeIndex];
+    if (node.name === 'CS_Car') node.name = 'Imported_CS_Car';
+    if (node.name === 'CS_Shadow') {
+      node.name = 'Imported_CS_Shadow';
+      detachNode(json, sourceRoots, nodeIndex);
+    }
+    delete node.camera;
+  }
+
+  const bake = mat4FromNode(transform || {});
+  applyDeletions(state, deletions, sourceRoots, bake);
+
+  const outputAnimations = [];
+  const eventBindings = {};
+  for (const binding of bindings || []) {
+    const slot = SLOT_BY_ID.get(binding.slotId);
+    const source = sourceAnimations[binding.sourceAnimationIndex];
+    if (!slot || !Number.isInteger(binding.sourceAnimationIndex)) continue;
+    validateAnimatedOtherClip(state, source, slot);
+    const event = eventAnimationSet(state, source, slot, binding);
+    outputAnimations.push(...event.animations);
+    const spec = event.spec;
+    const { playback, ...eventSpec } = spec;
+    eventBindings[slot.id] = { part: 'CS_Car', ...eventSpec };
+  }
+  json.animations = outputAnimations.length ? outputAnimations : undefined;
+
+  const modelBounds = boundsOfOutputGeometry(state, sourceRoots, [], bake);
+  const shadowIndex = await addAutomaticShadow(state, modelBounds);
+  const rootIndex = json.nodes.length;
+  json.nodes.push({
+    name: 'CS_Car',
+    children: sourceRoots,
+    translation: transform?.translation || [0, 0, 0],
+    rotation: transform?.rotation || [0, 0, 0, 1],
+    scale: transform?.scale || [1, 1, 1],
+  });
+  json.scenes = [{ name: 'Scene', nodes: [rootIndex, shadowIndex] }];
+  json.scene = 0;
+  json.cameras = undefined;
+  json.lights = undefined;
+  json.extensionsRequired = undefined;
+  json.extensionsUsed = undefined;
+  json.asset = { version: '2.0', generator: 'BYD Car Model Converter' };
+
+  dedupeMaterials(state);
+  await bakeDirectionalGradient(state, bake, new Set());
+  pruneOrphanNodes(state);
+  pruneUnusedMeshes(state);
+  pruneUnusedTextures(state);
+  pruneUnusedAccessors(state);
+  repackBin(state);
+  return { state, eventBindings };
+}
+
 function preservesSourceGeometry(binding) {
   return binding.preserveSource === true || binding.slotId === 'CS_Emergency';
 }
@@ -1133,7 +1756,6 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
     if (node.name === 'CS_Car') node.name = 'CS_Car_Imported';
     if (node.name === 'CS_Shadow') node.name = 'CS_Shadow_Imported';
     delete node.camera;
-    delete node.skin;
   }
   // 一旦输入包自带阴影，统一换成按当前车身轮廓重建的 CS_Shadow，避免两层阴影叠加。
   for (const nodeIndex of [...sourceRoots]) {
@@ -1153,6 +1775,9 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
   // 否则删除会重写索引，使精细选面保存的三角形编号失效。
   const parts = applyBindings(state, bindings, sourceRoots, bake);
   applyDeletions(state, deletions, sourceRoots, bake, parts.nodeIndices);
+  // applyBindings 需要先读取 skin 标记来拒绝车机无法安全播放的骨骼动画。
+  // 完成源动画判定后再沿用原管线移除蒙皮信息。
+  for (const node of json.nodes) delete node.skin;
   const validPartNodes = new Set(parts.nodeIndices.filter((nodeIndex) => Number.isInteger(json.nodes?.[nodeIndex]?.mesh)));
   parts.nodeIndices = parts.nodeIndices.filter((nodeIndex) => validPartNodes.has(nodeIndex));
   parts.animations = parts.animations.filter((animation) => (
@@ -1393,6 +2018,10 @@ function pruneOrphanNodes(state) {
     for (const channel of animation.channels || []) {
       channel.target.node = remap.get(channel.target.node);
     }
+  }
+  for (const skin of json.skins || []) {
+    skin.joints = (skin.joints || []).map((nodeIndex) => remap.get(nodeIndex));
+    if (Number.isInteger(skin.skeleton)) skin.skeleton = remap.get(skin.skeleton);
   }
 }
 
@@ -1673,6 +2302,9 @@ function pruneUnusedAccessors(state) {
   for (const mesh of json.meshes || []) {
     for (const primitive of mesh.primitives || []) {
       for (const value of Object.values(primitive.attributes || {})) used.add(value);
+      for (const target of primitive.targets || []) {
+        for (const value of Object.values(target || {})) used.add(value);
+      }
       if (Number.isInteger(primitive.indices)) used.add(primitive.indices);
     }
   }
@@ -1681,6 +2313,9 @@ function pruneUnusedAccessors(state) {
       used.add(sampler.input);
       used.add(sampler.output);
     }
+  }
+  for (const skin of json.skins || []) {
+    if (Number.isInteger(skin.inverseBindMatrices)) used.add(skin.inverseBindMatrices);
   }
   if (used.size >= json.accessors.length) return;
   const remap = new Map();
@@ -1696,6 +2331,9 @@ function pruneUnusedAccessors(state) {
       for (const key of Object.keys(primitive.attributes || {})) {
         primitive.attributes[key] = remap.get(primitive.attributes[key]);
       }
+      for (const target of primitive.targets || []) {
+        for (const key of Object.keys(target || {})) target[key] = remap.get(target[key]);
+      }
       if (Number.isInteger(primitive.indices)) primitive.indices = remap.get(primitive.indices);
     }
   }
@@ -1703,6 +2341,11 @@ function pruneUnusedAccessors(state) {
     for (const sampler of animation.samplers || []) {
       sampler.input = remap.get(sampler.input);
       sampler.output = remap.get(sampler.output);
+    }
+  }
+  for (const skin of json.skins || []) {
+    if (Number.isInteger(skin.inverseBindMatrices)) {
+      skin.inverseBindMatrices = remap.get(skin.inverseBindMatrices);
     }
   }
 }
@@ -1762,17 +2405,26 @@ function applyBindings(state, bindings, sourceRoots, bake) {
   if (!Array.isArray(bindings) || bindings.length === 0) return result;
   const { json } = state;
   const lampMaterialBySlot = new Map();
+  const effectiveBindings = [];
 
   // 第一阶段只复制：每个绑定都面对同一份未被其他绑定切过的源几何，
   // 因此完全重叠、部分重叠以及整节点与区域混用都不依赖处理顺序。
   for (const binding of bindings) {
     const slot = SLOT_BY_ID.get(binding.slotId);
     if (!slot) continue;
+    const sourceAnimation = Number.isInteger(binding.sourceAnimationIndex)
+      ? sourceAnimationDescriptor(state, binding, bake, slot)
+      : null;
+    // 原动画可以挂在没有网格的父节点上；导出时要提取整个子树，并以该父节点的
+    // 静态世界原点作为新顶层部件的枢轴，才不会改变原动画的运动轨迹。
+    const effectiveBinding = sourceAnimation
+      ? { ...binding, nodeIndices: sourceAnimation.nodeIndices, pivot: sourceAnimation.pivot }
+      : binding;
     const part = extractPart(state, {
-      nodeIndices: sourceNodeIndicesOf(binding),
-      region: binding.region || null,
-      selection: binding.selection || null,
-      pivot: binding.pivot,
+      nodeIndices: sourceNodeIndicesOf(effectiveBinding),
+      region: effectiveBinding.region || null,
+      selection: effectiveBinding.selection || null,
+      pivot: effectiveBinding.pivot,
       name: slot.id,
       label: slot.label,
       bake,
@@ -1782,7 +2434,9 @@ function applyBindings(state, bindings, sourceRoots, bake) {
     // 所有 primitive 只使用一个同名独立材质：地图按材质名换灯光贴图，若与
     // 其他槽位或车身共享材质，就会出现“踩刹车所有灯一起亮”。
     const partMesh = json.meshes[json.nodes[part.nodeIndex].mesh];
-    const isLamp = slot.kind === 'lamp' || slot.kind === 'blink';
+    // 其他模型模式下，转向灯等事件是直接播放原动画，不能再套用车辆灯光的
+    // 材质切换逻辑，否则事件会把无关模型部分染成同一种颜色。
+    const isLamp = !sourceAnimation && (slot.kind === 'lamp' || slot.kind === 'blink');
     if (isLamp) {
       let materialIndex = lampMaterialBySlot.get(slot.id);
       if (materialIndex === undefined) {
@@ -1813,30 +2467,36 @@ function applyBindings(state, bindings, sourceRoots, bake) {
     }
 
     for (const animationName of animationNamesOf(slot)) {
-      const keyframes = buildKeyframes(slot, binding, animationName);
+      const keyframes = sourceAnimation
+        ? (animationName.endsWith('_Close')
+          ? reverseKeyframes(sourceAnimation.times, sourceAnimation.values, sourceAnimation.path === 'rotation' ? 4 : 3)
+          : { times: sourceAnimation.times, values: sourceAnimation.values })
+        : buildKeyframes(slot, effectiveBinding, animationName);
+      const path = sourceAnimation?.path || keyframes.path;
       const input = writeAccessor(state, Float32Array.from(keyframes.times), 5126, 'SCALAR', {
         min: [keyframes.times[0]], max: [keyframes.times[keyframes.times.length - 1]],
       });
       const output = writeAccessor(state, Float32Array.from(keyframes.values), 5126,
-        keyframes.path === 'rotation' ? 'VEC4' : 'VEC3');
+        path === 'rotation' ? 'VEC4' : 'VEC3');
       result.animations.push({
         name: animationName,
-        samplers: [{ input, output, interpolation: 'LINEAR' }],
-        channels: [{ sampler: 0, target: { node: part.nodeIndex, path: keyframes.path } }],
+        samplers: [{ input, output, interpolation: sourceAnimation?.interpolation || 'LINEAR' }],
+        channels: [{ sampler: 0, target: { node: part.nodeIndex, path } }],
       });
     }
 
     result.nodeIndices.push(part.nodeIndex);
+    effectiveBindings.push(effectiveBinding);
     if (isLamp) {
-      result.lamps.push({ slotId: slot.id, color: binding.color || slot.color });
+      result.lamps.push({ slotId: slot.id, color: effectiveBinding.color || slot.color });
     }
   }
 
   // 第二阶段统一消费静态源几何。区域绑定按并集扣除；整节点绑定只摘一次。
   // preserveSource（目前为双闪）只生成副本，不参与任何源几何删除。
-  consumeBindingRegions(state, bindings, sourceRoots, bake);
+  consumeBindingRegions(state, effectiveBindings, sourceRoots, bake);
   const detached = new Set();
-  for (const binding of bindings) {
+  for (const binding of effectiveBindings) {
     if (binding.region || binding.selection || preservesSourceGeometry(binding)) continue;
     for (const nodeIndex of sourceNodeIndicesOf(binding)) {
       if (detached.has(nodeIndex) || !json.nodes?.[nodeIndex]?.mesh) continue;
@@ -2042,11 +2702,20 @@ function readAscii(bytes, offset, length) { return String.fromCharCode(...bytes.
 function writeAscii(bytes, offset, value) { for (let i = 0; i < value.length; i++) bytes[offset + i] = value.charCodeAt(i); }
 
 /** 生成与最终 .bydcar 完全同管线的 GLB，供“车机质感”预览。 */
-export async function makeVehiclePreviewGlb(sourceBytes, transform, bindings = [], deletions = [], quality) {
+export async function makeVehiclePreviewGlb(
+  sourceBytes,
+  transform,
+  bindings = [],
+  deletions = [],
+  quality,
+  modelType = 'vehicle',
+) {
   const exportQuality = normalizeExportQuality(quality);
   const parsed = parseGlb(sourceBytes);
   const baked = await bakeMaterialsForVehicle(parsed);
-  const normalized = await normalizeParsedGlb(baked, transform, bindings, [], deletions);
+  const normalized = modelType === 'other'
+    ? (await normalizeAnimatedOtherGlb(baked, transform, bindings, deletions)).state
+    : await normalizeParsedGlb(baked, transform, bindings, [], deletions);
   await resizeEmbeddedImages(normalized, exportQuality.textureMaxSize);
   await simplifyMeshToTarget(normalized, exportQuality.triangleTarget);
   return buildGlb(normalized.json, normalized.bin);

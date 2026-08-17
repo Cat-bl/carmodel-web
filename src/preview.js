@@ -3,7 +3,12 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { acceleratedRaycast, MeshBVH } from 'three-mesh-bvh';
-import { animationNamesOf, buildKeyframes } from './bindings.js';
+import {
+  actionKindOf,
+  animationNamesOf,
+  buildKeyframes,
+  normalizeOtherPlayback,
+} from './bindings.js';
 import { createCarShadowCanvas, shadowFootprint } from './shadow.js';
 import { inferModelFront } from './orientation.js';
 import {
@@ -29,6 +34,59 @@ const TARGET = Object.freeze({ x: 5.2, y: 1.8, z: 2.0 });
 
 function nextPaint() {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function trimThreeTrack(track, start, end, speed) {
+  const points = [start];
+  for (const time of track.times) {
+    if (time > start && time < end) points.push(Number(time));
+  }
+  if (end > start && points[points.length - 1] !== end) points.push(end);
+  const components = track.getValueSize();
+  const interpolant = track.createInterpolant(new Float32Array(components));
+  const values = [];
+  for (const point of points) values.push(...Array.from(interpolant.evaluate(point), Number));
+  const times = points.map((point) => (point - start) / speed);
+  return new track.constructor(track.name, times, values, track.getInterpolation());
+}
+
+function reverseThreeTrack(track) {
+  const components = track.getValueSize();
+  const duration = Number(track.times[track.times.length - 1]) || 0;
+  const times = Array.from(track.times, (_, index) => duration - track.times[track.times.length - 1 - index]);
+  const values = [];
+  for (let frame = track.times.length - 1; frame >= 0; frame--) {
+    for (let component = 0; component < components; component++) {
+      values.push(track.values[frame * components + component]);
+    }
+  }
+  return new track.constructor(track.name, times, values, track.getInterpolation());
+}
+
+function pingPongThreeTrack(track) {
+  const components = track.getValueSize();
+  const duration = Number(track.times[track.times.length - 1]) || 0;
+  const times = Array.from(track.times, Number);
+  const values = Array.from(track.values, Number);
+  for (let frame = track.times.length - 2; frame >= 0; frame--) {
+    times.push(duration + (duration - track.times[frame]));
+    for (let component = 0; component < components; component++) {
+      values.push(track.values[frame * components + component]);
+    }
+  }
+  return new track.constructor(track.name, times, values, track.getInterpolation());
+}
+
+function configuredThreeClip(source, playback, { reverse = false } = {}) {
+  const normalized = normalizeOtherPlayback(null, playback);
+  const start = source.duration * normalized.range.start;
+  const end = source.duration * normalized.range.end;
+  let tracks = source.tracks.map((track) => trimThreeTrack(track, start, end, normalized.speed));
+  if (normalized.direction === 'reverse') tracks = tracks.map(reverseThreeTrack);
+  if (normalized.mode === 'pingpong') tracks = tracks.map(pingPongThreeTrack);
+  if (reverse) tracks = tracks.map(reverseThreeTrack);
+  const duration = tracks.reduce((max, track) => Math.max(max, Number(track.times[track.times.length - 1]) || 0), 0);
+  return new THREE.AnimationClip(source.name, duration, tracks);
 }
 
 function readFileWithProgress(file, onProgress) {
@@ -274,7 +332,7 @@ export class ModelPreview {
     this.scene.add(sprite);
   }
 
-  async load(source, onProgress = null) {
+  async load(source, onProgress = null, { modelType = 'vehicle' } = {}) {
     const report = (progress, label, indeterminate = false) => onProgress?.({ progress, label, indeterminate });
     report(0.04, '正在读取规范化模型');
     const bytes = source?.bytes
@@ -295,8 +353,11 @@ export class ModelPreview {
     this.loadedAnimations = gltf.animations || [];
     this.model.name = 'CS_Car';
     this.scene.add(this.model);
-    report(0.72, '正在分析模型朝向');
-    const orientation = inferModelFront(this.model);
+    const isVehicle = modelType !== 'other';
+    report(0.72, isVehicle ? '正在分析模型朝向' : '正在保留模型原始朝向');
+    const orientation = isVehicle
+      ? inferModelFront(this.model)
+      : { detected: false, rotationY: 0, confidence: 1, method: 'original', reason: '其他模型保持原始朝向' };
     this.rotation = { x: 0, y: orientation.rotationY, z: 0 };
     this.normalize();
     this.frameObject();
@@ -334,6 +395,59 @@ export class ModelPreview {
         this.selectionMeshes.set(mesh, { nodeIndex, primitiveIndex });
       });
     });
+  }
+
+  /** Lists source clips that can be preserved as normal glTF TRS animations.
+   * The built-in R1 model proves that the renderer accepts skinned meshes and
+   * multi-channel clips. Morph targets and CUBICSPLINE remain excluded until
+   * they have equivalent device evidence. */
+  listBindableAnimations() {
+    const json = this.gltfJson;
+    if (!json?.animations?.length) return [];
+    const scene = json.scenes?.[Number.isInteger(json.scene) ? json.scene : 0];
+    const nodeIndices = [];
+    const seen = new Set();
+    const visit = (index) => {
+      if (seen.has(index)) return;
+      seen.add(index);
+      const node = json.nodes?.[index];
+      if (!node) return;
+      if (Number.isInteger(node.mesh)) nodeIndices.push(index);
+      for (const child of node.children || []) visit(child);
+    };
+    for (const root of scene?.nodes || []) visit(root);
+    if (nodeIndices.length === 0) return [];
+    const options = [];
+    json.animations.forEach((animation, index) => {
+      const channels = animation.channels || [];
+      if (channels.length === 0) return;
+      let valid = true;
+      for (const channel of channels) {
+        const path = channel.target?.path;
+        const targetNodeIndex = channel.target?.node;
+        const sampler = animation.samplers?.[channel.sampler];
+        if (!Number.isInteger(targetNodeIndex)
+          || !['translation', 'rotation', 'scale'].includes(path)
+          || !sampler
+          || sampler.interpolation === 'CUBICSPLINE'
+          || Array.isArray(json.nodes?.[targetNodeIndex]?.matrix)) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) return;
+      const clip = this.loadedAnimations[index];
+      if (!clip || clip.tracks.length === 0 || !(Number(clip.duration) > 0)) return;
+      options.push({
+        index,
+        name: String(animation.name || clip.name || `动画 ${index + 1}`),
+        duration: Number(clip.duration) || 0,
+        channelCount: channels.length,
+        skinned: nodeIndices.some((nodeIndex) => Number.isInteger(json.nodes?.[nodeIndex]?.skin)),
+        nodeIndices: [...nodeIndices],
+      });
+    });
+    return options;
   }
 
   /**
@@ -851,10 +965,32 @@ export class ModelPreview {
    * 关键帧与导出用同一份 buildKeyframes，保证所见即所得；
    * 灯光/闪烁类会把目标换成点亮纯色，对应车机端换纯色贴图的效果。
    */
-  previewBinding(slot, params) {
+  previewBinding(slot, params, phase = 'on') {
     this.stopBindingPreview();
     if (!this.model || !slot) return;
-    if (this.deviceMode && this.previewExportedBinding(slot, params)) return;
+    if (this.deviceMode && this.previewExportedBinding(slot, params, phase)) return;
+    if (Number.isInteger(params.sourceAnimationIndex)) {
+      const playback = normalizeOtherPlayback(slot, params.playback);
+      if (phase === 'off' && playback.endMode === 'reset') return;
+      const source = this.loadedAnimations[params.sourceAnimationIndex];
+      if (!source) return;
+      const clip = configuredThreeClip(source, playback, { reverse: phase === 'off' && playback.endMode === 'reverse' });
+      this.mixer = new THREE.AnimationMixer(this.model);
+      const action = this.mixer.clipAction(clip);
+      const loop = phase === 'on' && ['loop', 'pingpong'].includes(playback.mode);
+      action.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
+      action.clampWhenFinished = phase === 'off'
+        ? playback.endMode !== 'reverse'
+        : playback.mode === 'hold';
+      action.reset();
+      if (phase === 'off' && playback.endMode === 'hold') {
+        action.time = clip.duration;
+        action.paused = true;
+      }
+      action.play();
+      if (action.paused) this.mixer.update(0);
+      return;
+    }
     const selectionNodes = (params.selection?.groups || []).map((group) => group.nodeIndex);
     const targetIndices = selectionNodes.length ? [...new Set(selectionNodes)] : (params.nodeIndices || []);
     const targets = targetIndices.flatMap((i) => this.meshesOfNode(i));
@@ -919,20 +1055,26 @@ export class ModelPreview {
     this.mixer = new THREE.AnimationMixer(group);
     const action = this.mixer.clipAction(clip);
     // 开合类来回播放，正好演示开→关；转动与闪烁单向循环
-    action.setLoop(slot.kind === 'hinge' ? THREE.LoopPingPong : THREE.LoopRepeat, Infinity);
+    action.setLoop(['hinge', 'scale'].includes(actionKindOf(slot, params)) ? THREE.LoopPingPong : THREE.LoopRepeat, Infinity);
     action.play();
   }
 
   /** 车机模式直接播放最终 GLB 中导出的节点和动画，不再依赖原模型节点下标。 */
-  previewExportedBinding(slot, params) {
-    const nodeIndex = this.gltfJson?.nodes?.findIndex((node) => node.name === slot.id) ?? -1;
+  previewExportedBinding(slot, params, phase = 'on') {
+    // 其他模型导出时保留完整骨架，并统一用 CS_Car 作为事件部件；
+    // 车辆模式仍然使用各槽位自己的 CS_* 节点。
+    const isSourceAnimation = Number.isInteger(params.sourceAnimationIndex);
+    const exportedRootName = isSourceAnimation ? 'CS_Car' : slot.id;
+    const nodeIndex = this.gltfJson?.nodes?.findIndex((node) => node.name === exportedRootName) ?? -1;
     if (nodeIndex < 0) return false;
     const target = this.nodeObjects?.[nodeIndex];
     const meshes = this.meshesOfNode(nodeIndex);
-    if (!target || meshes.length === 0) return false;
+    // CS_Car 可能只是骨架/控制根，没有直接 mesh；只要节点存在即可交给
+    // AnimationMixer 驱动其整个子树。
+    if (!target || (!isSourceAnimation && meshes.length === 0)) return false;
 
     const materialRestores = [];
-    if (slot.kind === 'lamp' || slot.kind === 'blink') {
+    if (!isSourceAnimation && (slot.kind === 'lamp' || slot.kind === 'blink')) {
       for (const mesh of meshes) {
         const original = mesh.material;
         const originals = Array.isArray(original) ? original : [original];
@@ -952,7 +1094,20 @@ export class ModelPreview {
       materialRestores,
     };
 
-    const animationName = animationNamesOf(slot)[0];
+    const playback = normalizeOtherPlayback(slot, params.playback);
+    const activeAnimationName = `BYD_EVT_${slot.id}_${playback.mode === 'pingpong' ? 'PINGPONG' : playback.mode === 'loop' ? 'LOOP' : 'ON'}`;
+    const expectedEventAnimation = phase === 'off'
+      ? (playback.endMode === 'reverse'
+        ? `BYD_EVT_${slot.id}_OFF`
+        : playback.endMode === 'hold'
+          ? `BYD_EVT_${slot.id}_HOLD`
+          : playback.endMode === 'finish' ? activeAnimationName : '')
+      : activeAnimationName;
+    const animationName = isSourceAnimation
+      ? (this.gltfJson?.animations || [])
+        .map((animation) => animation.name)
+        .find((name) => name === expectedEventAnimation)
+      : animationNamesOf(slot)[0];
     const clip = animationName
       ? this.loadedAnimations.find((animation) => animation.name === animationName)
       : null;
@@ -960,13 +1115,39 @@ export class ModelPreview {
 
     this.mixer = new THREE.AnimationMixer(this.model);
     const action = this.mixer.clipAction(clip);
-    action.setLoop(slot.kind === 'hinge' ? THREE.LoopPingPong : THREE.LoopRepeat, Infinity);
+    if (isSourceAnimation) {
+      const isLoop = (phase === 'on' && ['loop', 'pingpong'].includes(playback.mode))
+        || (phase === 'off' && playback.endMode === 'hold');
+      action.setLoop(isLoop ? THREE.LoopRepeat : THREE.LoopOnce, isLoop ? Infinity : 1);
+      action.clampWhenFinished = phase === 'on' ? playback.mode === 'hold' : false;
+
+      if (phase === 'off' && playback.endMode === 'finish') {
+        const holdName = `BYD_EVT_${slot.id}_HOLD`;
+        const holdClip = this.loadedAnimations.find((animation) => animation.name === holdName);
+        const mixer = this.mixer;
+        const onFinished = (event) => {
+          if (event.action !== action || this.mixer !== mixer) return;
+          mixer.removeEventListener('finished', onFinished);
+          if (!holdClip) return;
+          const holdAction = mixer.clipAction(holdClip);
+          holdAction.setLoop(THREE.LoopRepeat, Infinity);
+          holdAction.reset().play();
+        };
+        mixer.addEventListener('finished', onFinished);
+        this.bindingPreview.mixerFinishedHandler = onFinished;
+      }
+    } else {
+      action.setLoop(['hinge', 'scale'].includes(actionKindOf(slot, params)) ? THREE.LoopPingPong : THREE.LoopRepeat, Infinity);
+    }
     action.reset().play();
     return true;
   }
 
   stopBindingPreview() {
     if (this.mixer) {
+      if (this.bindingPreview?.mixerFinishedHandler) {
+        this.mixer.removeEventListener('finished', this.bindingPreview.mixerFinishedHandler);
+      }
       this.mixer.stopAllAction();
       this.mixer = null;
     }
@@ -1387,6 +1568,7 @@ export class ModelPreview {
         child.material = materials.map((material) => new THREE.MeshLambertMaterial({
           map: material.map || null,
           color: material.color?.clone() || new THREE.Color(0xffffff),
+          flatShading: material.flatShading || !child.geometry?.attributes?.normal,
           transparent: material.transparent || false,
           opacity: material.opacity ?? 1,
           side: material.side,

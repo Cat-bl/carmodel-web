@@ -53,6 +53,92 @@ export const BINDING_SLOTS = [
 
 export const SLOT_BY_ID = new Map(BINDING_SLOTS.map((slot) => [slot.id, slot]));
 
+const OTHER_SLOT_PRESENTATION = {
+  CS_WF: { label: '前进', group: '移动', trigger: '车辆开始或停止行驶时触发' },
+  CS_LDirection: { trigger: '左转向灯打开时触发' },
+  CS_RDirection: { trigger: '右转向灯打开时触发' },
+  CS_Emergency: { trigger: '双闪打开时触发' },
+  CS_Lower: { trigger: '近光灯打开时触发' },
+  CS_High: { trigger: '远光灯打开时触发' },
+  CS_Stop: { trigger: '刹车灯打开时触发' },
+  CS_Daytime: { trigger: '日行灯打开时触发' },
+  CS_LF: { trigger: '左前门打开或关闭时触发' },
+  CS_RF: { trigger: '右前门打开或关闭时触发' },
+  CS_LB: { trigger: '左后门打开或关闭时触发' },
+  CS_RB: { trigger: '右后门打开或关闭时触发' },
+  CS_Bonnet: { trigger: '引擎盖打开或关闭时触发' },
+  CS_Trunk: { trigger: '后备箱打开或关闭时触发' },
+};
+
+export function slotForMode(slotOrId, modelType = 'vehicle') {
+  const slot = typeof slotOrId === 'string' ? SLOT_BY_ID.get(slotOrId) : slotOrId;
+  if (!slot || modelType !== 'other') return slot;
+  return { ...slot, ...(OTHER_SLOT_PRESENTATION[slot.id] || {}) };
+}
+
+/**
+ * 其他模型的事件动画播放策略。未保存过配置的旧项目继续沿用原默认值：
+ * 开合/灯光单次播放并在事件结束时反向恢复，循环类事件结束时直接停止。
+ */
+export function normalizeOtherPlayback(slot, value = {}) {
+  const defaults = slot?.kind === 'hinge' || slot?.kind === 'lamp'
+    ? { mode: 'hold', direction: 'forward', endMode: 'reverse' }
+    : { mode: 'loop', direction: 'forward', endMode: 'reset' };
+  const stored = value && typeof value === 'object' ? value : {};
+  const legacy = Object.keys(stored).length > 0 && stored.version !== 2;
+  const requestedMode = legacy && stored.mode === 'once' ? 'hold' : stored.mode;
+  const speed = Math.min(4, Math.max(0.1, Number(stored.speed) || 1));
+  const rawStart = Number(stored.range?.start ?? stored.rangeStart);
+  const rawEnd = Number(stored.range?.end ?? stored.rangeEnd);
+  const start = Number.isFinite(rawStart) ? Math.min(0.98, Math.max(0, rawStart)) : 0;
+  const end = Number.isFinite(rawEnd) ? Math.min(1, Math.max(start + 0.01, rawEnd)) : 1;
+  return {
+    version: 2,
+    mode: ['once', 'hold', 'loop', 'pingpong'].includes(requestedMode) ? requestedMode : defaults.mode,
+    direction: ['forward', 'reverse'].includes(stored.direction) ? stored.direction : defaults.direction,
+    endMode: ['reverse', 'reset', 'hold', 'finish'].includes(stored.endMode)
+      ? stored.endMode
+      : stored.endMode === 'stop' ? 'reset' : defaults.endMode,
+    speed,
+    range: { start, end },
+  };
+}
+
+export function playbackDurationOf(sourceDuration, playback, { cycle = true } = {}) {
+  const duration = Math.max(0, Number(sourceDuration) || 0);
+  const normalized = normalizeOtherPlayback(null, playback);
+  const oneWay = duration * (normalized.range.end - normalized.range.start) / normalized.speed;
+  return cycle && normalized.mode === 'pingpong' ? oneWay * 2 : oneWay;
+}
+
+const OTHER_ACTION_OPTIONS = {
+  lamp: [{ value: 'lamp', label: '发光 / 换色' }],
+  blink: [
+    { value: 'blink', label: '闪烁显隐' },
+    { value: 'spin', label: '循环旋转' },
+    { value: 'swing', label: '往复摆动' },
+  ],
+  spin: [
+    { value: 'spin', label: '循环旋转' },
+    { value: 'swing', label: '往复摆动' },
+    { value: 'pulse', label: '循环缩放' },
+  ],
+  hinge: [
+    { value: 'hinge', label: '旋转开合' },
+    { value: 'scale', label: '缩放开合' },
+  ],
+};
+
+export function actionOptionsOf(slot, modelType = 'vehicle') {
+  if (!slot || modelType !== 'other') return [];
+  return OTHER_ACTION_OPTIONS[slot.kind] || [];
+}
+
+export function actionKindOf(slot, params = {}) {
+  const value = params.actionKind;
+  return OTHER_ACTION_OPTIONS[slot?.kind]?.some((option) => option.value === value) ? value : slot?.kind;
+}
+
 // 页面暂时隐藏这三个绑定入口；槽位定义和导出兼容逻辑继续保留，方便后续恢复。
 const PAGE_HIDDEN_SLOT_IDS = new Set([
   'CS_Clearance', // 示宽灯
@@ -60,10 +146,16 @@ const PAGE_HIDDEN_SLOT_IDS = new Set([
   'CS_Backup', // 倒车灯
 ]);
 
-export function slotGroups() {
+// “其他模型”只需要感知车辆是否正在行驶。地图会同时派发前、后轮事件，
+// 因此统一复用 CS_WF 作为“前进”，隐藏 CS_WB，避免同一骨骼动作被播放两次。
+const OTHER_HIDDEN_SLOT_IDS = new Set(['CS_WB']);
+
+export function slotGroups(modelType = 'vehicle') {
   const groups = new Map();
-  for (const slot of BINDING_SLOTS) {
+  for (const baseSlot of BINDING_SLOTS) {
+    const slot = slotForMode(baseSlot, modelType);
     if (PAGE_HIDDEN_SLOT_IDS.has(slot.id)) continue;
+    if (modelType === 'other' && OTHER_HIDDEN_SLOT_IDS.has(slot.id)) continue;
     if (!groups.has(slot.group)) groups.set(slot.group, []);
     groups.get(slot.group).push(slot);
   }
@@ -79,18 +171,18 @@ export function animationNamesOf(slot) {
 }
 
 /** 按部件包围盒给出默认参数，用户可再调。 */
-export function defaultParams(slot, bounds) {
+export function defaultParams(slot, bounds, { modelType = 'vehicle' } = {}) {
   const center = [
     (bounds.min[0] + bounds.max[0]) / 2,
     (bounds.min[1] + bounds.max[1]) / 2,
     (bounds.min[2] + bounds.max[2]) / 2,
   ];
   const params = { pivot: center, axis: slot.axis, angle: slot.angle, color: slot.color };
-  if (slot.kind === 'hinge') {
+  if (slot.kind === 'hinge' && modelType !== 'other') {
     // 铰链在部件的车头侧或车尾侧边缘（X 为纵向，−X 是车头）
     params.pivot = [slot.hinge === 'front' ? bounds.min[0] : bounds.max[0], center[1], center[2]];
   }
-  if (slot.kind === 'spin') {
+  if (slot.kind === 'spin' && modelType !== 'other') {
     // 轮轴取横向中心，保证左右两侧同轴转动
     params.pivot = [center[0], center[1], 0];
   }
@@ -104,8 +196,9 @@ export function defaultParams(slot, bounds) {
  * 转动/开合类支持自定义时长（0.2~5 秒）；闪烁节奏与官方转向灯继电器对齐，不开放。
  */
 export function buildKeyframes(slot, params, animationName) {
+  const actionKind = actionKindOf(slot, params);
   const custom = Number(params.duration);
-  const duration = (slot.kind === 'spin' || slot.kind === 'hinge') && Number.isFinite(custom) && custom > 0
+  const duration = !['lamp', 'blink'].includes(actionKind) && Number.isFinite(custom) && custom > 0
     ? Math.min(5, Math.max(0.2, custom))
     : DURATION;
   const times = [];
@@ -113,9 +206,34 @@ export function buildKeyframes(slot, params, animationName) {
     times.push((i * duration) / (KEYFRAME_COUNT - 1));
   }
 
-  if (slot.kind === 'blink') {
+  if (actionKind === 'blink') {
     const values = [];
     for (const s of BLINK_SCALE) values.push(s, s, s);
+    return { path: 'scale', times, values };
+  }
+
+  if (actionKind === 'pulse') {
+    const amount = Math.min(0.9, Math.max(0.05, Number(params.scaleAmount) || 0.25));
+    const values = [];
+    for (let i = 0; i < KEYFRAME_COUNT; i++) {
+      const progress = i / (KEYFRAME_COUNT - 1);
+      const scale = 1 + Math.sin(progress * Math.PI * 2) * amount;
+      values.push(scale, scale, scale);
+    }
+    return { path: 'scale', times, values };
+  }
+
+  if (actionKind === 'scale') {
+    const target = Math.min(3, Math.max(0.01, Number(params.scaleTarget) || 0.01));
+    const close = animationName.endsWith('_Close');
+    const values = [];
+    for (let i = 0; i < KEYFRAME_COUNT; i++) {
+      const progress = i / (KEYFRAME_COUNT - 1);
+      const scale = close
+        ? target + (1 - target) * progress
+        : 1 + (target - 1) * progress;
+      values.push(scale, scale, scale);
+    }
     return { path: 'scale', times, values };
   }
 
@@ -124,8 +242,11 @@ export function buildKeyframes(slot, params, animationName) {
   for (let i = 0; i < KEYFRAME_COUNT; i++) {
     const progress = i / (KEYFRAME_COUNT - 1);
     let degrees;
-    if (slot.kind === 'spin') {
+    if (actionKind === 'spin') {
       degrees = progress * 360 * (params.reverse ? -1 : 1);
+    } else if (actionKind === 'swing') {
+      const target = Number.isFinite(params.angle) ? params.angle : 30;
+      degrees = Math.sin(progress * Math.PI * 2) * target;
     } else {
       const target = Number.isFinite(params.angle) ? params.angle : slot.angle;
       // Open 从 0 转到目标角，Close 反过来
@@ -186,8 +307,9 @@ const REGION_HINTS = {
   CS_Emergency: { x: [0, 0.15], y: [0.25, 0.5], z: [0, 1] },
 };
 
-export function suggestRegion(slot, bounds) {
-  const hint = REGION_HINTS[slot.id] || { x: [0.35, 0.65], y: [0.35, 0.65], z: [0.35, 0.65] };
+export function suggestRegion(slot, bounds, { modelType = 'vehicle' } = {}) {
+  const genericHint = { x: [0.35, 0.65], y: [0.35, 0.65], z: [0.35, 0.65] };
+  const hint = modelType === 'other' ? genericHint : (REGION_HINTS[slot.id] || genericHint);
   const axes = ['x', 'y', 'z'];
   const min = [];
   const max = [];

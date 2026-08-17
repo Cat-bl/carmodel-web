@@ -3,14 +3,25 @@ import { ModelPreview } from './preview.js';
 import { makeBydCar, makeVehiclePreviewGlb } from './package.js';
 import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
 import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
-import { SLOT_BY_ID, defaultParams, slotGroups, suggestRegion } from './bindings.js';
+import {
+  animationNamesOf,
+  SLOT_BY_ID,
+  defaultParams,
+  normalizeOtherPlayback,
+  playbackDurationOf,
+  slotForMode,
+  slotGroups,
+  suggestRegion,
+} from './bindings.js';
 import {
   createIcons,
   AlertCircle,
   AlertTriangle,
   ArrowLeft,
   ArrowLeftRight,
+  Box,
   BoxSelect,
+  CarFront,
   CheckCircle2,
   Download,
   Eye,
@@ -39,15 +50,65 @@ import { emptySelection, selectionGroupCount, selectionTriangleCount } from './s
 const app = document.querySelector('#app');
 
 app.innerHTML = `
-  <div class="editor-shell" data-stage="0">
+  <section class="model-type-home" id="model-type-home" aria-labelledby="model-type-title">
+    <header class="model-type-homebar">
+      <div class="model-type-brand">
+        <img class="brand-mark" src="./logo.svg" alt="" />
+        <div>
+          <strong>BYD 模型编辑器</strong>
+          <span>模型工作区</span>
+        </div>
+      </div>
+      <button class="btn home-project-button" id="home-open-project" type="button">
+        <i data-lucide="folder-open"></i>打开已有项目
+      </button>
+    </header>
+    <main class="model-type-main">
+      <div class="model-type-heading">
+        <span>新建项目</span>
+        <h1 id="model-type-title">选择模型类型</h1>
+        <p>模型类型将决定初始朝向和后续编辑方式。</p>
+      </div>
+      <div class="model-type-options" aria-label="模型类型">
+        <button class="model-type-option vehicle" type="button" data-model-type="vehicle" aria-label="选择车辆模型">
+          <span class="model-type-icon"><i data-lucide="car-front"></i></span>
+          <span class="model-type-copy">
+            <strong>车辆</strong>
+            <small>轿车、SUV、卡车及其他道路车辆</small>
+          </span>
+          <span class="model-type-enter">进入工作区 <i data-lucide="arrow-left-right"></i></span>
+        </button>
+        <button class="model-type-option other" type="button" data-model-type="other" aria-label="选择其他模型">
+          <span class="model-type-icon"><i data-lucide="box"></i></span>
+          <span class="model-type-copy">
+            <strong>其他</strong>
+            <small>人物、机器人、物品及非车辆模型</small>
+          </span>
+          <span class="model-type-enter">进入工作区 <i data-lucide="arrow-left-right"></i></span>
+        </button>
+      </div>
+      <button class="home-project-link" id="home-open-project-mobile" type="button">
+        <i data-lucide="folder-open"></i><span>打开已有 .bydcarproj 项目</span>
+      </button>
+    </main>
+    <footer class="model-type-footer">
+      <span>支持 ${MODEL_FORMAT_HINT}</span>
+      <span>项目进度可保存为 .bydcarproj</span>
+    </footer>
+  </section>
+
+  <div class="editor-shell" id="editor-shell" data-stage="0" hidden>
     <header class="commandbar">
       <div class="file-context">
         <img class="brand-mark" src="./logo.svg" alt="" />
         <div class="file-copy">
-          <strong>BYD 车模编辑器</strong>
+          <strong id="editor-brand-title">BYD 车模编辑器</strong>
           <span id="file-name">尚未选择模型</span>
           <small id="save-status">项目文件未保存</small>
         </div>
+        <button class="model-type-badge" id="model-type-switch" type="button" title="返回首页重新选择模型类型">
+          <i id="model-type-icon" data-lucide="car-front"></i><span id="model-type-label">车辆</span>
+        </button>
         <span class="dirty-dot" id="dirty-state" title="有尚未保存到项目文件的修改" hidden></span>
       </div>
       <div class="command-center">
@@ -78,6 +139,10 @@ app.innerHTML = `
             <span><i data-lucide="layers-3"></i>联动</span>
             <span id="binding-summary">未配置</span>
           </div>
+          <div class="other-mode-note" id="other-mode-note" hidden>
+            <strong>模型动画绑定</strong>
+            <span>选择车机事件，再从模型自带动画中选择要触发的动作</span>
+          </div>
           <button class="rail-action" id="demo-all" disabled><i data-lucide="play"></i>全部演示</button>
           <div id="binding-groups"></div>
         </div>
@@ -97,8 +162,8 @@ app.innerHTML = `
             <button class="tool-btn" data-view="top">顶</button>
           </div>
           <div class="segmented compact mobile-preview-mode" aria-label="移动端预览质感">
-            <button class="active" id="mode-web-mobile" disabled>网页</button>
-            <button id="mode-device-mobile" disabled>车机</button>
+            <button class="active" id="mode-web-mobile" disabled>网页质感</button>
+            <button id="mode-device-mobile" disabled>车机质感</button>
           </div>
           <button class="icon-btn canvas-reset" data-view="perspective" title="适应视图"><i data-lucide="maximize-2"></i></button>
         </div>
@@ -106,7 +171,7 @@ app.innerHTML = `
           <canvas id="preview"></canvas>
           <div class="empty-state" id="empty-state">
             <i data-lucide="upload"></i>
-            <strong>开始制作车模</strong>
+            <strong id="empty-state-title">开始制作车模</strong>
             <span>${MODEL_FORMAT_HINT}</span>
             <div class="empty-actions">
               <label class="btn primary" for="model-file"><i data-lucide="upload"></i>导入模型</label>
@@ -156,7 +221,7 @@ app.innerHTML = `
               </div>
             </section>
             <section class="tool-section">
-              <div class="section-title"><h3>朝向与尺寸</h3><span>蓝色箭头为车头</span></div>
+              <div class="section-title"><h3>朝向与尺寸</h3><span id="orientation-mode-hint">蓝色箭头为车头</span></div>
               <div class="field-grid">
                 ${numberField('旋转 X°', 'rotation-x', 0)}
                 ${numberField('旋转 Y°', 'rotation-y', 0)}
@@ -168,7 +233,7 @@ app.innerHTML = `
                 <button class="btn small" data-rotate="y:180">反向</button>
               </div>
               <div class="field-grid two-cols">
-                <div class="field"><label for="target-length">车身最长边（米）</label><input id="target-length" type="number" min="0.5" max="10" step="0.1" value="5.2" disabled /></div>
+                <div class="field"><label for="target-length" id="target-length-label">车身最长边（米）</label><input id="target-length" type="number" min="0.5" max="10" step="0.1" value="5.2" disabled /></div>
                 <div class="field"><label for="height-offset">离地高度（米）</label><input id="height-offset" type="number" min="0" max="3" step="0.05" value="0" disabled /></div>
               </div>
             </section>
@@ -284,13 +349,14 @@ function status(kind, icon, text) {
 }
 
 const ui = Object.fromEntries([
-  'model-file', 'project-file', 'drop-zone', 'file-name', 'save-status', 'analysis-state', 'empty-state',
+  'model-type-home', 'editor-shell', 'home-open-project', 'home-open-project-mobile', 'model-type-switch',
+  'model-type-icon', 'model-type-label', 'editor-brand-title', 'empty-state-title', 'model-file', 'project-file', 'drop-zone', 'file-name', 'save-status', 'analysis-state', 'empty-state',
   'source-format-label',
-  'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'height-offset', 'status-list',
+  'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'target-length-label', 'height-offset', 'orientation-mode-hint', 'status-list',
   'generate', 'mobile-generate', 'mobile-generate-shortcut', 'save-project', 'mobile-save-project',
   'open-project', 'inspector-open-project', 'reset-rotation', 'mobile-reset', 'mode-web', 'mode-device',
   'mode-web-mobile', 'mode-device-mobile',
-  'binding-groups', 'binding-summary', 'binding-editor-host', 'binding-editor-title', 'demo-all',
+  'binding-groups', 'binding-summary', 'binding-editor-host', 'binding-editor-title', 'demo-all', 'other-mode-note',
   'delete-start', 'delete-panel', 'delete-summary', 'undo', 'redo', 'dirty-state',
   'workspace-triangles', 'workspace-selection', 'workspace-mode', 'workspace-index',
   'import-progress', 'import-progress-label', 'import-progress-percent', 'import-progress-bar',
@@ -304,6 +370,7 @@ ui['drop-zone'] ||= ui['empty-state'];
 
 const preview = new ModelPreview(document.getElementById('preview'), updateStats);
 let current = null;
+let modelType = null;
 let dirty = false;
 let projectSaved = false;
 let activePanel = 'model';
@@ -317,6 +384,119 @@ let selectedQuality = 'original';
 const customQuality = { triangleTarget: 300000, textureMaxSize: 4096 };
 let qualityPreviewTimer = 0;
 
+const MODEL_TYPES = {
+  vehicle: { label: '车辆', icon: 'car-front', orientationHint: '蓝色箭头为车头', lengthLabel: '车身最长边（米）', emptyTitle: '开始制作车模' },
+  other: { label: '其他', icon: 'box', orientationHint: '保持导入时的原始朝向', lengthLabel: '模型最长边（米）', emptyTitle: '开始制作模型' },
+};
+
+function normalizeModelType(value) {
+  return value === 'other' ? 'other' : 'vehicle';
+}
+
+function activeSlot(slotOrId) {
+  return slotForMode(slotOrId, modelType || 'vehicle');
+}
+
+function activeSlotGroups() {
+  return slotGroups(modelType || 'vehicle');
+}
+
+function updateModelTypeUi() {
+  if (!modelType) return;
+  const config = MODEL_TYPES[modelType];
+  ui['model-type-label'].textContent = config.label;
+  ui['model-type-icon'].setAttribute('data-lucide', config.icon);
+  ui['editor-brand-title'].textContent = modelType === 'other' ? 'BYD 模型编辑器' : 'BYD 车模编辑器';
+  ui['orientation-mode-hint'].textContent = config.orientationHint;
+  ui['target-length-label'].textContent = config.lengthLabel;
+  ui['empty-state-title'].textContent = config.emptyTitle;
+  ui['model-type-switch'].classList.toggle('other', modelType === 'other');
+  ui['other-mode-note'].hidden = modelType !== 'other';
+  document.querySelector('.editor-shell')?.setAttribute('data-model-type', modelType);
+  renderIcons();
+}
+
+function enterEditorForType(type) {
+  modelType = normalizeModelType(type);
+  ui['model-type-home'].hidden = true;
+  ui['editor-shell'].hidden = false;
+  updateModelTypeUi();
+  renderBindings();
+  if (!current) {
+    ui['empty-state'].hidden = false;
+    ui['analysis-state'].textContent = '等待导入';
+    updateSteps(0);
+  }
+  requestAnimationFrame(() => preview.resize());
+}
+
+function resetWorkspaceForTypeSelection() {
+  stopDemo();
+  closePreviewTools();
+  preview.disposeModel();
+  current = null;
+  modelType = null;
+  dirty = false;
+  projectSaved = false;
+  selectedQuality = 'original';
+  customQuality.triangleTarget = 300000;
+  customQuality.textureMaxSize = 4096;
+  deletions = [];
+  deleteDraft = null;
+  bindings.clear();
+  bindableAnimations = [];
+  openSlot = null;
+  parts = [];
+  partGroups = [];
+  ui['file-name'].textContent = '尚未选择模型';
+  ui['file-name'].classList.remove('modified');
+  ui['analysis-state'].textContent = '等待导入';
+  ui['source-format-label'].textContent = '等待导入';
+  ui['save-status'].textContent = '项目文件未保存';
+  ui['save-status'].classList.remove('saving', 'error');
+  ui['dirty-state'].hidden = true;
+  ui['empty-state'].hidden = false;
+  ui['workspace-triangles'].textContent = '0';
+  ui['workspace-selection'].textContent = '0';
+  ui['workspace-mode'].textContent = '浏览模式';
+  ui['workspace-index'].textContent = '精细索引未启用';
+  ui['editor-shell'].removeAttribute('data-model-type');
+  ui['rotation-x'].value = 0;
+  ui['rotation-y'].value = 0;
+  ui['rotation-z'].value = 0;
+  ui['target-length'].value = 5.2;
+  ui['height-offset'].value = 0;
+  preview.targetLength = 5.2;
+  preview.heightOffset = 0;
+  undoStack.length = 0;
+  redoStack.length = 0;
+  syncUndoRedoButtons();
+  markDevicePreviewStale();
+  for (const id of ['stat-bytes', 'stat-triangles', 'stat-nodes', 'stat-meshes', 'stat-materials', 'stat-textures']) {
+    document.getElementById(id).textContent = '—';
+  }
+  renderDeletePanel();
+  renderBindings();
+  renderQualityControls();
+  setControls(false);
+  setStatuses([['warn', '…', '导入模型后开始检查']]);
+  setActivePanel('model');
+  updateSteps(0);
+}
+
+function returnToModelTypeHome() {
+  if (current) {
+    const message = dirty
+      ? '当前修改还没有保存为 .bydcarproj 项目文件。返回首页会丢失这些修改，确定继续吗？'
+      : '返回首页会关闭当前项目，确定继续吗？';
+    if (!window.confirm(message)) return;
+  }
+  resetWorkspaceForTypeSelection();
+  ui['editor-shell'].hidden = true;
+  ui['model-type-home'].hidden = false;
+  requestAnimationFrame(() => renderIcons());
+}
+
 window.addEventListener('beforeunload', (event) => {
   const importing = document.querySelector('.editor-shell')?.classList.contains('is-importing');
   if (!current && !importing) return;
@@ -325,7 +505,7 @@ window.addEventListener('beforeunload', (event) => {
 });
 
 const lucideIcons = {
-  AlertCircle, AlertTriangle, ArrowLeft, ArrowLeftRight, BoxSelect, CheckCircle2, Download, Eye, FolderOpen,
+  AlertCircle, AlertTriangle, ArrowLeft, ArrowLeftRight, Box, BoxSelect, CarFront, CheckCircle2, Download, Eye, FolderOpen,
   Gauge, Info, Layers3, Maximize2, MousePointer2, Paintbrush, Play, Redo2, RotateCcw, Save, Settings2,
   Sparkles, Square, Trash2, Undo2, Upload, Wrench, X,
 };
@@ -357,7 +537,7 @@ function setActivePanel(panel) {
     ui['workspace-mode'].textContent = panel === 'check' ? '兼容性检查' : '浏览模式';
   }
   if (panel === 'binding' && openSlot) {
-    const slot = SLOT_BY_ID.get(openSlot);
+    const slot = activeSlot(openSlot);
     const binding = bindings.get(openSlot);
     if (binding?.selection && selectionEditingSlot === slot.id) startFineSelection(slot, { preserveState: true });
   }
@@ -509,6 +689,14 @@ function finishImportProgress() {
   ui['import-progress'].classList.remove('indeterminate');
 }
 
+document.querySelectorAll('[data-model-type]').forEach((button) => {
+  button.addEventListener('click', () => enterEditorForType(button.dataset.modelType));
+});
+for (const id of ['home-open-project', 'home-open-project-mobile']) {
+  ui[id].addEventListener('click', () => ui['project-file'].click());
+}
+ui['model-type-switch'].addEventListener('click', returnToModelTypeHome);
+
 ui['model-file'].addEventListener('change', (event) => {
   const file = event.target.files?.[0];
   if (file && confirmReplaceCurrent()) loadFile(file);
@@ -637,14 +825,21 @@ async function setPreviewMode(device) {
     const previewBindings = bindingsForOutput();
     const previewDeletions = deletions.map((item) => item.region);
     const quality = exportQuality();
-    const cacheKey = JSON.stringify({ transform, bindings: previewBindings, deletions: previewDeletions, quality });
+    const cacheKey = JSON.stringify({ modelType, transform, bindings: previewBindings, deletions: previewDeletions, quality });
     if (device && (!deviceGlbCache || deviceGlbCacheKey !== cacheKey)) {
       ui['mode-device'].textContent = '烘焙中…';
       ui['mode-device-mobile'].textContent = '处理中…';
-      deviceGlbCache = await makeVehiclePreviewGlb(current.bytes, transform, previewBindings, previewDeletions, quality);
+      deviceGlbCache = await makeVehiclePreviewGlb(
+        current.bytes,
+        transform,
+        previewBindings,
+        previewDeletions,
+        quality,
+        modelType,
+      );
       deviceGlbCacheKey = cacheKey;
       ui['mode-device'].textContent = '车机质感';
-      ui['mode-device-mobile'].textContent = '车机';
+      ui['mode-device-mobile'].textContent = '车机质感';
     }
     await preview.setDeviceMode(device, deviceGlbCache, transform);
     for (const id of ['mode-web', 'mode-web-mobile']) ui[id].classList.toggle('active', !device);
@@ -653,7 +848,7 @@ async function setPreviewMode(device) {
     preview.setDeletions(deletions.map((item) => item.region));
     refreshParts();
     if (openSlot) {
-      const slot = SLOT_BY_ID.get(openSlot);
+      const slot = activeSlot(openSlot);
       const binding = bindings.get(openSlot);
       if (binding?.region) {
         openRegionBox(slot);
@@ -669,7 +864,7 @@ async function setPreviewMode(device) {
   } catch (error) {
     console.error(error);
     ui['mode-device'].textContent = '车机质感';
-    ui['mode-device-mobile'].textContent = '车机';
+    ui['mode-device-mobile'].textContent = '车机质感';
     setStatuses([['bad', '×', `车机质感预览失败：${error.message}`]]);
     showMessage(`车机质感预览失败：${error.message}`, 'error');
   } finally {
@@ -683,6 +878,7 @@ ui['mode-device-mobile'].addEventListener('click', () => setPreviewMode(true));
 
 async function loadFile(file) {
   if (!file) return;
+  if (!modelType) enterEditorForType('vehicle');
   const extension = file.name.toLowerCase().split('.').pop();
   if (!['glb', 'fbx', 'zip'].includes(extension)) {
     setStatuses([['bad', '×', '支持 GLB、glTF ZIP、FBX、FBX ZIP 和 OBJ ZIP']]);
@@ -714,6 +910,13 @@ async function loadFile(file) {
 
 async function loadProject(file) {
   if (!file) return;
+  const openedFromHome = ui['editor-shell'].hidden || !modelType;
+  const previousModelType = modelType;
+  if (openedFromHome) {
+    ui['model-type-home'].hidden = true;
+    ui['editor-shell'].hidden = false;
+    requestAnimationFrame(() => preview.resize());
+  }
   const previousName = ui['file-name'].textContent;
   beginFileLoad(file.name, '准备打开项目');
   ui['project-file'].disabled = true;
@@ -721,6 +924,8 @@ async function loadProject(file) {
     const project = await readProjectFile(file, ({ progress, label }) => {
       updateImportProgress({ progress: progress * 0.46, label });
     });
+    modelType = normalizeModelType(project.metadata.modelType);
+    updateModelTypeUi();
     const editorState = normalizeProjectState(project.editorState);
     const prepared = {
       bytes: project.modelBytes,
@@ -729,6 +934,7 @@ async function loadProject(file) {
       sourceFormat: project.metadata.sourceFormat,
       formatLabel: project.metadata.formatLabel,
       warnings: project.metadata.warnings,
+      modelType,
       fromProject: true,
     };
     await activatePreparedModel(prepared, {
@@ -742,6 +948,14 @@ async function loadProject(file) {
   } catch (error) {
     console.error(error);
     handleLoadFailure(error, previousName, '无法打开此项目');
+    if (openedFromHome && !current) {
+      modelType = null;
+      ui['editor-shell'].hidden = true;
+      ui['model-type-home'].hidden = false;
+    } else if (current) {
+      modelType = normalizeModelType(previousModelType);
+      updateModelTypeUi();
+    }
   } finally {
     ui['project-file'].disabled = false;
     ui['project-file'].value = '';
@@ -756,9 +970,12 @@ async function activatePreparedModel(prepared, {
   previewProgressStart,
   previewProgressScale,
 }) {
+  const activeModelType = normalizeModelType(modelType || prepared.modelType);
+  modelType = activeModelType;
+  updateModelTypeUi();
   const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {
     updateImportProgress({ progress: previewProgressStart + progress * previewProgressScale, label, indeterminate });
-  });
+  }, { modelType: activeModelType });
   updateImportProgress({ progress: 0.98, label: '正在初始化编辑工具' });
   current = {
     ...prepared,
@@ -767,7 +984,9 @@ async function activatePreparedModel(prepared, {
     sourceName: prepared.name,
     sourceFile,
     sourceFormat: prepared.sourceFormat,
+    modelType: activeModelType,
   };
+  bindableAnimations = activeModelType === 'other' ? preview.listBindableAnimations() : [];
   projectSaved = Boolean(editorState);
   ui['file-name'].textContent = displayName || prepared.name;
   setDirty(false);
@@ -792,7 +1011,7 @@ async function activatePreparedModel(prepared, {
   ui['mode-web-mobile'].classList.add('active');
   ui['mode-device-mobile'].classList.remove('active');
   ui['mode-device'].textContent = '车机质感';
-  ui['mode-device-mobile'].textContent = '车机';
+  ui['mode-device-mobile'].textContent = '车机质感';
   ui['analysis-state'].textContent = editorState ? '项目已恢复' : '解析完成';
   ui['empty-state'].hidden = true;
   setControls(true);
@@ -872,6 +1091,7 @@ async function saveProject() {
       metadata: {
         displayName: ui['file-name'].textContent,
         modelName: current.sourceName || current.file.name,
+        modelType: current.modelType || modelType || 'vehicle',
         sourceFormat: current.sourceFormat || 'glb',
         formatLabel: current.formatLabel || 'GLB',
         warnings: current.warnings || [],
@@ -915,14 +1135,25 @@ function normalizeProjectState(raw) {
     || !validNumberArray(transform?.scale, 3)) {
     throw new Error('项目中的模型变换数据无效');
   }
-  const bindingsState = Array.isArray(raw.bindings) ? raw.bindings.filter((entry) => (
+  let bindingsState = Array.isArray(raw.bindings) ? raw.bindings.filter((entry) => (
     Array.isArray(entry) && SLOT_BY_ID.has(entry[0]) && entry[1] && typeof entry[1] === 'object'
   )).map(([id, binding]) => [id, structuredClone(binding)]) : [];
+  if (modelType === 'other') {
+    const front = bindingsState.find(([id]) => id === 'CS_WF');
+    const rear = bindingsState.find(([id]) => id === 'CS_WB');
+    const forward = front || (rear && ['CS_WF', { ...rear[1], slotId: 'CS_WF' }]);
+    bindingsState = bindingsState.filter(([id]) => id !== 'CS_WF' && id !== 'CS_WB');
+    if (forward) bindingsState.push(forward);
+  }
   const knownSlots = new Set(bindingsState.map(([id]) => id));
   const requestedPanel = ['model', 'binding', 'check'].includes(raw.activePanel) ? raw.activePanel : 'model';
-  const openSlotValue = knownSlots.has(raw.openSlot) ? raw.openSlot : null;
+  const requestedOpenSlot = modelType === 'other' && raw.openSlot === 'CS_WB' ? 'CS_WF' : raw.openSlot;
+  const openSlotValue = knownSlots.has(requestedOpenSlot) ? requestedOpenSlot : null;
   const activePanelValue = requestedPanel === 'binding' && !openSlotValue ? 'model' : requestedPanel;
-  const selectionEditingValue = openSlotValue && raw.selectionEditingSlot === openSlotValue
+  const requestedSelectionSlot = modelType === 'other' && raw.selectionEditingSlot === 'CS_WB'
+    ? 'CS_WF'
+    : raw.selectionEditingSlot;
+  const selectionEditingValue = openSlotValue && requestedSelectionSlot === openSlotValue
     ? openSlotValue
     : null;
   const qualitySelected = ['smooth', 'balanced', 'high', 'original', 'custom'].includes(raw.quality?.selected)
@@ -999,10 +1230,18 @@ function validateStats(stats, orientation, importInfo = null) {
 
   results.push(['good', '✓', `材质数量 ${stats.materials} 个（不限制）`]);
 
-  if (stats.skinned) results.push(['warn', '!', '检测到骨骼蒙皮，首版会转换为当前静态姿态']);
-  if (stats.morphs) results.push(['warn', '!', '检测到 Morph，首版会保留当前静态形状']);
-  if (stats.animations) results.push(['warn', '!', `检测到 ${stats.animations} 段动画，首版不作为车模动画导出`]);
-  if (orientation?.detected && orientation.method === 'semantic') {
+  if (stats.skinned && modelType === 'other') results.push(['good', '✓', '检测到骨骼蒙皮，其他模型模式会保留骨架与已绑定动画']);
+  else if (stats.skinned) results.push(['warn', '!', '检测到骨骼蒙皮，车辆模式仍使用当前静态姿态']);
+  if (stats.morphs) results.push(['warn', '!', '检测到 Morph，车机导出仍使用当前静态形状']);
+  if (stats.animations && modelType === 'other') {
+    if (bindableAnimations.length) results.push(['good', '✓', `检测到 ${stats.animations} 段模型动画，其中 ${bindableAnimations.length} 段可绑定到联动事件`]);
+    else results.push(['warn', '!', `检测到 ${stats.animations} 段模型动画，但没有可用的 TRS 动画`]);
+  } else if (stats.animations) {
+    results.push(['warn', '!', `检测到 ${stats.animations} 段模型动画，车辆模式仍使用编辑器生成的标准联动动画`]);
+  }
+  if (modelType === 'other') {
+    results.push(['good', '✓', '其他模型已保持导入时的原始朝向，可在预览中手动调整']);
+  } else if (orientation?.detected && orientation.method === 'semantic') {
     results.push(['good', '✓', `已自动识别模型正面并对齐车头（Y ${orientation.rotationY}°，${orientation.reason}）`]);
   } else if (orientation?.detected) {
     results.push(['warn', '!', `已按车辆轮廓推测正面并对齐车头（Y ${orientation.rotationY}°），请在预览中确认`]);
@@ -1078,6 +1317,7 @@ function reset() {
 /* ---------- 联动配置 ---------- */
 
 const bindings = new Map();
+let bindableAnimations = [];
 let parts = [];
 let partGroups = [];
 let openSlot = null;
@@ -1096,6 +1336,47 @@ let treeQuery = '';
 let expandedGroups = new Set();
 const partTreeScrollBySlot = new Map();
 let pendingPartTreeReveal = null;
+
+function sourceAnimationByIndex(index) {
+  return bindableAnimations.find((animation) => animation.index === Number(index)) || null;
+}
+
+function actionUsesPivot(actionKind) {
+  return actionKind === 'hinge' || actionKind === 'spin';
+}
+
+function sourceAnimationBindingValid(binding) {
+  return Boolean(binding && Number.isInteger(binding.sourceAnimationIndex)
+    && sourceAnimationByIndex(binding.sourceAnimationIndex));
+}
+
+function setSourceAnimationBinding(slot, value) {
+  const animation = sourceAnimationByIndex(value);
+  const existing = bindings.get(slot.id);
+  if (!animation) {
+    if (!existing) return;
+    snapshot();
+    bindings.delete(slot.id);
+    preview.stopBindingPreview();
+    setDirty();
+    markDevicePreviewStale();
+    renderBindings();
+    return;
+  }
+  snapshot();
+  bindings.set(slot.id, {
+    slotId: slot.id,
+    sourceAnimationIndex: animation.index,
+    sourceAnimationName: animation.name,
+    sourceName: `模型动画：${animation.name}`,
+    nodeIndices: [...animation.nodeIndices],
+    playback: normalizeOtherPlayback(slot, existing?.playback),
+  });
+  setDirty();
+  markDevicePreviewStale();
+  renderBindings();
+  playCurrentBinding();
+}
 
 /** parts 与两层部件分组一起刷新，并给每一项算好中文方位标签 */
 function refreshParts() {
@@ -1404,7 +1685,7 @@ function restoreSnapshot(snap, { markDirty = true } = {}) {
   renderBindings();
   setActivePanel(snap.activePanel || (openSlot ? 'binding' : 'model'));
   if (activePanel === 'binding' && openSlot) {
-    const slot = SLOT_BY_ID.get(openSlot);
+    const slot = activeSlot(openSlot);
     const binding = bindings.get(openSlot);
     if (binding?.region) openRegionBox(slot);
     else if (binding?.selection && resumeFineSelection && !preview.selectionState) startFineSelection(slot, { preserveState: true });
@@ -1562,7 +1843,7 @@ function refreshOpenEditor() {
   refreshParts();
   renderBindings();
   if (!openSlot) return;
-  const slot = SLOT_BY_ID.get(openSlot);
+  const slot = activeSlot(openSlot);
   const binding = bindings.get(openSlot);
   if (binding?.region) openRegionBox(slot);
   else if (binding?.selection) startFineSelection(slot, { preserveState: true });
@@ -1657,6 +1938,7 @@ const LATERAL_SLOT_SIDE = {
 
 function constrainRegionToSlotSide(slot, region) {
   if (!region) return null;
+  if (modelType === 'other') return structuredClone(region);
   const side = LATERAL_SLOT_SIDE[slot?.id];
   if (!side) return structuredClone(region);
   const constrained = structuredClone(region);
@@ -1672,12 +1954,13 @@ function constrainRegionToSlotSide(slot, region) {
 /** 预览与生成共用相同的左右半车裁剪，也兼容修改前保存在内存里的跨中线选区。 */
 function bindingsForOutput() {
   return [...bindings.values()].filter((binding) => {
+    if (modelType === 'other') return sourceAnimationBindingValid(binding);
     if (!binding.selection) return true;
     return selectionTriangleCount(binding.selection) > 0;
   }).map((binding) => {
     const copy = structuredClone(binding);
     if (!copy.region) return copy;
-    const slot = SLOT_BY_ID.get(copy.slotId);
+    const slot = activeSlot(copy.slotId);
     copy.region = constrainRegionToSlotSide(slot, copy.region);
     copy.bounds = copy.region;
     return copy;
@@ -1731,7 +2014,7 @@ function mirrorBindingInto(slot) {
     geomBounds: measured.bounds,
     pivot: source.pivotCustom
       ? [source.pivot[0], source.pivot[1], -source.pivot[2]]
-      : defaultParams(slot, measured.bounds || region).pivot,
+      : defaultParams(slot, measured.bounds || region, { modelType }).pivot,
     pivotCustom: Boolean(source.pivotCustom),
     axis,
     angle,
@@ -1819,7 +2102,8 @@ async function demoAll() {
   setDemoButton(true);
   for (const [slotId, binding] of [...bindings]) {
     if (run.cancelled) break;
-    const slot = SLOT_BY_ID.get(slotId);
+    if (modelType === 'other' && !sourceAnimationBindingValid(binding)) continue;
+    const slot = activeSlot(slotId);
     if (!slot) continue;
     ui['binding-summary'].textContent = `演示中：${slot.label}`;
     preview.previewBinding(slot, binding);
@@ -1832,7 +2116,8 @@ async function demoAll() {
     preview.stopBindingPreview();
     demoRun = null;
     setDemoButton(false);
-    ui['binding-summary'].textContent = bindings.size ? `已配置 ${bindings.size} 项` : '未配置';
+    const count = bindingsForOutput().length;
+    ui['binding-summary'].textContent = count ? `已配置 ${count} 项` : '未配置';
   }
 }
 
@@ -1842,7 +2127,8 @@ function stopDemo() {
   demoRun = null;
   preview.stopBindingPreview();
   setDemoButton(false);
-  ui['binding-summary'].textContent = bindings.size ? `已配置 ${bindings.size} 项` : '未配置';
+  const count = bindingsForOutput().length;
+  ui['binding-summary'].textContent = count ? `已配置 ${count} 项` : '未配置';
 }
 
 /** 被其他槽位（非框选）占用的叶子 → 槽位名，占用的部位不能重复绑定 */
@@ -1850,7 +2136,7 @@ function claimedByOthers(slot) {
   const claimed = new Map();
   for (const [id, other] of bindings) {
     if (id === slot.id || other.region) continue;
-    const label = SLOT_BY_ID.get(id)?.label || id;
+    const label = activeSlot(id)?.label || id;
     for (const nodeIndex of other.nodeIndices || []) claimed.set(nodeIndex, label);
   }
   return claimed;
@@ -1884,7 +2170,7 @@ function setBindingNodes(slot, nodeIndices, { revealNodeIndex = null } = {}) {
   }
   const previous = bindings.get(slot.id);
   const bounds = mergeBounds(chosen.map((item) => item.bounds));
-  const defaults = defaultParams(slot, bounds);
+  const defaults = defaultParams(slot, bounds, { modelType });
   preview.hideRegionBox();
   const whole = chosen.length === parts.length;
   bindings.set(slot.id, {
@@ -1900,6 +2186,9 @@ function setBindingNodes(slot, nodeIndices, { revealNodeIndex = null } = {}) {
     duration: previous?.duration ?? 0.8,
     reverse: Boolean(previous?.reverse),
     color: previous?.color || defaults.color,
+    actionKind: slot.kind,
+    scaleAmount: previous?.scaleAmount ?? 0.25,
+    scaleTarget: previous?.scaleTarget ?? 0.01,
   });
   renderBindings();
   playCurrentBinding();
@@ -1980,7 +2269,7 @@ function renderPartTree({ resetScroll = false } = {}) {
   if (!openSlot) return;
   const wrap = document.getElementById('part-tree-wrap');
   if (!wrap) return;
-  const slot = SLOT_BY_ID.get(openSlot);
+  const slot = activeSlot(openSlot);
   capturePartTreeScroll();
   if (resetScroll) partTreeScrollBySlot.set(slot.id, 0);
   wrap.innerHTML = partTreeHtml(slot, bindings.get(openSlot));
@@ -2065,7 +2354,9 @@ function onPickNode(slot, nodeIndex) {
     const region = constrainRegionToSlotSide(slot, padBounds(mergeBounds(all.map((leaf) => leaf.bounds))));
     if (!region) return;
     createRegionBinding(slot, region);
-    const sideText = LATERAL_SLOT_SIDE[slot.id] ? `并限制在车身${LATERAL_SLOT_SIDE[slot.id] === 'left' ? '左' : '右'}半边` : '';
+    const sideText = modelType === 'vehicle' && LATERAL_SLOT_SIDE[slot.id]
+      ? `并限制在车身${LATERAL_SLOT_SIDE[slot.id] === 'left' ? '左' : '右'}半边`
+      : '';
     showMessage(`「${group?.name || all[0].name}」已整体绑给「${owner}」。已自动切换为框选${sideText}，请确认蓝框只套住本槽位区域。`, 'warning');
     return;
   }
@@ -2079,25 +2370,121 @@ function onPickNode(slot, nodeIndex) {
   setBindingNodes(slot, [...selected], { revealNodeIndex: nodeIndex });
 }
 
+function otherBindingEditor(slot, binding) {
+  const selected = sourceAnimationBindingValid(binding) ? binding.sourceAnimationIndex : '';
+  const playback = normalizeOtherPlayback(slot, binding?.playback);
+  const sourceAnimation = sourceAnimationByIndex(selected);
+  const effectiveDuration = playbackDurationOf(sourceAnimation?.duration, playback);
+  let animationControl;
+  if (bindableAnimations.length === 0) {
+    animationControl = `
+      <div class="source-animation-empty">
+        <i data-lucide="film"></i>
+        <strong>没有可绑定的动画</strong>
+        <span>当前模型没有可用的 TRS 动画；Morph 与 CUBICSPLINE 动画暂不开放。</span>
+      </div>`;
+  } else {
+    animationControl = `
+      <div class="field source-animation-field">
+        <label for="bind-source-animation">模型自带动画</label>
+        <select id="bind-source-animation">
+          <option value="">选择一个动画</option>
+          ${bindableAnimations.map((animation) => `
+            <option value="${animation.index}"${animation.index === selected ? ' selected' : ''}>${escapeHtml(animation.name)}${animation.duration ? ` · ${animation.duration.toFixed(2)} 秒` : ''}</option>`).join('')}
+        </select>
+        <small>选择后立即绑定并在网页质感中预览。</small>
+      </div>`;
+  }
+  const bound = sourceAnimationBindingValid(binding)
+    ? `<div class="source-animation-bound"><span>已绑定动画</span><strong>${escapeHtml(binding.sourceAnimationName)}</strong></div>
+       <section class="other-playback-config" aria-label="播放设置">
+         <div class="other-playback-title"><i data-lucide="settings-2"></i><strong>播放设置</strong></div>
+         <div class="other-playback-grid">
+           <div class="field">
+             <label for="bind-playback-mode">播放方式</label>
+             <select id="bind-playback-mode">
+               <option value="once"${playback.mode === 'once' ? ' selected' : ''}>播放一次后复位</option>
+               <option value="hold"${playback.mode === 'hold' ? ' selected' : ''}>播放一次并保持尾帧</option>
+               <option value="loop"${playback.mode === 'loop' ? ' selected' : ''}>循环播放</option>
+               <option value="pingpong"${playback.mode === 'pingpong' ? ' selected' : ''}>往返循环</option>
+             </select>
+           </div>
+           <div class="field">
+             <label for="bind-playback-direction">播放方向</label>
+             <select id="bind-playback-direction">
+               <option value="forward"${playback.direction === 'forward' ? ' selected' : ''}>正放</option>
+               <option value="reverse"${playback.direction === 'reverse' ? ' selected' : ''}>倒放</option>
+             </select>
+           </div>
+           <div class="field playback-end-field">
+             <label for="bind-playback-end">事件结束</label>
+             <select id="bind-playback-end">
+               <option value="reverse"${playback.endMode === 'reverse' ? ' selected' : ''}>反向恢复</option>
+               <option value="reset"${playback.endMode === 'reset' ? ' selected' : ''}>立即复位</option>
+               <option value="hold"${playback.endMode === 'hold' ? ' selected' : ''}>立即保持尾帧</option>
+               <option value="finish"${playback.endMode === 'finish' ? ' selected' : ''}>播完本轮并保持尾帧</option>
+             </select>
+           </div>
+         </div>
+         <details class="playback-advanced">
+           <summary><span>高级设置</span><small id="playback-duration">实际时长 ${effectiveDuration.toFixed(2)} 秒</small></summary>
+           <div class="playback-advanced-grid">
+             <div class="field">
+               <label for="bind-playback-speed">播放速度</label>
+               <input id="bind-playback-speed" type="number" min="0.1" max="4" step="0.05" value="${playback.speed}" />
+             </div>
+             <div class="field">
+               <label for="bind-playback-start">动作开始</label>
+               <div class="input-suffix"><input id="bind-playback-start" type="number" min="0" max="98" step="1" value="${Math.round(playback.range.start * 100)}" /><span>%</span></div>
+             </div>
+             <div class="field">
+               <label for="bind-playback-end-range">动作结束</label>
+               <div class="input-suffix"><input id="bind-playback-end-range" type="number" min="1" max="100" step="1" value="${Math.round(playback.range.end * 100)}" /><span>%</span></div>
+             </div>
+           </div>
+         </details>
+       </section>
+       <div class="quick-row other-preview-actions">
+         <button class="btn small" id="bind-preview-source"><i data-lucide="play"></i>预览触发</button>
+         <button class="btn small" id="bind-preview-end"><i data-lucide="rotate-ccw"></i>预览结束</button>
+         <button class="btn small" id="bind-remove">移除绑定</button>
+       </div>`
+    : '';
+  return `<div class="binding-editor other-binding-editor">
+    <section class="event-action-card">
+      <div class="event-action-copy">
+        <span>车机事件</span>
+        <strong>${slot.label}</strong>
+        <small>${slot.trigger || '对应车辆状态变化时触发'}</small>
+      </div>
+      ${animationControl}
+    </section>
+    ${bound}
+  </div>`;
+}
+
 function bindingEditor(slot) {
   const binding = bindings.get(slot.id);
   const isSelection = Boolean(binding?.selection) || selectionEditingSlot === slot.id;
   const isRegion = Boolean(binding?.region);
-  const rows = [`
+  if (modelType === 'other') return otherBindingEditor(slot, binding);
+  const actionKind = slot.kind;
+  const rows = [];
+  rows.push(`
     <div class="source-tabs" role="tablist" aria-label="绑定来源">
       <button type="button" class="btn small${!isSelection && !isRegion ? ' primary' : ''}" data-source-tab="parts">整部件</button>
       <button type="button" class="btn small${isSelection ? ' primary' : ''}" data-source-tab="selection">精细选面</button>
       <button type="button" class="btn small${isRegion ? ' primary' : ''}" data-source-tab="region">旧框选</button>
-    </div>`];
+    </div>`);
 
   // 对侧已配置时提供一键镜像（框选与选部件两种来源都支持）
   const mirrorFromId = MIRROR_PAIRS[slot.id];
   const mirrorFrom = mirrorFromId ? bindings.get(mirrorFromId) : null;
-  if (mirrorFrom) {
+  if (modelType === 'vehicle' && mirrorFrom) {
     const mirrorSelectionDisabled = Boolean(mirrorFrom.selection);
     rows.push(`
       <div class="quick-row" style="margin-top:0">
-        <button type="button" class="btn small" id="bind-mirror"${mirrorSelectionDisabled ? ' disabled title="精细选面暂不支持自动镜像，请在模型上手动补选"' : ''}><i data-lucide="arrow-left-right"></i>${mirrorSelectionDisabled ? '精细选面请手动补选' : `从「${SLOT_BY_ID.get(mirrorFromId).label}」镜像过来`}</button>
+        <button type="button" class="btn small" id="bind-mirror"${mirrorSelectionDisabled ? ' disabled title="精细选面暂不支持自动镜像，请在模型上手动补选"' : ''}><i data-lucide="arrow-left-right"></i>${mirrorSelectionDisabled ? '精细选面请手动补选' : `从「${activeSlot(mirrorFromId).label}」镜像过来`}</button>
       </div>`);
   }
 
@@ -2110,7 +2497,9 @@ function bindingEditor(slot) {
       </div>
       <div id="part-tree-wrap">${partTreeHtml(slot, binding)}</div>`);
     if (!binding) {
-      rows.push(`<p class="hint" style="margin:8px 0 0">车门这类多块的部件直接勾整组（内饰会跟着动）；也可以点“在模型上点选”后直接点击 3D 模型。点到已被其他联动占用的部件（比如同一盏灯）会自动转为框选，从它上面切一块出来。</p>`);
+      rows.push(`<p class="hint" style="margin:8px 0 0">${modelType === 'other'
+        ? '可以勾选任意数量的模型部件，也可以点“在模型上点选”后直接点击 3D 模型。一个事件可以同时驱动多个部位。'
+        : '车门这类多块的部件直接勾整组（内饰会跟着动）；也可以点“在模型上点选”后直接点击 3D 模型。点到已被其他联动占用的部件（比如同一盏灯）会自动转为框选，从它上面切一块出来。'}</p>`);
       return `<div class="binding-editor">${rows.join('')}</div>`;
     }
   }
@@ -2151,12 +2540,14 @@ function bindingEditor(slot) {
           <button type="button" class="btn small" id="selection-clear"${stats.triangles ? '' : ' disabled'}>清空选区</button>
           <button type="button" class="btn small primary" id="selection-done">完成选择</button>
         </div>
-        <p class="hint">智能点选会沿共享边扩展到相邻曲面；画笔可以旋转模型后继续补选另一侧。选中左右两个轮子时，它们会加入同一个槽位。</p>
+        <p class="hint">${modelType === 'other'
+          ? '智能点选会沿共享边扩展到相邻曲面；画笔可以旋转模型后继续补选其他需要联动的区域。'
+          : '智能点选会沿共享边扩展到相邻曲面；画笔可以旋转模型后继续补选另一侧。选中左右两个轮子时，它们会加入同一个槽位。'}</p>
       </div>`);
   }
 
   if (binding.region) {
-    const pivotButton = (slot.kind === 'hinge' || slot.kind === 'spin')
+    const pivotButton = actionUsesPivot(actionKind)
       ? `<button class="btn small${regionMode === 'pivot' ? ' primary' : ''}" data-region-mode="pivot">拖中心点</button>`
       : '';
     rows.push(`
@@ -2168,7 +2559,7 @@ function bindingEditor(slot) {
       <p class="hint" id="region-count" style="margin:8px 0 0">正在统计…</p>`);
   }
 
-  if (slot.kind === 'hinge' || slot.kind === 'spin') {
+  if (actionUsesPivot(actionKind)) {
     const pivot = binding?.pivot || [0, 0, 0];
     rows.push(`
       <div class="field-grid">
@@ -2177,15 +2568,14 @@ function bindingEditor(slot) {
         ${bindNumber('旋转中心 Z', 'bind-pivot-z', pivot[2])}
       </div>
       <div class="quick-row">
-        ${binding?.selection && slot.kind === 'spin' ? '<button class="btn small" id="pivot-refit">重新自动拟合</button>' : ''}
+        ${binding?.selection && actionKind === 'spin' ? '<button class="btn small" id="pivot-refit">重新自动拟合</button>' : ''}
         <button class="btn small" data-pivot="center">取中心</button>
-        <button class="btn small" data-pivot="front">取车头侧</button>
-        <button class="btn small" data-pivot="rear">取车尾侧</button>
+        ${modelType === 'vehicle' ? '<button class="btn small" data-pivot="front">取车头侧</button><button class="btn small" data-pivot="rear">取车尾侧</button>' : ''}
       </div>
       <p class="hint" style="margin:6px 0 9px">预览里的橙色小球就是旋转中心，虚线是旋转轴，${
         binding?.region ? '切到上方“拖中心点”后可直接拖动小球' : '可直接拖动小球调整'}。</p>`);
   }
-  if (slot.kind === 'hinge') {
+  if (actionKind === 'hinge' || actionKind === 'swing') {
     const axis = binding?.axis || slot.axis;
     rows.push(`
       <div class="field-grid">
@@ -2197,29 +2587,45 @@ function bindingEditor(slot) {
             <option value="z"${axis === 'z' ? ' selected' : ''}>Z 横向</option>
           </select>
         </div>
-        ${bindNumber('开启角度°', 'bind-angle', binding?.angle ?? slot.angle)}
-        ${bindNumber('开合用时 秒', 'bind-duration', binding?.duration ?? 0.8, 0.1)}
+        ${bindNumber(actionKind === 'swing' ? '摆动幅度°' : '开启角度°', 'bind-angle', binding?.angle ?? slot.angle ?? 30)}
+        ${bindNumber(actionKind === 'swing' ? '循环用时 秒' : '开合用时 秒', 'bind-duration', binding?.duration ?? 0.8, 0.1)}
       </div>`);
   }
-  if (slot.kind === 'spin') {
+  if (actionKind === 'spin') {
     const axis = binding?.axis || slot.axis;
     rows.push(`
       <div class="field">
         <label for="bind-axis">旋转轴</label>
         <select id="bind-axis">
-          <option value="z"${axis === 'z' ? ' selected' : ''}>Z 横向（车轮向前滚动）</option>
-          <option value="x"${axis === 'x' ? ' selected' : ''}>X 纵向（左右侧翻）</option>
-          <option value="y"${axis === 'y' ? ' selected' : ''}>Y 竖直（水平打转）</option>
+          <option value="z"${axis === 'z' ? ' selected' : ''}>Z 轴${modelType === 'vehicle' ? '（车轮向前滚动）' : ''}</option>
+          <option value="x"${axis === 'x' ? ' selected' : ''}>X 轴${modelType === 'vehicle' ? '（左右侧翻）' : ''}</option>
+          <option value="y"${axis === 'y' ? ' selected' : ''}>Y 轴${modelType === 'vehicle' ? '（水平打转）' : ''}</option>
         </select>
       </div>
       ${bindNumber('转一圈用时（秒）', 'bind-duration', binding?.duration ?? 0.8, 0.1)}
       <label class="check-row"><input type="checkbox" id="bind-reverse"${binding?.reverse ? ' checked' : ''} />反向转动</label>
-      <p class="hint" style="margin:0 0 9px">车机只有前、后两个车轮插槽，左右轮共用同一段动画同向转动。框选时把左右两个轮子一起框住，并把旋转中心放到轮轴上，轮子就会原地自转。</p>`);
+      <p class="hint" style="margin:0 0 9px">${modelType === 'other'
+        ? '旋转中心决定部位围绕哪里转动。默认取所选部位中心，也可以拖动橙色中心点微调。'
+        : '车机只有前、后两个车轮插槽，左右轮共用同一段动画同向转动。框选时把左右两个轮子一起框住，并把旋转中心放到轮轴上，轮子就会原地自转。'}</p>`);
+  }
+  if (actionKind === 'pulse') {
+    rows.push(`
+      <div class="field-grid two-cols">
+        ${bindNumber('缩放幅度', 'bind-scale-amount', binding?.scaleAmount ?? 0.25, 0.05)}
+        ${bindNumber('循环用时 秒', 'bind-duration', binding?.duration ?? 0.8, 0.1)}
+      </div>`);
+  }
+  if (actionKind === 'scale') {
+    rows.push(`
+      <div class="field-grid two-cols">
+        ${bindNumber('打开时缩放到', 'bind-scale-target', binding?.scaleTarget ?? 0.01, 0.05)}
+        ${bindNumber('开合用时 秒', 'bind-duration', binding?.duration ?? 0.8, 0.1)}
+      </div>`);
   }
   if (slot.kind === 'lamp' || slot.kind === 'blink') {
     rows.push(`
       <div class="field">
-        <label for="bind-color">点亮颜色</label>
+        <label for="bind-color">${modelType === 'other' ? '事件点亮颜色' : '点亮颜色'}</label>
         <input id="bind-color" type="color" value="${binding?.color || slot.color}" />
       </div>`);
   }
@@ -2243,17 +2649,21 @@ function renderBindings() {
   capturePartTreeScroll();
   const ready = Boolean(current);
   const html = [];
-  for (const [group, slots] of slotGroups()) {
+  for (const [group, slots] of activeSlotGroups()) {
     const ordered = [...slots].sort((a, b) => Number(bindings.has(b.id)) - Number(bindings.has(a.id)));
     const items = ordered.map((slot) => {
       const binding = bindings.get(slot.id);
       const open = openSlot === slot.id;
       const selectionCount = binding?.selection ? selectionTriangleCount(binding.selection) : 0;
-      const state = !binding ? '未绑定' : binding.selection && selectionCount === 0 ? '需确认' : '已绑定';
+      const needsConfirm = Boolean(binding && (
+        (modelType === 'other' && !sourceAnimationBindingValid(binding))
+        || (binding.selection && selectionCount === 0)
+      ));
+      const state = !binding ? '未绑定' : needsConfirm ? '需确认' : '已绑定';
       return `
-        <div class="binding-item${binding ? ' bound' : ''}${open ? ' open' : ''}">
+        <div class="binding-item${binding && !needsConfirm ? ' bound' : ''}${open ? ' open' : ''}">
           <button class="binding-head" data-slot="${slot.id}"${ready ? '' : ' disabled'}>
-            <span class="binding-name"><span class="slot-dot ${binding ? 'bound' : ''}"></span>${slot.label}</span>
+            <span class="binding-name"><span class="slot-dot ${binding && !needsConfirm ? 'bound' : ''}"></span>${slot.label}</span>
             <span class="binding-state ${state === '需确认' ? 'needs-confirm' : ''}">${state}</span>
           </button>
         </div>`;
@@ -2261,25 +2671,29 @@ function renderBindings() {
     html.push(`<div class="binding-group"><h3>${group}</h3>${items}</div>`);
   }
   ui['binding-groups'].innerHTML = html.join('');
-  ui['binding-summary'].textContent = bindings.size ? `已配置 ${bindings.size} 项` : '未配置';
-  ui['demo-all'].disabled = !current || bindings.size === 0;
+  const readyBindingCount = bindingsForOutput().length;
+  ui['binding-summary'].textContent = readyBindingCount ? `已配置 ${readyBindingCount} 项` : '未配置';
+  ui['demo-all'].disabled = !current || readyBindingCount === 0;
   ui['binding-back'].hidden = !openSlot;
   document.querySelector('.binding-inspector-title').classList.toggle('has-back', Boolean(openSlot));
   if (demoRun) setDemoButton(true);
   else setDemoButton(false);
   if (openSlot) {
-    const slot = SLOT_BY_ID.get(openSlot);
+    const slot = activeSlot(openSlot);
     ui['binding-editor-title'].textContent = slot?.label || '联动编辑';
     ui['binding-editor-host'].innerHTML = slot ? bindingEditor(slot) : '';
   } else {
     ui['binding-editor-title'].textContent = '选择一个联动槽位';
-    const picker = [...slotGroups()].flatMap(([, slots]) => slots).map((slot) => `
+    const picker = [...activeSlotGroups()].flatMap(([, slots]) => slots).map((slot) => `
       <button class="btn small" data-mobile-slot="${slot.id}">${slot.label}${bindings.has(slot.id) ? ' · 已绑定' : ''}</button>`).join('');
-    ui['binding-editor-host'].innerHTML = `<div class="inspector-placeholder"><i data-lucide="mouse-pointer-2"></i><span>从左侧选择灯光、车轮或开合槽位</span></div><div class="mobile-slot-picker">${picker}</div>`;
+    const emptyCopy = modelType === 'other'
+      ? '先选择一个车机事件，再绑定模型自带动画'
+      : '从左侧选择灯光、车轮或开合槽位';
+    ui['binding-editor-host'].innerHTML = `<div class="inspector-placeholder"><i data-lucide="mouse-pointer-2"></i><span>${emptyCopy}</span></div><div class="mobile-slot-picker">${picker}</div>`;
   }
   renderIcons();
   wireBindingEditor();
-  if (openSlot) restorePartTreeScroll(SLOT_BY_ID.get(openSlot));
+  if (openSlot) restorePartTreeScroll(activeSlot(openSlot));
 }
 
 function closeBindingEditor() {
@@ -2301,7 +2715,29 @@ function wireBindingEditor() {
     button.addEventListener('click', () => toggleSlot(button.dataset.slot));
   });
   if (!openSlot) return;
-  const slot = SLOT_BY_ID.get(openSlot);
+  const slot = activeSlot(openSlot);
+  if (modelType === 'other') {
+    document.getElementById('bind-source-animation')?.addEventListener('change', (event) => {
+      setSourceAnimationBinding(slot, event.target.value);
+    });
+    for (const id of [
+      'bind-playback-mode', 'bind-playback-direction', 'bind-playback-end',
+      'bind-playback-speed', 'bind-playback-start', 'bind-playback-end-range',
+    ]) {
+      document.getElementById(id)?.addEventListener('change', () => updateOtherPlaybackBinding(slot));
+    }
+    document.getElementById('bind-preview-source')?.addEventListener('click', () => playCurrentBinding('on'));
+    document.getElementById('bind-preview-end')?.addEventListener('click', () => playCurrentBinding('off'));
+    document.getElementById('bind-remove')?.addEventListener('click', () => {
+      snapshot();
+      bindings.delete(slot.id);
+      preview.stopBindingPreview();
+      setDirty();
+      markDevicePreviewStale();
+      renderBindings();
+    });
+    return;
+  }
   ui['binding-editor-host'].querySelectorAll('[data-source-tab]').forEach((button) => {
     button.addEventListener('click', () => setSourceTab(slot, button.dataset.sourceTab));
   });
@@ -2314,7 +2750,7 @@ function wireBindingEditor() {
   }
   document.getElementById('part-pick')?.addEventListener('click', () => togglePickMode(slot));
   wirePartTree(slot);
-  for (const id of ['bind-pivot-x', 'bind-pivot-y', 'bind-pivot-z', 'bind-angle', 'bind-axis', 'bind-color', 'bind-duration', 'bind-reverse']) {
+  for (const id of ['bind-pivot-x', 'bind-pivot-y', 'bind-pivot-z', 'bind-angle', 'bind-axis', 'bind-color', 'bind-duration', 'bind-reverse', 'bind-scale-amount', 'bind-scale-target']) {
     const input = document.getElementById(id);
     if (input) {
       input.addEventListener('input', () => updateBindingFromInputs(slot));
@@ -2388,7 +2824,7 @@ function toggleSlot(slotId) {
   renderBindings();
   if (closing) return;
   setActivePanel('binding');
-  const slot = SLOT_BY_ID.get(slotId);
+  const slot = activeSlot(slotId);
   const binding = bindings.get(slotId);
   // 框选绑定由 openRegionBox 的 onChange 负责播放，避免重复切分
   if (binding?.region) openRegionBox(slot);
@@ -2413,7 +2849,7 @@ function setSourceTab(slot, tab) {
     if (isRegion) return;
     const modelBounds = preview.wholeBounds();
     if (!modelBounds) return;
-    createRegionBinding(slot, suggestRegion(slot, modelBounds));
+    createRegionBinding(slot, suggestRegion(slot, modelBounds, { modelType }));
     return;
   }
   if (!isRegion && !isSelection) return;
@@ -2432,7 +2868,8 @@ function createSelectionBinding(slot, previous) {
   const stats = preview.selectionStats(selection);
   const bounds = boundsFromPoints(stats.points) || previous?.geomBounds || previous?.bounds || preview.wholeBounds();
   if (!bounds) return;
-  const defaults = defaultParams(slot, bounds);
+  const defaults = defaultParams(slot, bounds, { modelType });
+  const actionKind = slot.kind;
   const next = {
     ...(previous ? structuredClone(previous) : {}),
     slotId: slot.id,
@@ -2442,13 +2879,16 @@ function createSelectionBinding(slot, previous) {
     sourceName: stats.triangles ? `精细选面（${stats.triangles.toLocaleString()} 面）` : '精细选面（未完成）',
     bounds,
     geomBounds: bounds,
-    pivot: previous?.pivotCustom ? previous.pivot : (slot.kind === 'spin' ? (stats.pivot || defaults.pivot) : defaults.pivot),
+    pivot: previous?.pivotCustom ? previous.pivot : (actionKind === 'spin' ? (stats.pivot || defaults.pivot) : defaults.pivot),
     pivotCustom: Boolean(previous?.pivotCustom),
     axis: previous?.axis || defaults.axis,
     angle: previous?.angle ?? defaults.angle,
     duration: previous?.duration ?? 0.8,
     reverse: Boolean(previous?.reverse),
     color: previous?.color || defaults.color,
+    actionKind,
+    scaleAmount: previous?.scaleAmount ?? 0.25,
+    scaleTarget: previous?.scaleTarget ?? 0.01,
   };
   delete next.region;
   bindings.set(slot.id, next);
@@ -2524,7 +2964,7 @@ function updateSelectionSummary(stats) {
   if (clear) clear.disabled = !(stats?.triangles);
   syncUndoRedoButtons();
   const binding = openSlot ? bindings.get(openSlot) : null;
-  if (binding) updateBindingRow(SLOT_BY_ID.get(openSlot), binding);
+  if (binding) updateBindingRow(activeSlot(openSlot), binding);
 }
 
 function startFineSelection(slot, { preserveState = false } = {}) {
@@ -2647,13 +3087,16 @@ function createRegionBinding(slot, region) {
     sourceName: '框选区域',
     bounds: constrainedRegion,
     geomBounds: measured.bounds,
-    pivot: previous?.pivotCustom ? previous.pivot : defaultParams(slot, measured.bounds || constrainedRegion).pivot,
+    pivot: previous?.pivotCustom ? previous.pivot : defaultParams(slot, measured.bounds || constrainedRegion, { modelType }).pivot,
     pivotCustom: Boolean(previous?.pivotCustom),
     axis: previous?.axis || slot.axis,
     angle: previous?.angle ?? slot.angle,
     duration: previous?.duration ?? 0.8,
     reverse: Boolean(previous?.reverse),
     color: previous?.color || slot.color,
+    actionKind: slot.kind,
+    scaleAmount: previous?.scaleAmount ?? 0.25,
+    scaleTarget: previous?.scaleTarget ?? 0.01,
   });
   regionMode = 'translate';
   renderBindings();
@@ -2685,7 +3128,7 @@ function openRegionBox(slot) {
     updateRegionCount(binding);
     // 用户手动调过旋转中心就不再自动跟随选区；否则跟随框内实际几何的中心
     if (!binding.pivotCustom) {
-      binding.pivot = defaultParams(slot, binding.geomBounds || region).pivot;
+      binding.pivot = defaultParams(slot, binding.geomBounds || region, { modelType }).pivot;
       syncPivotInputs(binding);
     }
     syncPivotTools(slot, binding);
@@ -2711,7 +3154,7 @@ function updateRegionCount(binding) {
  * 非框选绑定（或框选切到“拖中心点”模式）时小球可直接拖动。
  */
 function syncPivotTools(slot, binding) {
-  if (!slot || !binding || !(slot.kind === 'hinge' || slot.kind === 'spin')) {
+  if (!slot || !binding || !actionUsesPivot(slot.kind)) {
     preview.hidePivotMarker();
     return;
   }
@@ -2785,6 +3228,10 @@ function updateBindingFromInputs(slot) {
   if (reverse) binding.reverse = reverse.checked;
   const color = document.getElementById('bind-color');
   if (color) binding.color = color.value;
+  const scaleAmount = document.getElementById('bind-scale-amount');
+  if (scaleAmount) binding.scaleAmount = Math.min(0.9, Math.max(0.05, Number(scaleAmount.value) || 0.25));
+  const scaleTarget = document.getElementById('bind-scale-target');
+  if (scaleTarget) binding.scaleTarget = Math.min(3, Math.max(0.01, Number(scaleTarget.value) || 0.01));
   setDirty();
   markDevicePreviewStale();
   syncPivotTools(slot, binding);
@@ -2807,18 +3254,46 @@ function snapPivot(slot, mode) {
   playCurrentBinding();
 }
 
-function playCurrentBinding() {
+function updateOtherPlaybackBinding(slot) {
+  const binding = bindings.get(slot.id);
+  if (!binding) return;
+  snapshot({ scope: 'binding-playback', slotId: slot.id });
+  binding.playback = normalizeOtherPlayback(slot, {
+    version: 2,
+    mode: document.getElementById('bind-playback-mode')?.value,
+    direction: document.getElementById('bind-playback-direction')?.value,
+    endMode: document.getElementById('bind-playback-end')?.value,
+    speed: document.getElementById('bind-playback-speed')?.value,
+    range: {
+      start: (Number(document.getElementById('bind-playback-start')?.value) || 0) / 100,
+      end: (Number(document.getElementById('bind-playback-end-range')?.value) || 100) / 100,
+    },
+  });
+  setDirty();
+  markDevicePreviewStale();
+  document.getElementById('bind-playback-speed').value = binding.playback.speed;
+  document.getElementById('bind-playback-start').value = Math.round(binding.playback.range.start * 100);
+  document.getElementById('bind-playback-end-range').value = Math.round(binding.playback.range.end * 100);
+  const animation = sourceAnimationByIndex(binding.sourceAnimationIndex);
+  const duration = playbackDurationOf(animation?.duration, binding.playback);
+  const durationLabel = document.getElementById('playback-duration');
+  if (durationLabel) durationLabel.textContent = `实际时长 ${duration.toFixed(2)} 秒`;
+  playCurrentBinding('on');
+}
+
+function playCurrentBinding(phase = 'on') {
   if (!openSlot) return;
-  const slot = SLOT_BY_ID.get(openSlot);
+  const slot = activeSlot(openSlot);
   const binding = bindings.get(openSlot);
   if (!slot || !binding) return;
+  if (modelType === 'other' && !sourceAnimationBindingValid(binding)) return;
   if (selectionEditingSlot === openSlot) {
     preview.stopBindingPreview();
     return;
   }
   // 框选时已经有选区盒了，再叠一个高亮框只会互相干扰
   if (!binding.region && !binding.selection) preview.highlightPart(binding.nodeIndices);
-  preview.previewBinding(slot, binding);
+  preview.previewBinding(slot, binding, phase);
 }
 
 async function generatePackage() {
@@ -2834,6 +3309,7 @@ async function generatePackage() {
     const result = await makeBydCar({
       sourceBytes: current.bytes,
       sourceName: current.sourceName || current.file.name,
+      modelType,
       transform: preview.getExportTransform(),
       stats: current.stats,
       bindings: bindingsForOutput(),

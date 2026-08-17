@@ -103,6 +103,7 @@ function sanitizeMetadata(metadata) {
   return {
     displayName: cleanText(source.displayName, '未命名车模'),
     modelName: cleanText(source.modelName, 'custom-model.glb'),
+    modelType: source.modelType === 'other' ? 'other' : 'vehicle',
     sourceFormat: cleanText(source.sourceFormat, 'glb'),
     formatLabel: cleanText(source.formatLabel, 'GLB'),
     warnings: Array.isArray(source.warnings) ? source.warnings.filter((item) => typeof item === 'string').slice(0, 100) : [],
