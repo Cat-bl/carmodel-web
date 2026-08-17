@@ -89,6 +89,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .tool-btn { min-height: 30px; padding: 5px 10px; color: #9daab1; border: 1px solid transparent; background: transparent; border-radius: 4px; font-size: 11px; cursor: pointer; }
 .tool-btn:hover, .tool-btn.active { color: var(--ink); border-color: #3f4c53; background: #252d32; }
 .canvas-reset { margin-left: auto; }
+.mobile-preview-mode { display: none; flex: none; }
 .viewport { position: relative; min-height: 0; overflow: hidden; background: #11171a; touch-action: none; }
 .viewport canvas { display: block; width: 100%; height: 100%; }
 .empty-state { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; color: var(--ink-2); text-align: center; cursor: pointer; background: #13191d; }
@@ -255,6 +256,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
   .editor-workspace { position: relative; display: block; height: auto; min-height: 0; overflow: hidden; }
   .task-rail { display: none; }
   .canvas-stage { min-height: 0; height: 100%; }
+  .mobile-preview-mode { display: inline-flex; margin-left: auto; border-color: #344149; background: #151b1f; }
+  .mobile-preview-mode button { min-width: 46px; min-height: 30px; padding: 4px 8px; color: #95a3aa; }
+  .mobile-preview-mode button.active { color: #fff; background: #237f90; }
+  .canvas-reset { margin-left: 0; }
   .inspector { position: absolute; left: 0; right: 0; bottom: 0; z-index: 34; height: 42%; min-height: 180px; max-height: calc(100% - 86px); border-left: 0; border-top: 1px solid var(--line-strong); box-shadow: 0 -12px 30px rgba(0, 0, 0, .38); }
   .inspector-panel { min-height: 0; }
   .inspector-title { position: relative; cursor: ns-resize; touch-action: none; }

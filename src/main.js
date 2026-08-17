@@ -1,6 +1,7 @@
 import './style.css';
 import { ModelPreview } from './preview.js';
 import { makeBydCar, makeVehiclePreviewGlb } from './package.js';
+import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
 import { SLOT_BY_ID, defaultParams, slotGroups, suggestRegion } from './bindings.js';
 import {
   createIcons,
@@ -86,14 +87,18 @@ app.innerHTML = `
             <button class="tool-btn" data-view="right">右</button>
             <button class="tool-btn" data-view="top">顶</button>
           </div>
+          <div class="segmented compact mobile-preview-mode" aria-label="移动端预览质感">
+            <button class="active" id="mode-web-mobile" disabled>网页</button>
+            <button id="mode-device-mobile" disabled>车机</button>
+          </div>
           <button class="icon-btn canvas-reset" data-view="perspective" title="适应视图"><i data-lucide="maximize-2"></i></button>
         </div>
         <div class="viewport">
           <canvas id="preview"></canvas>
           <label class="empty-state" id="empty-state" for="model-file" tabindex="0" role="button">
             <i data-lucide="upload"></i>
-            <strong>导入 GLB 车模</strong>
-            <span>点击或拖入完整的 GLB 文件</span>
+            <strong>导入车模</strong>
+            <span>${MODEL_FORMAT_HINT}</span>
           </label>
           <div class="import-progress" id="import-progress" role="status" aria-live="polite" aria-valuemin="0" aria-valuemax="100" hidden>
             <div class="import-progress-copy">
@@ -103,7 +108,7 @@ app.innerHTML = `
             </div>
             <div class="import-progress-track" aria-hidden="true"><span id="import-progress-bar"></span></div>
           </div>
-          <input id="model-file" class="visually-hidden" type="file" accept=".glb,model/gltf-binary" />
+          <input id="model-file" class="visually-hidden" type="file" accept="${MODEL_FILE_ACCEPT}" />
           <div class="selection-hud" id="selection-hud" hidden></div>
         </div>
         <footer class="workspace-status">
@@ -123,7 +128,7 @@ app.innerHTML = `
           </div>
           <div class="inspector-scroll">
             <section class="tool-section">
-              <div class="section-title"><h3>模型信息</h3><span>GLB 2.0</span></div>
+              <div class="section-title"><h3>模型信息</h3><span id="source-format-label">等待导入</span></div>
               <div class="stats">
                 ${stat('大小', 'stat-bytes')}
                 ${stat('三角形', 'stat-triangles')}
@@ -262,8 +267,10 @@ function status(kind, icon, text) {
 
 const ui = Object.fromEntries([
   'model-file', 'drop-zone', 'file-name', 'analysis-state', 'empty-state',
+  'source-format-label',
   'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'height-offset', 'status-list',
   'generate', 'mobile-generate', 'reset-rotation', 'mobile-reset', 'mode-web', 'mode-device',
+  'mode-web-mobile', 'mode-device-mobile',
   'binding-groups', 'binding-summary', 'binding-editor-host', 'binding-editor-title', 'demo-all',
   'delete-start', 'delete-panel', 'delete-summary', 'undo', 'redo', 'dirty-state',
   'workspace-triangles', 'workspace-selection', 'workspace-mode', 'workspace-index',
@@ -578,8 +585,7 @@ let deviceGlbCacheKey = '';
 async function setPreviewMode(device) {
   if (!current || (preview.deviceMode === device && (!device || deviceGlbCache))) return;
   stopFineSelection();
-  ui['mode-web'].disabled = true;
-  ui['mode-device'].disabled = true;
+  for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = true;
   try {
     // 预览复用最终导出管线：变换、联动切分或删除区域改变时都要重烘。
     const transform = preview.getExportTransform();
@@ -589,13 +595,15 @@ async function setPreviewMode(device) {
     const cacheKey = JSON.stringify({ transform, bindings: previewBindings, deletions: previewDeletions, quality });
     if (device && (!deviceGlbCache || deviceGlbCacheKey !== cacheKey)) {
       ui['mode-device'].textContent = '烘焙中…';
+      ui['mode-device-mobile'].textContent = '处理中…';
       deviceGlbCache = await makeVehiclePreviewGlb(current.bytes, transform, previewBindings, previewDeletions, quality);
       deviceGlbCacheKey = cacheKey;
       ui['mode-device'].textContent = '车机质感';
+      ui['mode-device-mobile'].textContent = '车机';
     }
     await preview.setDeviceMode(device, deviceGlbCache, transform);
-    ui['mode-web'].classList.toggle('active', !device);
-    ui['mode-device'].classList.toggle('active', device);
+    for (const id of ['mode-web', 'mode-web-mobile']) ui[id].classList.toggle('active', !device);
+    for (const id of ['mode-device', 'mode-device-mobile']) ui[id].classList.toggle('active', device);
     // 模型实例换了，删除区域、部件映射与打开中的联动工具都要跟着重建
     preview.setDeletions(deletions.map((item) => item.region));
     refreshParts();
@@ -616,19 +624,22 @@ async function setPreviewMode(device) {
   } catch (error) {
     console.error(error);
     ui['mode-device'].textContent = '车机质感';
+    ui['mode-device-mobile'].textContent = '车机';
     setStatuses([['bad', '×', `车机质感预览失败：${error.message}`]]);
   } finally {
-    ui['mode-web'].disabled = false;
-    ui['mode-device'].disabled = false;
+    for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = false;
   }
 }
 ui['mode-web'].addEventListener('click', () => setPreviewMode(false));
 ui['mode-device'].addEventListener('click', () => setPreviewMode(true));
+ui['mode-web-mobile'].addEventListener('click', () => setPreviewMode(false));
+ui['mode-device-mobile'].addEventListener('click', () => setPreviewMode(true));
 
 async function loadFile(file) {
   if (!file) return;
-  if (!file.name.toLowerCase().endsWith('.glb')) {
-    setStatuses([['bad', '×', '首版只接受完整的 .glb 文件']]);
+  const extension = file.name.toLowerCase().split('.').pop();
+  if (!['glb', 'fbx', 'zip'].includes(extension)) {
+    setStatuses([['bad', '×', '支持 GLB、glTF ZIP、FBX、FBX ZIP 和 OBJ ZIP']]);
     return;
   }
   ui['file-name'].textContent = file.name;
@@ -639,9 +650,21 @@ async function loadFile(file) {
   updateImportProgress({ progress: 0.02, label: '准备读取模型' });
   setStatuses([['warn', '…', '正在解析模型，请稍候']]);
   try {
-    const loaded = await preview.load(file, updateImportProgress);
+    const prepared = await prepareModelImport(file, ({ progress, label, indeterminate }) => {
+      updateImportProgress({ progress: progress * 0.55, label, indeterminate });
+    });
+    const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {
+      updateImportProgress({ progress: 0.55 + progress * 0.43, label, indeterminate });
+    });
     updateImportProgress({ progress: 0.96, label: '正在初始化编辑工具' });
-    current = { file, ...loaded };
+    current = {
+      ...prepared,
+      ...loaded,
+      file: { name: prepared.name, size: prepared.bytes.byteLength },
+      sourceName: prepared.name,
+      sourceFile: file,
+      sourceFormat: prepared.sourceFormat,
+    };
     setDirty(false);
     ui['rotation-x'].value = 0;
     ui['rotation-y'].value = loaded.orientation.rotationY;
@@ -661,13 +684,19 @@ async function loadFile(file) {
     resetBindings();
     ui['mode-web'].classList.add('active');
     ui['mode-device'].classList.remove('active');
+    ui['mode-web-mobile'].classList.add('active');
+    ui['mode-device-mobile'].classList.remove('active');
     ui['mode-device'].textContent = '车机质感';
+    ui['mode-device-mobile'].textContent = '车机';
     ui['analysis-state'].textContent = '解析完成';
     ui['empty-state'].hidden = true;
     setControls(true);
     setActivePanel('model');
     updateSteps(3);
-    validateStats(loaded.stats, loaded.orientation);
+    ui['source-format-label'].textContent = prepared.sourceFormat === 'glb'
+      ? 'GLB 2.0'
+      : `${prepared.formatLabel} · 已统一为 GLB`;
+    validateStats(loaded.stats, loaded.orientation, prepared);
     updateImportProgress({ progress: 1, label: '模型导入完成' });
   } catch (error) {
     console.error(error);
@@ -677,7 +706,7 @@ async function loadFile(file) {
     setControls(false);
     updateSteps(0);
     ui['empty-state'].hidden = false;
-    setStatuses([['bad', '×', `无法读取此 GLB：${error.message || '文件结构无效'}`]]);
+    setStatuses([['bad', '×', `无法读取此模型：${error.message || '文件结构无效'}`]]);
   } finally {
     ui['model-file'].disabled = false;
     ui['model-file'].value = '';
@@ -697,7 +726,7 @@ function updateStats(stats) {
   ui['workspace-index'].textContent = '精细索引未启用';
 }
 
-function validateStats(stats, orientation) {
+function validateStats(stats, orientation, importInfo = null) {
   const results = [];
   if (stats.triangles > 300000) results.push(['warn', '!', `三角形较多（${stats.triangles.toLocaleString()}），原始档会完整保留，可按需要选择其他质量档位`]);
   else if (stats.triangles > 60000) results.push(['warn', '!', `三角形较多（${stats.triangles.toLocaleString()}），可按车机性能选择导出质量`]);
@@ -713,8 +742,12 @@ function validateStats(stats, orientation) {
   } else if (orientation?.detected) {
     results.push(['warn', '!', `已按车辆轮廓推测正面并对齐车头（Y ${orientation.rotationY}°），请在预览中确认`]);
   } else {
-    results.push(['warn', '!', '未能从部件中可靠识别正面，已按常见 GLB 约定默认左转 90°（Y 270°），可在预览中手动校正']);
+    results.push(['warn', '!', '未能从部件中可靠识别正面，已按常见模型约定默认左转 90°（Y 270°），可在预览中手动校正']);
   }
+  if (importInfo?.sourceFormat && importInfo.sourceFormat !== 'glb') {
+    results.push(['good', '✓', `${importInfo.formatLabel} 已转换为内嵌资源 GLB，后续编辑与导出使用统一几何`]);
+  }
+  for (const warning of importInfo?.warnings || []) results.push(['warn', '!', warning]);
   results.push(['good', '✓', '模型结构已完成解析']);
   setStatuses(results);
   ui.generate.disabled = false;
@@ -732,8 +765,7 @@ function setControls(enabled) {
   ui.generate.disabled = !enabled;
   ui['mobile-generate'].disabled = !enabled;
   document.getElementById('mobile-generate-shortcut').disabled = !enabled;
-  ui['mode-web'].disabled = !enabled;
-  ui['mode-device'].disabled = !enabled;
+  for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = !enabled;
   ui['reset-rotation'].disabled = !enabled;
   ui['mobile-reset'].disabled = !enabled;
 }
@@ -2453,7 +2485,7 @@ async function generatePackage() {
   try {
     const result = await makeBydCar({
       sourceBytes: current.bytes,
-      sourceName: current.file.name,
+      sourceName: current.sourceName || current.file.name,
       transform: preview.getExportTransform(),
       stats: current.stats,
       bindings: bindingsForOutput(),

@@ -274,14 +274,17 @@ export class ModelPreview {
     this.scene.add(sprite);
   }
 
-  async load(file, onProgress = null) {
+  async load(source, onProgress = null) {
     const report = (progress, label, indeterminate = false) => onProgress?.({ progress, label, indeterminate });
-    report(0.04, '正在读取模型文件');
-    const bytes = await readFileWithProgress(file, (ratio) => report(0.04 + ratio * 0.22, '正在读取模型文件'));
+    report(0.04, '正在读取规范化模型');
+    const bytes = source?.bytes
+      ? new Uint8Array(source.bytes)
+      : new Uint8Array(await readFileWithProgress(source, (ratio) => report(0.04 + ratio * 0.22, '正在读取模型文件')));
     report(0.3, '正在解析模型与纹理', true);
     await nextPaint();
     const gltf = await new Promise((resolve, reject) => {
-      new GLTFLoader().parse(bytes, '', resolve, reject);
+      const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      new GLTFLoader().parse(buffer, '', resolve, reject);
     });
     report(0.64, '正在建立预览场景');
     await nextPaint();
@@ -300,7 +303,7 @@ export class ModelPreview {
     report(0.82, '正在建立部件索引');
     await this.indexNodes(gltf, (ratio) => report(0.82 + ratio * 0.1, '正在建立部件索引'));
     report(0.94, '正在统计模型信息');
-    const stats = collectStats(gltf, file.size);
+    const stats = collectStats(gltf, bytes.byteLength);
     this.onStats?.(stats);
     return { gltf, bytes, stats, orientation };
   }
