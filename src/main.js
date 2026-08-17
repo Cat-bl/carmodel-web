@@ -2,16 +2,21 @@ import './style.css';
 import { ModelPreview } from './preview.js';
 import { makeBydCar, makeVehiclePreviewGlb } from './package.js';
 import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
+import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
 import { SLOT_BY_ID, defaultParams, slotGroups, suggestRegion } from './bindings.js';
 import {
   createIcons,
+  AlertCircle,
+  AlertTriangle,
   ArrowLeft,
   ArrowLeftRight,
   BoxSelect,
   CheckCircle2,
   Download,
   Eye,
+  FolderOpen,
   Gauge,
+  Info,
   Layers3,
   Maximize2,
   MousePointer2,
@@ -19,6 +24,7 @@ import {
   Play,
   Redo2,
   RotateCcw,
+  Save,
   Settings2,
   Sparkles,
   Square,
@@ -40,8 +46,9 @@ app.innerHTML = `
         <div class="file-copy">
           <strong>BYD 车模编辑器</strong>
           <span id="file-name">尚未选择模型</span>
+          <small id="save-status">项目文件未保存</small>
         </div>
-        <span class="dirty-dot" id="dirty-state" title="未保存的修改" hidden></span>
+        <span class="dirty-dot" id="dirty-state" title="有尚未保存到项目文件的修改" hidden></span>
       </div>
       <div class="command-center">
         <button class="icon-btn" id="undo" disabled title="撤销"><i data-lucide="undo-2"></i></button>
@@ -54,6 +61,8 @@ app.innerHTML = `
         </div>
       </div>
       <div class="command-actions">
+        <button class="icon-btn project-action" id="open-project" type="button" title="打开项目"><i data-lucide="folder-open"></i></button>
+        <button class="icon-btn project-action" id="save-project" type="button" title="保存项目 (Ctrl+S)" disabled><i data-lucide="save"></i></button>
         <button class="btn command-check" data-panel-target="check"><i data-lucide="check-circle-2"></i><span>检查</span></button>
         <button class="btn primary" id="generate" disabled><i data-lucide="download"></i><span id="generate-label">原始 · 生成车模包</span></button>
       </div>
@@ -95,11 +104,15 @@ app.innerHTML = `
         </div>
         <div class="viewport">
           <canvas id="preview"></canvas>
-          <label class="empty-state" id="empty-state" for="model-file" tabindex="0" role="button">
+          <div class="empty-state" id="empty-state">
             <i data-lucide="upload"></i>
-            <strong>导入车模</strong>
+            <strong>开始制作车模</strong>
             <span>${MODEL_FORMAT_HINT}</span>
-          </label>
+            <div class="empty-actions">
+              <label class="btn primary" for="model-file"><i data-lucide="upload"></i>导入模型</label>
+              <label class="btn" for="project-file"><i data-lucide="folder-open"></i>打开项目</label>
+            </div>
+          </div>
           <div class="import-progress" id="import-progress" role="status" aria-live="polite" aria-valuemin="0" aria-valuemax="100" hidden>
             <div class="import-progress-copy">
               <span class="spinner" aria-hidden="true"></span>
@@ -109,6 +122,7 @@ app.innerHTML = `
             <div class="import-progress-track" aria-hidden="true"><span id="import-progress-bar"></span></div>
           </div>
           <input id="model-file" class="visually-hidden" type="file" accept="${MODEL_FILE_ACCEPT}" />
+          <input id="project-file" class="visually-hidden" type="file" accept="${PROJECT_FILE_ACCEPT}" />
           <div class="selection-hud" id="selection-hud" hidden></div>
         </div>
         <footer class="workspace-status">
@@ -124,7 +138,10 @@ app.innerHTML = `
         <section class="inspector-panel active" data-panel="model">
           <div class="inspector-title">
             <div><span>模型</span><h2>导入与调整</h2></div>
-            <label class="icon-btn" for="model-file" title="导入或更换模型"><i data-lucide="upload"></i></label>
+            <div class="inspector-title-actions">
+              <button class="icon-btn" id="inspector-open-project" type="button" title="打开项目"><i data-lucide="folder-open"></i></button>
+              <label class="icon-btn" for="model-file" title="导入或更换模型"><i data-lucide="upload"></i></label>
+            </div>
           </div>
           <div class="inspector-scroll">
             <section class="tool-section">
@@ -211,6 +228,7 @@ app.innerHTML = `
       <button class="dock-task active" data-panel-target="model">模型</button>
       <button class="dock-task" data-panel-target="binding">联动</button>
       <button class="dock-task" data-panel-target="check">检查</button>
+      <button class="icon-btn" id="mobile-save-project" disabled title="保存项目"><i data-lucide="save"></i></button>
       <button class="icon-btn primary" id="mobile-generate-shortcut" disabled title="生成"><i data-lucide="download"></i></button>
     </div>
   </div>
@@ -266,10 +284,11 @@ function status(kind, icon, text) {
 }
 
 const ui = Object.fromEntries([
-  'model-file', 'drop-zone', 'file-name', 'analysis-state', 'empty-state',
+  'model-file', 'project-file', 'drop-zone', 'file-name', 'save-status', 'analysis-state', 'empty-state',
   'source-format-label',
   'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'height-offset', 'status-list',
-  'generate', 'mobile-generate', 'reset-rotation', 'mobile-reset', 'mode-web', 'mode-device',
+  'generate', 'mobile-generate', 'mobile-generate-shortcut', 'save-project', 'mobile-save-project',
+  'open-project', 'inspector-open-project', 'reset-rotation', 'mobile-reset', 'mode-web', 'mode-device',
   'mode-web-mobile', 'mode-device-mobile',
   'binding-groups', 'binding-summary', 'binding-editor-host', 'binding-editor-title', 'demo-all',
   'delete-start', 'delete-panel', 'delete-summary', 'undo', 'redo', 'dirty-state',
@@ -286,6 +305,7 @@ ui['drop-zone'] ||= ui['empty-state'];
 const preview = new ModelPreview(document.getElementById('preview'), updateStats);
 let current = null;
 let dirty = false;
+let projectSaved = false;
 let activePanel = 'model';
 const QUALITY_PRESETS = {
   smooth: { label: '流畅', triangleTarget: 80000, textureMaxSize: 1024 },
@@ -305,8 +325,9 @@ window.addEventListener('beforeunload', (event) => {
 });
 
 const lucideIcons = {
-  ArrowLeft, ArrowLeftRight, BoxSelect, CheckCircle2, Download, Eye, Gauge, Layers3, Maximize2, MousePointer2,
-  Paintbrush, Play, Redo2, RotateCcw, Settings2, Sparkles, Square, Trash2, Undo2, Upload, Wrench, X,
+  AlertCircle, AlertTriangle, ArrowLeft, ArrowLeftRight, BoxSelect, CheckCircle2, Download, Eye, FolderOpen,
+  Gauge, Info, Layers3, Maximize2, MousePointer2, Paintbrush, Play, Redo2, RotateCcw, Save, Settings2,
+  Sparkles, Square, Trash2, Undo2, Upload, Wrench, X,
 };
 
 function renderIcons() {
@@ -315,8 +336,11 @@ function renderIcons() {
 
 function setDirty(value = true) {
   dirty = value;
+  if (value) projectSaved = false;
   ui['dirty-state'].hidden = !dirty;
   ui['file-name'].classList.toggle('modified', dirty);
+  ui['save-status'].classList.remove('saving', 'error');
+  ui['save-status'].textContent = value ? '有未保存修改' : projectSaved ? '项目已保存' : '项目文件未保存';
 }
 
 function setActivePanel(panel) {
@@ -392,7 +416,7 @@ function refreshDevicePreviewForQuality() {
   qualityPreviewTimer = window.setTimeout(() => {
     setPreviewMode(true).catch((error) => {
       console.error(error);
-      showToast(`车机质感刷新失败：${error.message}`);
+      showMessage(`车机质感刷新失败：${error.message}`, 'error');
     });
   }, 320);
 }
@@ -485,10 +509,19 @@ function finishImportProgress() {
   ui['import-progress'].classList.remove('indeterminate');
 }
 
-ui['model-file'].addEventListener('change', (event) => loadFile(event.target.files?.[0]));
-ui['drop-zone'].addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' || event.key === ' ') ui['model-file'].click();
+ui['model-file'].addEventListener('change', (event) => {
+  const file = event.target.files?.[0];
+  if (file && confirmReplaceCurrent()) loadFile(file);
+  else event.target.value = '';
 });
+ui['project-file'].addEventListener('change', (event) => {
+  const file = event.target.files?.[0];
+  if (file && confirmReplaceCurrent()) loadProject(file);
+  else event.target.value = '';
+});
+for (const id of ['open-project', 'inspector-open-project']) {
+  ui[id].addEventListener('click', () => ui['project-file'].click());
+}
 for (const eventName of ['dragenter', 'dragover']) {
   ui['drop-zone'].addEventListener(eventName, (event) => {
     event.preventDefault();
@@ -501,7 +534,12 @@ for (const eventName of ['dragleave', 'drop']) {
     ui['drop-zone'].classList.remove('drag');
   });
 }
-ui['drop-zone'].addEventListener('drop', (event) => loadFile(event.dataTransfer.files?.[0]));
+ui['drop-zone'].addEventListener('drop', (event) => {
+  const file = event.dataTransfer.files?.[0];
+  if (!file || !confirmReplaceCurrent()) return;
+  if (/\.bydcarproj$/i.test(file.name)) loadProject(file);
+  else loadFile(file);
+});
 
 document.querySelectorAll('[data-view]').forEach((button) => {
   button.addEventListener('click', () => preview.view(button.dataset.view));
@@ -553,6 +591,8 @@ function closeGenerateDialog() {
 ui.generate.addEventListener('click', openGenerateDialog);
 ui['mobile-generate'].addEventListener('click', openGenerateDialog);
 document.getElementById('mobile-generate-shortcut')?.addEventListener('click', openGenerateDialog);
+ui['save-project'].addEventListener('click', saveProject);
+ui['mobile-save-project'].addEventListener('click', saveProject);
 ui['generate-dialog-close'].addEventListener('click', closeGenerateDialog);
 ui['generate-dialog-cancel'].addEventListener('click', closeGenerateDialog);
 ui['generate-dialog'].addEventListener('click', (event) => {
@@ -563,6 +603,11 @@ ui['generate-confirm'].addEventListener('click', () => {
   generatePackage();
 });
 document.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    if (current) saveProject();
+    return;
+  }
   if (event.key === 'Escape' && !ui['generate-dialog'].hidden) closeGenerateDialog();
 });
 ui['demo-all'].addEventListener('click', () => { demoAll(); });
@@ -626,6 +671,7 @@ async function setPreviewMode(device) {
     ui['mode-device'].textContent = '车机质感';
     ui['mode-device-mobile'].textContent = '车机';
     setStatuses([['bad', '×', `车机质感预览失败：${error.message}`]]);
+    showMessage(`车机质感预览失败：${error.message}`, 'error');
   } finally {
     for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = false;
   }
@@ -640,79 +686,297 @@ async function loadFile(file) {
   const extension = file.name.toLowerCase().split('.').pop();
   if (!['glb', 'fbx', 'zip'].includes(extension)) {
     setStatuses([['bad', '×', '支持 GLB、glTF ZIP、FBX、FBX ZIP 和 OBJ ZIP']]);
+    showMessage('文件格式不支持，请选择 GLB、glTF ZIP、FBX、FBX ZIP 或 OBJ ZIP', 'warning');
     return;
   }
-  ui['file-name'].textContent = file.name;
-  ui['analysis-state'].textContent = '解析中…';
-  ui['model-file'].disabled = true;
-  document.querySelector('.editor-shell').classList.add('is-importing');
-  ui['empty-state'].hidden = true;
-  updateImportProgress({ progress: 0.02, label: '准备读取模型' });
-  setStatuses([['warn', '…', '正在解析模型，请稍候']]);
+  const previousName = ui['file-name'].textContent;
+  beginFileLoad(file.name, '准备读取模型');
   try {
     const prepared = await prepareModelImport(file, ({ progress, label, indeterminate }) => {
       updateImportProgress({ progress: progress * 0.55, label, indeterminate });
     });
-    const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {
-      updateImportProgress({ progress: 0.55 + progress * 0.43, label, indeterminate });
-    });
-    updateImportProgress({ progress: 0.96, label: '正在初始化编辑工具' });
-    current = {
-      ...prepared,
-      ...loaded,
-      file: { name: prepared.name, size: prepared.bytes.byteLength },
-      sourceName: prepared.name,
+    await activatePreparedModel(prepared, {
+      displayName: file.name,
       sourceFile: file,
-      sourceFormat: prepared.sourceFormat,
-    };
-    setDirty(false);
-    ui['rotation-x'].value = 0;
-    ui['rotation-y'].value = loaded.orientation.rotationY;
-    ui['rotation-z'].value = 0;
-    markDevicePreviewStale();
-    refreshParts();
-    deletions = [];
-    deleteDraft = null;
-    undoStack.length = 0;
-    redoStack.length = 0;
-    syncUndoRedoButtons();
-    ui['height-offset'].value = 0;
-    preview.heightOffset = 0;
-    treeQuery = '';
-    expandedGroups = new Set();
-    renderDeletePanel();
-    resetBindings();
-    ui['mode-web'].classList.add('active');
-    ui['mode-device'].classList.remove('active');
-    ui['mode-web-mobile'].classList.add('active');
-    ui['mode-device-mobile'].classList.remove('active');
-    ui['mode-device'].textContent = '车机质感';
-    ui['mode-device-mobile'].textContent = '车机';
-    ui['analysis-state'].textContent = '解析完成';
-    ui['empty-state'].hidden = true;
-    setControls(true);
-    setActivePanel('model');
-    updateSteps(3);
-    ui['source-format-label'].textContent = prepared.sourceFormat === 'glb'
-      ? 'GLB 2.0'
-      : `${prepared.formatLabel} · 已统一为 GLB`;
-    validateStats(loaded.stats, loaded.orientation, prepared);
-    updateImportProgress({ progress: 1, label: '模型导入完成' });
+      previewProgressStart: 0.55,
+      previewProgressScale: 0.43,
+    });
+    showMessage('模型导入完成', 'success');
   } catch (error) {
     console.error(error);
-    current = null;
+    handleLoadFailure(error, previousName, '无法读取此模型');
+  } finally {
+    ui['model-file'].disabled = false;
+    ui['model-file'].value = '';
+    endFileLoad();
+  }
+}
+
+async function loadProject(file) {
+  if (!file) return;
+  const previousName = ui['file-name'].textContent;
+  beginFileLoad(file.name, '准备打开项目');
+  ui['project-file'].disabled = true;
+  try {
+    const project = await readProjectFile(file, ({ progress, label }) => {
+      updateImportProgress({ progress: progress * 0.46, label });
+    });
+    const editorState = normalizeProjectState(project.editorState);
+    const prepared = {
+      bytes: project.modelBytes,
+      name: project.metadata.modelName,
+      sourceName: project.metadata.modelName,
+      sourceFormat: project.metadata.sourceFormat,
+      formatLabel: project.metadata.formatLabel,
+      warnings: project.metadata.warnings,
+      fromProject: true,
+    };
+    await activatePreparedModel(prepared, {
+      displayName: project.metadata.displayName,
+      sourceFile: file,
+      editorState,
+      previewProgressStart: 0.46,
+      previewProgressScale: 0.51,
+    });
+    showMessage('项目进度已完整恢复', 'success');
+  } catch (error) {
+    console.error(error);
+    handleLoadFailure(error, previousName, '无法打开此项目');
+  } finally {
+    ui['project-file'].disabled = false;
+    ui['project-file'].value = '';
+    endFileLoad();
+  }
+}
+
+async function activatePreparedModel(prepared, {
+  displayName,
+  sourceFile,
+  editorState = null,
+  previewProgressStart,
+  previewProgressScale,
+}) {
+  const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {
+    updateImportProgress({ progress: previewProgressStart + progress * previewProgressScale, label, indeterminate });
+  });
+  updateImportProgress({ progress: 0.98, label: '正在初始化编辑工具' });
+  current = {
+    ...prepared,
+    ...loaded,
+    file: { name: prepared.name, size: prepared.bytes.byteLength },
+    sourceName: prepared.name,
+    sourceFile,
+    sourceFormat: prepared.sourceFormat,
+  };
+  projectSaved = Boolean(editorState);
+  ui['file-name'].textContent = displayName || prepared.name;
+  setDirty(false);
+  ui['rotation-x'].value = 0;
+  ui['rotation-y'].value = loaded.orientation.rotationY;
+  ui['rotation-z'].value = 0;
+  markDevicePreviewStale();
+  refreshParts();
+  deletions = [];
+  deleteDraft = null;
+  undoStack.length = 0;
+  redoStack.length = 0;
+  syncUndoRedoButtons();
+  ui['height-offset'].value = 0;
+  preview.heightOffset = 0;
+  treeQuery = '';
+  expandedGroups = new Set();
+  renderDeletePanel();
+  resetBindings();
+  ui['mode-web'].classList.add('active');
+  ui['mode-device'].classList.remove('active');
+  ui['mode-web-mobile'].classList.add('active');
+  ui['mode-device-mobile'].classList.remove('active');
+  ui['mode-device'].textContent = '车机质感';
+  ui['mode-device-mobile'].textContent = '车机';
+  ui['analysis-state'].textContent = editorState ? '项目已恢复' : '解析完成';
+  ui['empty-state'].hidden = true;
+  setControls(true);
+  setActivePanel('model');
+  updateSteps(3);
+  ui['source-format-label'].textContent = prepared.fromProject
+    ? `${prepared.formatLabel || 'GLB'} · 项目恢复`
+    : prepared.sourceFormat === 'glb' ? 'GLB 2.0' : `${prepared.formatLabel} · 已统一为 GLB`;
+  if (editorState) restoreSnapshot(editorState, { markDirty: false });
+  validateStats(loaded.stats, loaded.orientation, prepared);
+  setDirty(false);
+  updateImportProgress({ progress: 1, label: editorState ? '项目恢复完成' : '模型导入完成' });
+}
+
+function beginFileLoad(displayName, label) {
+  ui['file-name'].textContent = displayName;
+  ui['analysis-state'].textContent = '解析中…';
+  ui['model-file'].disabled = true;
+  ui['project-file'].disabled = true;
+  ui['open-project'].disabled = true;
+  ui['inspector-open-project'].disabled = true;
+  document.querySelector('.editor-shell').classList.add('is-importing');
+  ui['empty-state'].hidden = true;
+  updateImportProgress({ progress: 0.02, label });
+  setStatuses([['warn', '…', '正在解析文件，请稍候']]);
+}
+
+function endFileLoad() {
+  ui['model-file'].disabled = false;
+  ui['project-file'].disabled = false;
+  ui['open-project'].disabled = false;
+  ui['inspector-open-project'].disabled = false;
+  document.querySelector('.editor-shell').classList.remove('is-importing');
+  finishImportProgress();
+}
+
+function handleLoadFailure(error, previousName, prefix) {
+  if (current) {
+    ui['file-name'].textContent = previousName;
+    ui['analysis-state'].textContent = '当前项目未更改';
+    setControls(true);
+  } else {
     setDirty(false);
     ui['analysis-state'].textContent = '解析失败';
     setControls(false);
     updateSteps(0);
     ui['empty-state'].hidden = false;
-    setStatuses([['bad', '×', `无法读取此模型：${error.message || '文件结构无效'}`]]);
-  } finally {
-    ui['model-file'].disabled = false;
-    ui['model-file'].value = '';
-    document.querySelector('.editor-shell').classList.remove('is-importing');
-    finishImportProgress();
   }
+  setStatuses([['bad', '×', `${prefix}：${error.message || '文件结构无效'}`]]);
+  showMessage(`${prefix}：${error.message || '文件结构无效'}`, 'error');
+}
+
+function confirmReplaceCurrent() {
+  if (!current) return true;
+  const message = dirty
+    ? '当前修改还没有保存为 .bydcarproj 项目文件。打开其他文件会丢失这些修改，确定继续吗？'
+    : '打开其他文件会关闭当前项目，确定继续吗？';
+  return window.confirm(message);
+}
+
+async function saveProject() {
+  if (!current || !preview.model) return;
+  const buttons = [ui['save-project'], ui['mobile-save-project']];
+  const labels = buttons.map((button) => button.innerHTML);
+  let lastPercent = -1;
+  buttons.forEach((button) => {
+    button.disabled = true;
+    button.classList.add('busy');
+    button.innerHTML = '<span class="spinner"></span>';
+  });
+  ui['save-status'].classList.add('saving');
+  ui['save-status'].textContent = '正在打包项目…';
+  showMessage('正在打包项目文件…', 'info', { duration: 2500 });
+  try {
+    const result = await makeProjectFile({
+      modelBytes: current.bytes,
+      metadata: {
+        displayName: ui['file-name'].textContent,
+        modelName: current.sourceName || current.file.name,
+        sourceFormat: current.sourceFormat || 'glb',
+        formatLabel: current.formatLabel || 'GLB',
+        warnings: current.warnings || [],
+      },
+      editorState: captureSnapshot(),
+    }, ({ progress, label }) => {
+      const percent = Math.round(progress * 100);
+      if (percent === lastPercent) return;
+      lastPercent = percent;
+      buttons.forEach((button) => { button.title = `${label} ${percent}%`; });
+      ui['save-status'].textContent = `${label} ${percent}%`;
+    });
+    const projectName = projectBaseName(ui['file-name'].textContent);
+    downloadBytes(result.bytes, `${safeName(projectName)}.bydcarproj`);
+    projectSaved = true;
+    setDirty(false);
+    showMessage(`项目已保存：${formatBytes(result.bytes.byteLength)}`, 'success');
+  } catch (error) {
+    console.error(error);
+    ui['save-status'].classList.remove('saving');
+    ui['save-status'].classList.add('error');
+    ui['save-status'].textContent = '项目保存失败';
+    showMessage(`项目保存失败：${error.message || '未知错误'}`, 'error');
+  } finally {
+    buttons.forEach((button, index) => {
+      button.disabled = !current;
+      button.classList.remove('busy');
+      button.innerHTML = labels[index];
+      button.title = index === 0 ? '保存项目 (Ctrl+S)' : '保存项目';
+    });
+    if (!dirty && projectSaved) ui['save-status'].classList.remove('saving', 'error');
+    renderIcons();
+  }
+}
+
+function normalizeProjectState(raw) {
+  if (!raw || typeof raw !== 'object') throw new Error('项目缺少有效的编辑进度');
+  const transform = raw.transform;
+  if (!validNumberArray(transform?.translation, 3)
+    || !validNumberArray(transform?.rotation, 4)
+    || !validNumberArray(transform?.scale, 3)) {
+    throw new Error('项目中的模型变换数据无效');
+  }
+  const bindingsState = Array.isArray(raw.bindings) ? raw.bindings.filter((entry) => (
+    Array.isArray(entry) && SLOT_BY_ID.has(entry[0]) && entry[1] && typeof entry[1] === 'object'
+  )).map(([id, binding]) => [id, structuredClone(binding)]) : [];
+  const knownSlots = new Set(bindingsState.map(([id]) => id));
+  const requestedPanel = ['model', 'binding', 'check'].includes(raw.activePanel) ? raw.activePanel : 'model';
+  const openSlotValue = knownSlots.has(raw.openSlot) ? raw.openSlot : null;
+  const activePanelValue = requestedPanel === 'binding' && !openSlotValue ? 'model' : requestedPanel;
+  const selectionEditingValue = openSlotValue && raw.selectionEditingSlot === openSlotValue
+    ? openSlotValue
+    : null;
+  const qualitySelected = ['smooth', 'balanced', 'high', 'original', 'custom'].includes(raw.quality?.selected)
+    ? raw.quality.selected
+    : 'original';
+  return {
+    bindings: bindingsState,
+    deletions: Array.isArray(raw.deletions) ? structuredClone(raw.deletions) : [],
+    rotation: validNumberArray(raw.rotation, 3) ? raw.rotation.map(Number) : [0, 0, 0],
+    targetLength: finiteNumber(raw.targetLength, 5.2),
+    heightOffset: finiteNumber(raw.heightOffset, 0),
+    transform: structuredClone(transform),
+    activePanel: activePanelValue,
+    openSlot: openSlotValue,
+    regionMode: ['translate', 'scale'].includes(raw.regionMode) ? raw.regionMode : 'translate',
+    selectionEditingSlot: selectionEditingValue,
+    selectionTool: {
+      mode: ['smart', 'brush'].includes(raw.selectionTool?.mode) ? raw.selectionTool.mode : 'smart',
+      operation: ['add', 'subtract'].includes(raw.selectionTool?.operation) ? raw.selectionTool.operation : 'add',
+      visibleOnly: raw.selectionTool?.visibleOnly !== false,
+      radius: finiteNumber(raw.selectionTool?.radius, 28),
+      angle: finiteNumber(raw.selectionTool?.angle, 38),
+    },
+    quality: {
+      selected: qualitySelected,
+      custom: {
+        triangleTarget: finiteNumber(raw.quality?.custom?.triangleTarget, 300000),
+        textureMaxSize: finiteNumber(raw.quality?.custom?.textureMaxSize, 4096),
+      },
+    },
+  };
+}
+
+function validNumberArray(value, length) {
+  return Array.isArray(value) && value.length === length && value.every((item) => Number.isFinite(Number(item)));
+}
+
+function finiteNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function projectBaseName(value) {
+  return String(value || 'custom-model').replace(/(?:\.(?:glb|gltf|fbx|obj|zip|bydcarproj))+$/i, '') || 'custom-model';
+}
+
+function downloadBytes(bytes, fileName) {
+  const blob = new Blob([bytes], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function updateStats(stats) {
@@ -728,6 +992,7 @@ function updateStats(stats) {
 
 function validateStats(stats, orientation, importInfo = null) {
   const results = [];
+  if (importInfo?.fromProject) results.push(['good', '✓', '已恢复模型调整、删除区域、联动选区和导出质量']);
   if (stats.triangles > 300000) results.push(['warn', '!', `三角形较多（${stats.triangles.toLocaleString()}），原始档会完整保留，可按需要选择其他质量档位`]);
   else if (stats.triangles > 60000) results.push(['warn', '!', `三角形较多（${stats.triangles.toLocaleString()}），可按车机性能选择导出质量`]);
   else results.push(['good', '✓', `三角形数量适合车机（${stats.triangles.toLocaleString()}）`]);
@@ -765,6 +1030,8 @@ function setControls(enabled) {
   ui.generate.disabled = !enabled;
   ui['mobile-generate'].disabled = !enabled;
   document.getElementById('mobile-generate-shortcut').disabled = !enabled;
+  ui['save-project'].disabled = !enabled;
+  ui['mobile-save-project'].disabled = !enabled;
   for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = !enabled;
   ui['reset-rotation'].disabled = !enabled;
   ui['mobile-reset'].disabled = !enabled;
@@ -892,19 +1159,85 @@ function padBounds(bounds) {
   return { min, max };
 }
 
-let toastTimer = null;
-function toast(message) {
-  let el = document.getElementById('app-toast');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'app-toast';
-    document.body.appendChild(el);
+const MESSAGE_ICONS = {
+  success: 'check-circle-2',
+  warning: 'alert-triangle',
+  error: 'alert-circle',
+  info: 'info',
+};
+const MESSAGE_TITLES = {
+  success: '操作成功',
+  warning: '请检查',
+  error: '操作失败',
+  info: '提示',
+};
+const recentMessages = new Map();
+
+function showMessage(message, type = 'info', { duration } = {}) {
+  const text = String(message || '发生未知错误').trim();
+  const kind = Object.hasOwn(MESSAGE_ICONS, type) ? type : 'info';
+  const now = Date.now();
+  const duplicateKey = `${kind}:${text}`;
+  if (now - (recentMessages.get(duplicateKey) || 0) < 900) return null;
+  recentMessages.set(duplicateKey, now);
+
+  let stack = document.getElementById('message-stack');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.id = 'message-stack';
+    stack.className = 'message-stack';
+    stack.setAttribute('aria-live', 'polite');
+    document.body.appendChild(stack);
   }
-  el.textContent = message;
-  el.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 6000);
+  while (stack.children.length >= 5) stack.firstElementChild?.remove();
+
+  const element = document.createElement('div');
+  element.className = `app-message ${kind}`;
+  element.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+  const icon = document.createElement('i');
+  icon.setAttribute('data-lucide', MESSAGE_ICONS[kind]);
+  icon.className = 'message-icon';
+  const content = document.createElement('div');
+  content.className = 'message-copy';
+  const title = document.createElement('strong');
+  title.textContent = MESSAGE_TITLES[kind];
+  const copy = document.createElement('span');
+  copy.textContent = text;
+  content.append(title, copy);
+  const closeButton = document.createElement('button');
+  closeButton.type = 'button';
+  closeButton.className = 'message-close';
+  closeButton.title = '关闭';
+  closeButton.innerHTML = '<i data-lucide="x"></i>';
+  element.append(icon, content, closeButton);
+  stack.appendChild(element);
+  renderIcons();
+  requestAnimationFrame(() => element.classList.add('show'));
+
+  let timer = null;
+  const close = () => {
+    clearTimeout(timer);
+    element.classList.remove('show');
+    window.setTimeout(() => {
+      element.remove();
+      if (!stack.children.length) stack.remove();
+    }, 180);
+  };
+  closeButton.addEventListener('click', close);
+  const timeout = duration ?? (kind === 'error' ? 0 : kind === 'warning' ? 9000 : 5000);
+  if (timeout > 0) timer = window.setTimeout(close, timeout);
+  return { close };
 }
+
+window.addEventListener('error', (event) => {
+  const message = event.error?.message || event.message;
+  if (message) showMessage(`运行错误：${message}`, 'error');
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  const message = event.reason?.message || event.reason;
+  showMessage(`操作失败：${message || '未知 Promise 错误'}`, 'error');
+});
 
 /**
  * 部件相对整车的中文方位（预览坐标：车头 −X、左侧 +Z、上 +Y）。
@@ -945,6 +1278,13 @@ function captureSnapshot() {
     openSlot,
     regionMode,
     selectionEditingSlot,
+    selectionTool: {
+      mode: previewSelectionMode,
+      operation: previewSelectionOperation,
+      visibleOnly: previewSelectionVisibleOnly,
+      radius: previewSelectionRadius,
+      angle: previewSelectionAngle,
+    },
     quality: {
       selected: selectedQuality,
       custom: structuredClone(customQuality),
@@ -1016,7 +1356,7 @@ function wireContinuousHistory(input, meta = {}) {
   input.addEventListener('blur', finish);
 }
 
-function restoreSnapshot(snap) {
+function restoreSnapshot(snap, { markDirty = true } = {}) {
   if (!snap) return;
   stopDemo();
   cancelDeleteDraft(true);
@@ -1032,6 +1372,13 @@ function restoreSnapshot(snap) {
   preview.targetLength = snap.targetLength;
   ui['height-offset'].value = snap.heightOffset;
   preview.heightOffset = snap.heightOffset;
+  if (snap.selectionTool) {
+    previewSelectionMode = snap.selectionTool.mode || 'smart';
+    previewSelectionOperation = snap.selectionTool.operation || 'add';
+    previewSelectionVisibleOnly = snap.selectionTool.visibleOnly !== false;
+    previewSelectionRadius = Number(snap.selectionTool.radius) || 28;
+    previewSelectionAngle = Number(snap.selectionTool.angle) || 38;
+  }
   // 直接还原快照时刻的模型矩阵——删除框/选区/旋转中心都是与它配套的世界坐标，
   // 不能经 normalize 重新推导（落地缩放会随删除后的几何变化而漂移）
   preview.setTransform(snap.transform);
@@ -1063,7 +1410,7 @@ function restoreSnapshot(snap) {
     else if (binding?.selection && resumeFineSelection && !preview.selectionState) startFineSelection(slot, { preserveState: true });
     else if (binding) playCurrentBinding();
   }
-  setDirty();
+  setDirty(markDirty);
   markDevicePreviewStale();
   syncUndoRedoButtons();
   refreshDevicePreviewForQuality();
@@ -1288,6 +1635,7 @@ window.__carmodelDebug = {
     };
   },
   preview,
+  notify: showMessage,
 };
 
 /** 左右对称槽位：配好一侧后另一侧可一键镜像（车机坐标 +Z 左 / −Z 右） */
@@ -1354,7 +1702,7 @@ function mirrorBindingInto(slot) {
   // 精细三角面编号属于源 primitive，左右模型通常不是同一个 primitive，
   // 不能把 selection 静默降级成整部件镜像，否则会扩大绑定范围。
   if (source.selection) {
-    toast('精细选面暂不支持一键镜像，请在当前模型上手动补选对应区域。');
+    showMessage('精细选面暂不支持一键镜像，请在当前模型上手动补选对应区域。', 'warning');
     return;
   }
 
@@ -1718,7 +2066,7 @@ function onPickNode(slot, nodeIndex) {
     if (!region) return;
     createRegionBinding(slot, region);
     const sideText = LATERAL_SLOT_SIDE[slot.id] ? `并限制在车身${LATERAL_SLOT_SIDE[slot.id] === 'left' ? '左' : '右'}半边` : '';
-    toast(`「${group?.name || all[0].name}」已整体绑给「${owner}」。已自动切换为框选${sideText}，请确认蓝框只套住本槽位区域。`);
+    showMessage(`「${group?.name || all[0].name}」已整体绑给「${owner}」。已自动切换为框选${sideText}，请确认蓝框只套住本槽位区域。`, 'warning');
     return;
   }
   const selected = new Set(binding && !binding.region ? binding.nodeIndices : []);
@@ -2499,7 +2847,6 @@ async function generatePackage() {
     link.download = `${safeName(result.manifest.name)}.bydcar`;
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setDirty(false);
     updateSteps(4);
     setStatuses([
       ['good', '✓', `车模包已生成：${formatBytes(result.bytes.byteLength)}`],
@@ -2508,9 +2855,11 @@ async function generatePackage() {
       ['good', '✓', 'CarSelf.dat 和 GLB 均已写入 SHA-256 校验值'],
       ['warn', '!', '导入地图后需要重启地图进程才能生效'],
     ]);
+    showMessage(`车模包已生成：${formatBytes(result.bytes.byteLength)}`, 'success');
   } catch (error) {
     console.error(error);
     setStatuses([['bad', '×', `生成失败：${error.message || '未知错误'}`]]);
+    showMessage(`生成失败：${error.message || '未知错误'}`, 'error');
   } finally {
     buttons.forEach((button, index) => {
       if (!button) return;
