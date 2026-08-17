@@ -6,22 +6,20 @@ import { selectedTriangles } from './selection.js';
 
 const CARSELF_HEADER_URL = './templates/hcmodel-header.bin';
 const TAIL = new Uint8Array([0x0b, 0x00, 0x00, 0x00]);
-const GLB_BUDGET = 32 * 1024 * 1024 - 4096;
-// 车机实时渲染预算：比旧版 100k 保守得多，优先保留车身轮廓和曲面细节。
-const DEVICE_TRIANGLE_TARGET = 300000;
 let headerPromise = null;
 // 灯/闪烁槽位的材质不做方向渐变：灭灯态（textureId=-1）显示的是 baseColorFactor，必须保持纯色
 const LAMP_SLOT_IDS = new Set(
   [...SLOT_BY_ID.values()].filter((slot) => slot.kind === 'lamp' || slot.kind === 'blink').map((slot) => slot.id),
 );
 
-export async function makeBydCar({ sourceBytes, sourceName, transform, stats, bindings, deletions }) {
+export async function makeBydCar({ sourceBytes, sourceName, transform, stats, bindings, deletions, quality }) {
+  const exportQuality = normalizeExportQuality(quality);
   const parsed = parseGlb(sourceBytes);
   const baked = await bakeMaterialsForVehicle(parsed);
   const lamps = [];
   const normalizedState = await normalizeParsedGlb(baked, transform, bindings, lamps, deletions);
-  await fitGlbBudget(normalizedState);
-  await simplifyMeshToBudget(normalizedState);
+  await resizeEmbeddedImages(normalizedState, exportQuality.textureMaxSize);
+  await simplifyMeshToTarget(normalizedState, exportQuality.triangleTarget);
   const normalized = buildGlb(normalizedState.json, normalizedState.bin);
   const outputStats = collectGlbStats(normalizedState.json);
   // 外部 CarSelf_Main.png 必须与最终 GLB 内嵌主贴图逐像素一致，原厂资源也是这个约定。
@@ -46,6 +44,7 @@ export async function makeBydCar({ sourceBytes, sourceName, transform, stats, bi
       rootNode: 'CS_Car',
       stats,
       outputStats,
+      quality: exportQuality,
     },
   };
 
@@ -79,6 +78,21 @@ export async function makeBydCar({ sourceBytes, sourceName, transform, stats, bi
   return { bytes, manifest, dat, glb: normalized };
 }
 
+function normalizeExportQuality(quality) {
+  const positiveInteger = (value) => {
+    const number = Math.floor(Number(value) || 0);
+    return number > 0 ? number : null;
+  };
+  const preset = typeof quality?.preset === 'string' ? quality.preset : 'original';
+  const label = typeof quality?.label === 'string' && quality.label.trim() ? quality.label.trim() : '原始';
+  return {
+    preset,
+    label,
+    triangleTarget: positiveInteger(quality?.triangleTarget),
+    textureMaxSize: positiveInteger(quality?.textureMaxSize),
+  };
+}
+
 /** 灯位贴图：整图纯色。官方是共享 UV 图集，自定义模型没有那套 UV 约定，纯色才通用。 */
 async function makeLampTexture(color) {
   const [r, g, b] = parseColor(color);
@@ -105,7 +119,7 @@ const GLOSS_REFLECT = 0.35; // 非金属但高光泽（清漆/玻璃）按光泽
  * 官方 U8L 实测——车顶画成接近底色的深色（线性 0.012，保住“黑车”身份），
  * 车身侧面把天空反光直接画进贴图（线性 0.39，质感全靠它）。
  * 这里程序化复刻：UV.v 编码世界法线仰角，采样一条“顶暗侧亮”的渐变；
- * 所有渐变材质共用一张图集（每材质一列），不挤占车机 16 张贴图的上限。
+ * 所有渐变材质共用一张图集（每材质一列），减少额外贴图、状态切换和显存占用。
  */
 const GRAD_SIDE = 0.35; // 侧面（水平法线）反射峰值，对齐官方侧板亮度
 const GRAD_POWER = 2.4; // 压低大面积垂直侧面的亮度，把高光收进曲面转折
@@ -529,13 +543,10 @@ async function bakeDirectionalGradient(state, baseMatrix, excludeNames) {
   }
 }
 
-/**
- * 最终网格按“渲染预算 + 文件预算”取更严格的一项减面。
- * 旧逻辑只因超过 12 万面就把本模型从 46.8 万面砍到 11.9 万面，
- * 即使最终包只有约 6MiB 也照砍，车身曲面和缝线损失没有必要。
- */
-async function simplifyMeshToBudget(state) {
+/** 仅在用户选择了三角面上限时减面；原始档完整保留最终几何。 */
+async function simplifyMeshToTarget(state, triangleTarget) {
   repackBin(state);
+  if (!Number.isFinite(triangleTarget) || triangleTarget <= 0) return 0;
   const { json } = state;
   const primitives = [];
   let totalTriangles = 0;
@@ -551,10 +562,7 @@ async function simplifyMeshToBudget(state) {
     }
   }
   if (!totalTriangles) return 0;
-  const sizeRatio = glbSizeOf(state) > GLB_BUDGET
-    ? (GLB_BUDGET / glbSizeOf(state)) * 0.95 : 1;
-  const qualityRatio = DEVICE_TRIANGLE_TARGET / totalTriangles;
-  const ratio = Math.min(1, sizeRatio, qualityRatio);
+  const ratio = Math.min(1, triangleTarget / totalTriangles);
   if (ratio >= 0.999) return 0;
   await MeshoptSimplifier.ready;
   let removed = 0;
@@ -578,9 +586,6 @@ async function simplifyMeshToBudget(state) {
     }
   }
   repackBin(state);
-  if (glbSizeOf(state) > GLB_BUDGET) {
-    throw new Error('模型过大：贴图与网格已按导入上限压缩，仍超过 32MiB，请先在建模工具里简化模型');
-  }
   return removed;
 }
 
@@ -1066,38 +1071,31 @@ function repackBin(state) {
   if (json.buffers?.[0]) json.buffers[0].byteLength = merged.byteLength;
 }
 
-/** DAT 上限 32MiB（与 APK 导入器一致）：超限时逐级降采样嵌入贴图。 */
-async function fitGlbBudget(state) {
+/** 仅在所选质量档位指定贴图尺寸时统一降采样。 */
+async function resizeEmbeddedImages(state, maxSize) {
+  if (!Number.isFinite(maxSize) || maxSize <= 0) return false;
   repackBin(state);
-  if (glbSizeOf(state) <= GLB_BUDGET) return;
-  for (const cap of [2048, 1024, 512, 256]) {
-    let changed = false;
-    for (let i = 0; i < (state.json.images || []).length; i++) {
-      const raw = imageBytesOf(state, i);
-      if (!raw) continue;
-      const bitmap = await createImageBitmap(new Blob([raw.bytes], { type: raw.mimeType }));
-      const { width, height } = bitmap;
-      if (Math.max(width, height) <= cap) { bitmap.close?.(); continue; }
-      const scale = cap / Math.max(width, height);
-      const w = Math.max(1, Math.round(width * scale));
-      const h = Math.max(1, Math.round(height * scale));
-      const canvas = makeCanvas(w, h);
-      canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
-      bitmap.close?.();
-      const png = await encodeCanvasPng(canvas);
-      state.json.images[i] = { mimeType: 'image/png', bufferView: appendImageToBin(state, png) };
-      changed = true;
-    }
-    if (changed) repackBin(state);
-    if (glbSizeOf(state) <= GLB_BUDGET) return;
+  let changed = false;
+  for (let i = 0; i < (state.json.images || []).length; i++) {
+    const raw = imageBytesOf(state, i);
+    if (!raw) continue;
+    const bitmap = await createImageBitmap(new Blob([raw.bytes], { type: raw.mimeType }));
+    const { width, height } = bitmap;
+    if (Math.max(width, height) <= maxSize) { bitmap.close?.(); continue; }
+    const scale = maxSize / Math.max(width, height);
+    const w = Math.max(1, Math.round(width * scale));
+    const h = Math.max(1, Math.round(height * scale));
+    const canvas = makeCanvas(w, h);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+    bitmap.close?.();
+    const png = await encodeCanvasPng(canvas);
+    state.json.images[i] = {
+      ...state.json.images[i], mimeType: 'image/png', bufferView: appendImageToBin(state, png),
+    };
+    changed = true;
   }
-  // 贴图已降到最低，交给后续按最终体积触发的网格简化继续尝试。
-  return false;
-}
-
-function glbSizeOf(state) {
-  const jsonBytes = new TextEncoder().encode(JSON.stringify(state.json));
-  return 28 + ((jsonBytes.byteLength + 3) & ~3) + ((state.bin.byteLength + 3) & ~3);
+  if (changed) repackBin(state);
+  return changed;
 }
 
 function collectGlbStats(json) {
@@ -1142,7 +1140,7 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
     if (json.nodes[nodeIndex]?.name === 'CS_Shadow_Imported') detachNode(json, sourceRoots, nodeIndex);
   }
 
-  // 车机不认的顶点属性先扔掉，重复材质合并（材质数上限 32）
+  // 车机不认的顶点属性先扔掉，并合并内容完全相同的重复材质。
   sanitizeForVehicle(state);
   dedupeMaterials(state);
 
@@ -1162,7 +1160,7 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
   ).some((channel) => validPartNodes.has(channel.target?.node)));
   if (Array.isArray(lampsOut)) lampsOut.push(...parts.lamps);
 
-  // 剩余静态几何合并成一个节点，保证节点/网格数量在车机上限内
+  // 剩余静态几何合并成一个节点，减少无意义的节点遍历和绘制提交。
   consolidateStaticGeometry(state, sourceRoots);
   // 合并后再去重一次材质（extractPart 为每个部件创建了新材质，很多实际内容重复）
   dedupeMaterials(state);
@@ -1196,14 +1194,12 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
   // 此时部件顶点已在最终空间、静态几何挂在 CS_Car 下，worldMatrixOf 两种情况都能给出正确朝向
   smoothMeshNormals(state);
   await bakeDirectionalGradient(state, null, LAMP_SLOT_IDS);
-  // 静态几何合并后原树全是孤儿：清掉空节点、死网格、死贴图与孤儿数据，
-  // 最后按车机导入器的硬上限自检，超限在这里就报明确原因
+  // 静态几何合并后原树全是孤儿：清掉空节点、死网格、死贴图与孤儿数据。
   pruneOrphanNodes(state);
   pruneUnusedMeshes(state);
   pruneUnusedTextures(state);
   pruneUnusedAccessors(state);
   repackBin(state);
-  assertDeviceLimits(state);
   return state;
 }
 
@@ -1502,8 +1498,8 @@ function dedupeMaterials(state) {
 
 /**
  * 把没绑定联动的静态几何全部合并成一个节点（按材质分组 primitive）。
- * 下载模型动辄几百个节点，而车机导入器上限是 256 节点 / 128 网格，
- * 只有联动部件才需要独立节点，其余合并后数量骤减一个量级。
+ * 下载模型动辄几百个节点，只有联动部件才需要独立节点；其余合并后可显著
+ * 减少场景遍历与绘制提交，但不再用于满足任何节点或网格数量限制。
  * 顶点烘的是节点在源场景里的累计矩阵（不含 CS_Car 的全局变换），
  * 因为合并节点仍挂在 CS_Car 下继承那份变换。
  */
@@ -1711,26 +1707,6 @@ function pruneUnusedAccessors(state) {
   }
 }
 
-/** 与车机 CarSelfDatValidator 相同的硬上限，超限时在打包阶段就给出明确原因 */
-function assertDeviceLimits(state) {
-  const { json } = state;
-  const checks = [
-    [json.nodes?.length || 0, 256, '节点'],
-    [json.meshes?.length || 0, 128, '网格'],
-    [json.materials?.length || 0, 32, '材质'],
-    [json.textures?.length || 0, 16, '贴图'],
-  ];
-  for (const [count, limit, label] of checks) {
-    if (count > limit) {
-      throw new Error(`超出车机导入上限：${label} ${count} 个（上限 ${limit}），请减少绑定项或简化模型`);
-    }
-  }
-  const jsonSize = new TextEncoder().encode(JSON.stringify(json)).byteLength;
-  if (jsonSize > 1024 * 1024) {
-    throw new Error(`超出车机导入上限：模型描述 ${(jsonSize / 1024).toFixed(0)}KB（上限 1024KB），请简化模型`);
-  }
-}
-
 function primitiveTriangleCount(json, primitive) {
   const accessorIndex = Number.isInteger(primitive.indices)
     ? primitive.indices
@@ -1913,7 +1889,7 @@ async function extractMainTexture({ json, bin }) {
   if (offset < 0 || end > bin.byteLength) throw new Error('主贴图数据越界');
   const bytes = bin.slice(offset, end);
   const png = image.mimeType === 'image/png' ? bytes : await transcodeToPng(bytes, image.mimeType);
-  return { bytes: await fitPngBudget(png, 16 * 1024 * 1024 - 4096), mimeType: 'image/png' };
+  return { bytes: png, mimeType: 'image/png' };
 }
 
 function extractNamedTexture({ json, bin }, materialName) {
@@ -1929,25 +1905,6 @@ function extractNamedTexture({ json, bin }, materialName) {
   const end = offset + view.byteLength;
   if (offset < 0 || end > bin.byteLength) throw new Error(`${materialName} 贴图数据越界`);
   return { bytes: bin.slice(offset, end), mimeType: 'image/png' };
-}
-
-/** 导入器单张贴图上限 16MiB：超限时降采样重编码。 */
-async function fitPngBudget(bytes, budget) {
-  let current = bytes;
-  while (current.byteLength > budget) {
-    const bitmap = await createImageBitmap(new Blob([current], { type: 'image/png' }));
-    const w = Math.max(1, Math.round(bitmap.width / 2));
-    const h = Math.max(1, Math.round(bitmap.height / 2));
-    if (bitmap.width <= 128 || bitmap.height <= 128) {
-      bitmap.close?.();
-      throw new Error('主贴图无法压缩到 16MiB 以内');
-    }
-    const canvas = makeCanvas(w, h);
-    canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
-    bitmap.close?.();
-    current = await encodeCanvasPng(canvas);
-  }
-  return current;
 }
 
 /** 车机按 CarSelf_Main.png 读取外部贴图，JPEG 需要先转成 PNG。 */
@@ -2085,11 +2042,12 @@ function readAscii(bytes, offset, length) { return String.fromCharCode(...bytes.
 function writeAscii(bytes, offset, value) { for (let i = 0; i < value.length; i++) bytes[offset + i] = value.charCodeAt(i); }
 
 /** 生成与最终 .bydcar 完全同管线的 GLB，供“车机质感”预览。 */
-export async function makeVehiclePreviewGlb(sourceBytes, transform, bindings = [], deletions = []) {
+export async function makeVehiclePreviewGlb(sourceBytes, transform, bindings = [], deletions = [], quality) {
+  const exportQuality = normalizeExportQuality(quality);
   const parsed = parseGlb(sourceBytes);
   const baked = await bakeMaterialsForVehicle(parsed);
   const normalized = await normalizeParsedGlb(baked, transform, bindings, [], deletions);
-  await fitGlbBudget(normalized);
-  await simplifyMeshToBudget(normalized);
+  await resizeEmbeddedImages(normalized, exportQuality.textureMaxSize);
+  await simplifyMeshToTarget(normalized, exportQuality.triangleTarget);
   return buildGlb(normalized.json, normalized.bin);
 }

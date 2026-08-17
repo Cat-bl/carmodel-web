@@ -25,6 +25,7 @@ import {
   Undo2,
   Upload,
   Wrench,
+  X,
 } from 'lucide';
 import { emptySelection, selectionGroupCount, selectionTriangleCount } from './selection.js';
 
@@ -53,7 +54,7 @@ app.innerHTML = `
       </div>
       <div class="command-actions">
         <button class="btn command-check" data-panel-target="check"><i data-lucide="check-circle-2"></i><span>检查</span></button>
-        <button class="btn primary" id="generate" disabled><i data-lucide="download"></i><span>生成车模包</span></button>
+        <button class="btn primary" id="generate" disabled><i data-lucide="download"></i><span id="generate-label">原始 · 生成车模包</span></button>
       </div>
     </header>
 
@@ -92,7 +93,7 @@ app.innerHTML = `
           <label class="empty-state" id="empty-state" for="model-file" tabindex="0" role="button">
             <i data-lucide="upload"></i>
             <strong>导入 GLB 车模</strong>
-            <span>点击或拖入文件，最大 32MB</span>
+            <span>点击或拖入完整的 GLB 文件</span>
           </label>
           <div class="import-progress" id="import-progress" role="status" aria-live="polite" aria-valuemin="0" aria-valuemax="100" hidden>
             <div class="import-progress-copy">
@@ -122,7 +123,7 @@ app.innerHTML = `
           </div>
           <div class="inspector-scroll">
             <section class="tool-section">
-              <div class="section-title"><h3>模型信息</h3><span>GLB · 32MB 上限</span></div>
+              <div class="section-title"><h3>模型信息</h3><span>GLB 2.0</span></div>
               <div class="stats">
                 ${stat('大小', 'stat-bytes')}
                 ${stat('三角形', 'stat-triangles')}
@@ -170,6 +171,29 @@ app.innerHTML = `
         <section class="inspector-panel" data-panel="check">
           <div class="inspector-title"><div><span>检查</span><h2>车机兼容性</h2></div><span class="profile-badge">profile v1</span></div>
           <div class="inspector-scroll">
+            <section class="tool-section export-quality">
+              <div class="section-title"><h3>导出质量</h3><span id="quality-summary">原始 · 不限</span></div>
+              <div class="quality-presets" role="radiogroup" aria-label="导出质量">
+                <button type="button" data-quality="smooth" role="radio" aria-checked="false">流畅</button>
+                <button type="button" data-quality="balanced" role="radio" aria-checked="false">均衡</button>
+                <button type="button" data-quality="high" role="radio" aria-checked="false">高清</button>
+                <button type="button" class="active" data-quality="original" role="radio" aria-checked="true">原始</button>
+                <button type="button" data-quality="custom" role="radio" aria-checked="false">自定义</button>
+              </div>
+              <div class="quality-custom" id="quality-custom" hidden>
+                <div class="field">
+                  <label for="quality-triangles">三角面上限</label>
+                  <input id="quality-triangles" type="number" min="0" step="10000" value="300000" inputmode="numeric" />
+                </div>
+                <div class="field">
+                  <label for="quality-texture-size">贴图最长边</label>
+                  <input id="quality-texture-size" type="number" min="0" step="256" value="4096" inputmode="numeric" />
+                </div>
+              </div>
+              <div class="quality-metrics" id="quality-metrics">
+                <span>全部面片</span><span>原始贴图</span>
+              </div>
+            </section>
             <div class="status-list" id="status-list">${status('warn', '…', '导入模型后开始检查')}</div>
             <button class="btn primary inspector-generate" id="mobile-generate" disabled><i data-lucide="download"></i>生成车模包</button>
           </div>
@@ -183,6 +207,43 @@ app.innerHTML = `
       <button class="dock-task" data-panel-target="binding">联动</button>
       <button class="dock-task" data-panel-target="check">检查</button>
       <button class="icon-btn primary" id="mobile-generate-shortcut" disabled title="生成"><i data-lucide="download"></i></button>
+    </div>
+  </div>
+
+  <div class="generate-dialog" id="generate-dialog" role="dialog" aria-modal="true" aria-labelledby="generate-dialog-title" hidden>
+    <div class="generate-dialog-panel">
+      <div class="generate-dialog-header">
+        <div><span>导出设置</span><h2 id="generate-dialog-title">生成车模包</h2></div>
+        <button class="icon-btn" id="generate-dialog-close" type="button" title="关闭"><i data-lucide="x"></i></button>
+      </div>
+      <div class="generate-dialog-body">
+        <div class="section-title"><h3>选择导出质量</h3><span id="generate-quality-summary">原始 · 不限</span></div>
+        <div class="quality-presets generate-quality-presets" role="radiogroup" aria-label="生成质量">
+          <button type="button" data-quality="smooth" role="radio" aria-checked="false">流畅</button>
+          <button type="button" data-quality="balanced" role="radio" aria-checked="false">均衡</button>
+          <button type="button" data-quality="high" role="radio" aria-checked="false">高清</button>
+          <button type="button" class="active" data-quality="original" role="radio" aria-checked="true">原始</button>
+          <button type="button" data-quality="custom" role="radio" aria-checked="false">自定义</button>
+        </div>
+        <div class="quality-custom" id="generate-quality-custom" hidden>
+          <div class="field">
+            <label for="generate-quality-triangles">三角面上限</label>
+            <input id="generate-quality-triangles" type="number" min="0" step="10000" value="300000" inputmode="numeric" />
+          </div>
+          <div class="field">
+            <label for="generate-quality-texture-size">贴图最长边</label>
+            <input id="generate-quality-texture-size" type="number" min="0" step="256" value="4096" inputmode="numeric" />
+          </div>
+        </div>
+        <div class="quality-metrics" id="generate-quality-metrics">
+          <span>全部面片</span><span>原始贴图</span>
+        </div>
+        <p class="generate-quality-note">原始档不会主动减少面片或缩小贴图；其他档位只按所选质量优化。</p>
+      </div>
+      <div class="generate-dialog-actions">
+        <button class="btn" id="generate-dialog-cancel" type="button">取消</button>
+        <button class="btn primary" id="generate-confirm" type="button"><i data-lucide="download"></i><span>按原始质量生成</span></button>
+      </div>
     </div>
   </div>
 `;
@@ -207,7 +268,10 @@ const ui = Object.fromEntries([
   'delete-start', 'delete-panel', 'delete-summary', 'undo', 'redo', 'dirty-state',
   'workspace-triangles', 'workspace-selection', 'workspace-mode', 'workspace-index',
   'import-progress', 'import-progress-label', 'import-progress-percent', 'import-progress-bar',
-  'binding-back',
+  'binding-back', 'quality-summary', 'quality-custom', 'quality-triangles', 'quality-texture-size',
+  'quality-metrics', 'generate-dialog', 'generate-dialog-close', 'generate-dialog-cancel',
+  'generate-confirm', 'generate-quality-summary', 'generate-quality-custom',
+  'generate-quality-triangles', 'generate-quality-texture-size', 'generate-quality-metrics',
 ].map((id) => [id, document.getElementById(id)]));
 // 空状态本身就是拖入区域；兼容旧逻辑保留 drop-zone 别名。
 ui['drop-zone'] ||= ui['empty-state'];
@@ -216,6 +280,15 @@ const preview = new ModelPreview(document.getElementById('preview'), updateStats
 let current = null;
 let dirty = false;
 let activePanel = 'model';
+const QUALITY_PRESETS = {
+  smooth: { label: '流畅', triangleTarget: 80000, textureMaxSize: 1024 },
+  balanced: { label: '均衡', triangleTarget: 160000, textureMaxSize: 2048 },
+  high: { label: '高清', triangleTarget: 300000, textureMaxSize: 4096 },
+  original: { label: '原始', triangleTarget: null, textureMaxSize: null },
+};
+let selectedQuality = 'original';
+const customQuality = { triangleTarget: 300000, textureMaxSize: 4096 };
+let qualityPreviewTimer = 0;
 
 window.addEventListener('beforeunload', (event) => {
   const importing = document.querySelector('.editor-shell')?.classList.contains('is-importing');
@@ -226,7 +299,7 @@ window.addEventListener('beforeunload', (event) => {
 
 const lucideIcons = {
   ArrowLeft, ArrowLeftRight, BoxSelect, CheckCircle2, Download, Eye, Gauge, Layers3, Maximize2, MousePointer2,
-  Paintbrush, Play, Redo2, RotateCcw, Settings2, Sparkles, Square, Trash2, Undo2, Upload, Wrench,
+  Paintbrush, Play, Redo2, RotateCcw, Settings2, Sparkles, Square, Trash2, Undo2, Upload, Wrench, X,
 };
 
 function renderIcons() {
@@ -263,6 +336,90 @@ function markDevicePreviewStale() {
   deviceGlbCache = null;
   deviceGlbCacheKey = '';
 }
+
+function positiveQualityValue(input) {
+  const value = Math.floor(Number(input) || 0);
+  return value > 0 ? value : null;
+}
+
+function exportQuality() {
+  if (selectedQuality === 'custom') {
+    return {
+      preset: 'custom',
+      label: '自定义',
+      triangleTarget: positiveQualityValue(customQuality.triangleTarget),
+      textureMaxSize: positiveQualityValue(customQuality.textureMaxSize),
+    };
+  }
+  return { preset: selectedQuality, ...QUALITY_PRESETS[selectedQuality] };
+}
+
+function renderQualityControls() {
+  const quality = exportQuality();
+  document.querySelectorAll('[data-quality]').forEach((button) => {
+    const active = button.dataset.quality === selectedQuality;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-checked', String(active));
+  });
+  document.querySelectorAll('.quality-custom').forEach((element) => {
+    element.hidden = selectedQuality !== 'custom';
+  });
+  const summary = `${quality.label} · ${quality.triangleTarget || quality.textureMaxSize ? '按档位优化' : '不限'}`;
+  ui['quality-summary'].textContent = summary;
+  ui['generate-quality-summary'].textContent = summary;
+  const metrics = `
+    <span>${quality.triangleTarget ? `${quality.triangleTarget.toLocaleString()} 面` : '全部面片'}</span>
+    <span>${quality.textureMaxSize ? `${quality.textureMaxSize}px 贴图` : '原始贴图'}</span>
+  `;
+  ui['quality-metrics'].innerHTML = metrics;
+  ui['generate-quality-metrics'].innerHTML = metrics;
+  const generateLabel = document.getElementById('generate-label');
+  if (generateLabel) generateLabel.textContent = `${quality.label} · 生成车模包`;
+  ui['generate-confirm'].querySelector('span').textContent = `按${quality.label}质量生成`;
+  document.getElementById('mobile-generate-shortcut').title = `${quality.label}质量生成`;
+}
+
+function refreshDevicePreviewForQuality() {
+  clearTimeout(qualityPreviewTimer);
+  if (!current || !preview.deviceMode) return;
+  qualityPreviewTimer = window.setTimeout(() => {
+    setPreviewMode(true).catch((error) => {
+      console.error(error);
+      showToast(`车机质感刷新失败：${error.message}`);
+    });
+  }, 320);
+}
+
+function qualityChanged() {
+  renderQualityControls();
+  markDevicePreviewStale();
+  if (current) setDirty(true);
+  refreshDevicePreviewForQuality();
+}
+
+document.querySelectorAll('[data-quality]').forEach((button) => {
+  button.addEventListener('click', () => {
+    if (current && selectedQuality !== button.dataset.quality) snapshot({ scope: 'quality' });
+    selectedQuality = button.dataset.quality;
+    qualityChanged();
+  });
+});
+const qualityInputConfig = {
+  'quality-triangles': ['triangleTarget', 'generate-quality-triangles'],
+  'generate-quality-triangles': ['triangleTarget', 'quality-triangles'],
+  'quality-texture-size': ['textureMaxSize', 'generate-quality-texture-size'],
+  'generate-quality-texture-size': ['textureMaxSize', 'quality-texture-size'],
+};
+for (const [id, [key, mirrorId]] of Object.entries(qualityInputConfig)) {
+  ui[id].addEventListener('input', () => {
+    selectedQuality = 'custom';
+    customQuality[key] = Math.max(0, Math.floor(Number(ui[id].value) || 0));
+    ui[mirrorId].value = ui[id].value;
+    qualityChanged();
+  });
+  wireContinuousHistory(ui[id], { scope: 'quality-input' });
+}
+renderQualityControls();
 
 renderIcons();
 
@@ -355,21 +512,52 @@ document.querySelectorAll('[data-rotate]').forEach((button) => {
   });
 });
 
-for (const axis of ['x', 'y', 'z']) ui[`rotation-${axis}`].addEventListener('input', updateRotation);
+for (const axis of ['x', 'y', 'z']) {
+  const input = ui[`rotation-${axis}`];
+  input.addEventListener('input', updateRotation);
+  wireContinuousHistory(input, { scope: 'model-input', field: `rotation-${axis}` });
+}
 // 尺寸与离地高度不改旋转，变换后可把删除框/选区/旋转中心无损迁移到新坐标
 ui['target-length'].addEventListener('input', () => {
   renormalizeAndMigrate(() => preview.setTargetLength(ui['target-length'].value));
 });
+wireContinuousHistory(ui['target-length'], { scope: 'model-input', field: 'target-length' });
 ui['height-offset'].addEventListener('input', () => {
   renormalizeAndMigrate(() => {
     preview.heightOffset = Math.min(3, Math.max(0, Number(ui['height-offset'].value) || 0));
     preview.normalize();
   });
 });
+wireContinuousHistory(ui['height-offset'], { scope: 'model-input', field: 'height-offset' });
 ui['reset-rotation'].addEventListener('click', reset);
 ui['mobile-reset'].addEventListener('click', reset);
-ui.generate.addEventListener('click', generatePackage);
-ui['mobile-generate'].addEventListener('click', () => ui.generate.click());
+
+function openGenerateDialog() {
+  if (!current || !preview.model) return;
+  renderQualityControls();
+  ui['generate-dialog'].hidden = false;
+  ui['generate-confirm'].focus();
+}
+
+function closeGenerateDialog() {
+  ui['generate-dialog'].hidden = true;
+}
+
+ui.generate.addEventListener('click', openGenerateDialog);
+ui['mobile-generate'].addEventListener('click', openGenerateDialog);
+document.getElementById('mobile-generate-shortcut')?.addEventListener('click', openGenerateDialog);
+ui['generate-dialog-close'].addEventListener('click', closeGenerateDialog);
+ui['generate-dialog-cancel'].addEventListener('click', closeGenerateDialog);
+ui['generate-dialog'].addEventListener('click', (event) => {
+  if (event.target === ui['generate-dialog']) closeGenerateDialog();
+});
+ui['generate-confirm'].addEventListener('click', () => {
+  closeGenerateDialog();
+  generatePackage();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !ui['generate-dialog'].hidden) closeGenerateDialog();
+});
 ui['demo-all'].addEventListener('click', () => { demoAll(); });
 ui.redo.addEventListener('click', redo);
 document.querySelectorAll('[data-panel-target]').forEach((element) => {
@@ -383,13 +571,12 @@ document.querySelectorAll('[data-panel-target]').forEach((element) => {
   });
 });
 document.querySelector('.command-check')?.addEventListener('click', () => setActivePanel('check'));
-document.getElementById('mobile-generate-shortcut')?.addEventListener('click', generatePackage);
 ui['binding-back'].addEventListener('click', closeBindingEditor);
 
 let deviceGlbCache = null;
 let deviceGlbCacheKey = '';
 async function setPreviewMode(device) {
-  if (!current || preview.deviceMode === device) return;
+  if (!current || (preview.deviceMode === device && (!device || deviceGlbCache))) return;
   stopFineSelection();
   ui['mode-web'].disabled = true;
   ui['mode-device'].disabled = true;
@@ -398,10 +585,11 @@ async function setPreviewMode(device) {
     const transform = preview.getExportTransform();
     const previewBindings = bindingsForOutput();
     const previewDeletions = deletions.map((item) => item.region);
-    const cacheKey = JSON.stringify({ transform, bindings: previewBindings, deletions: previewDeletions });
+    const quality = exportQuality();
+    const cacheKey = JSON.stringify({ transform, bindings: previewBindings, deletions: previewDeletions, quality });
     if (device && (!deviceGlbCache || deviceGlbCacheKey !== cacheKey)) {
       ui['mode-device'].textContent = '烘焙中…';
-      deviceGlbCache = await makeVehiclePreviewGlb(current.bytes, transform, previewBindings, previewDeletions);
+      deviceGlbCache = await makeVehiclePreviewGlb(current.bytes, transform, previewBindings, previewDeletions, quality);
       deviceGlbCacheKey = cacheKey;
       ui['mode-device'].textContent = '车机质感';
     }
@@ -443,10 +631,6 @@ async function loadFile(file) {
     setStatuses([['bad', '×', '首版只接受完整的 .glb 文件']]);
     return;
   }
-  if (file.size > 32 * 1024 * 1024) {
-    setStatuses([['bad', '×', '模型超过 32MB 硬限制']]);
-    return;
-  }
   ui['file-name'].textContent = file.name;
   ui['analysis-state'].textContent = '解析中…';
   ui['model-file'].disabled = true;
@@ -467,7 +651,8 @@ async function loadFile(file) {
     deletions = [];
     deleteDraft = null;
     undoStack.length = 0;
-    ui.undo.disabled = true;
+    redoStack.length = 0;
+    syncUndoRedoButtons();
     ui['height-offset'].value = 0;
     preview.heightOffset = 0;
     treeQuery = '';
@@ -514,12 +699,11 @@ function updateStats(stats) {
 
 function validateStats(stats, orientation) {
   const results = [];
-  if (stats.triangles > 300000) results.push(['warn', '!', `三角形较多（${stats.triangles.toLocaleString()}），生成时会按车机渲染预算保留约 300,000 面`]);
-  else if (stats.triangles > 60000) results.push(['warn', '!', `三角形较多（${stats.triangles.toLocaleString()}），建议后续简化`]);
+  if (stats.triangles > 300000) results.push(['warn', '!', `三角形较多（${stats.triangles.toLocaleString()}），原始档会完整保留，可按需要选择其他质量档位`]);
+  else if (stats.triangles > 60000) results.push(['warn', '!', `三角形较多（${stats.triangles.toLocaleString()}），可按车机性能选择导出质量`]);
   else results.push(['good', '✓', `三角形数量适合车机（${stats.triangles.toLocaleString()}）`]);
 
-  if (stats.materials > 32) results.push(['bad', '×', `材质 ${stats.materials} 个，超过 32 个硬限制`]);
-  else results.push(['good', '✓', `材质数量 ${stats.materials} 个`]);
+  results.push(['good', '✓', `材质数量 ${stats.materials} 个（不限制）`]);
 
   if (stats.skinned) results.push(['warn', '!', '检测到骨骼蒙皮，首版会转换为当前静态姿态']);
   if (stats.morphs) results.push(['warn', '!', '检测到 Morph，首版会保留当前静态形状']);
@@ -531,13 +715,12 @@ function validateStats(stats, orientation) {
   } else {
     results.push(['warn', '!', '未能从部件中可靠识别正面，已按常见 GLB 约定默认左转 90°（Y 270°），可在预览中手动校正']);
   }
-  results.push(['good', '✓', '纹理和模型数据全部在浏览器本地处理']);
+  results.push(['good', '✓', '模型结构已完成解析']);
   setStatuses(results);
-  const blocked = results.some(([kind]) => kind === 'bad');
-  ui.generate.disabled = blocked;
-  ui['mobile-generate'].disabled = blocked;
-  document.getElementById('mobile-generate-shortcut').disabled = blocked;
-  ui.generate.title = blocked ? '存在未通过的兼容性检查，请先查看检查结果' : '生成车模包';
+  ui.generate.disabled = false;
+  ui['mobile-generate'].disabled = false;
+  document.getElementById('mobile-generate-shortcut').disabled = false;
+  ui.generate.title = '生成车模包';
 }
 
 function setStatuses(items) {
@@ -603,7 +786,6 @@ let regionMode = 'translate';
 let demoRun = null;
 let pickingFor = null;
 let selectionEditingSlot = null;
-let selectionHistory = [];
 let selectionLast = emptySelection();
 let selectionLastStrokeId = null;
 let previewSelectionMode = 'smart';
@@ -715,6 +897,7 @@ function positionLabel(bounds, whole) {
 
 /* ---------- 撤销 ---------- */
 
+const HISTORY_LIMIT = 80;
 const undoStack = [];
 const redoStack = [];
 
@@ -726,25 +909,86 @@ function captureSnapshot() {
     targetLength: Number(ui['target-length'].value) || 5.2,
     heightOffset: Number(ui['height-offset'].value) || 0,
     transform: preview.getExportTransform(),
+    activePanel,
     openSlot,
+    regionMode,
+    selectionEditingSlot,
+    quality: {
+      selected: selectedQuality,
+      custom: structuredClone(customQuality),
+    },
   };
 }
 
-/** 在每个会改变配置的操作之前调用，把当前完整状态压栈（最多 30 步） */
-function snapshot() {
-  undoStack.push(captureSnapshot());
-  if (undoStack.length > 30) undoStack.shift();
+function pushHistory(state, meta = {}) {
+  if (!state) return;
+  undoStack.push({ state, meta });
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
   redoStack.length = 0;
-  ui.undo.disabled = false;
-  ui.redo.disabled = true;
+  syncUndoRedoButtons();
   setDirty();
   markDevicePreviewStale();
+}
+
+/** 在每个会改变配置的操作之前调用，把当前完整状态压栈。 */
+function snapshot(meta = {}) {
+  pushHistory(captureSnapshot(), meta);
+}
+
+function historyEntryMatchesSelection(entry, slotId = selectionEditingSlot) {
+  return Boolean(
+    slotId
+    && entry?.meta?.scope === 'selection'
+    && entry.meta.slotId === slotId,
+  );
+}
+
+function syncUndoRedoButtons() {
+  ui.undo.disabled = undoStack.length === 0;
+  ui.redo.disabled = redoStack.length === 0;
+  const localUndo = document.getElementById('selection-undo');
+  const localRedo = document.getElementById('selection-redo');
+  if (localUndo) localUndo.disabled = !historyEntryMatchesSelection(undoStack.at(-1), openSlot);
+  if (localRedo) localRedo.disabled = !historyEntryMatchesSelection(redoStack.at(-1), openSlot);
+  ui.undo.title = historyEntryMatchesSelection(undoStack.at(-1)) ? '撤销上一笔选面' : '撤销';
+  ui.redo.title = historyEntryMatchesSelection(redoStack.at(-1)) ? '重做上一笔选面' : '重做';
+}
+
+/** 连续输入在聚焦期间只记录一次编辑前状态，避免每个字符都占一个撤销步骤。 */
+function wireContinuousHistory(input, meta = {}) {
+  if (!input || input.dataset.historyWired === 'true') return;
+  input.dataset.historyWired = 'true';
+  let baseline = null;
+  let recorded = false;
+  const begin = () => {
+    if (!current || baseline) return;
+    baseline = captureSnapshot();
+    recorded = false;
+  };
+  const record = () => {
+    if (!current || recorded) return;
+    if (!baseline) baseline = captureSnapshot();
+    pushHistory(baseline, meta);
+    recorded = true;
+  };
+  const finish = () => {
+    baseline = null;
+    recorded = false;
+  };
+  input.addEventListener('focus', begin);
+  input.addEventListener('pointerdown', begin);
+  input.addEventListener('keydown', begin);
+  input.addEventListener('beforeinput', begin);
+  input.addEventListener('input', record);
+  input.addEventListener('change', finish);
+  input.addEventListener('blur', finish);
 }
 
 function restoreSnapshot(snap) {
   if (!snap) return;
   stopDemo();
   cancelDeleteDraft(true);
+  closePreviewTools();
   bindings.clear();
   for (const [id, binding] of snap.bindings) bindings.set(id, binding);
   deletions = snap.deletions;
@@ -760,38 +1004,53 @@ function restoreSnapshot(snap) {
   // 不能经 normalize 重新推导（落地缩放会随删除后的几何变化而漂移）
   preview.setTransform(snap.transform);
   preview.setDeletions(deletions.map((item) => item.region));
+  if (snap.quality) {
+    selectedQuality = snap.quality.selected || 'original';
+    customQuality.triangleTarget = snap.quality.custom?.triangleTarget ?? customQuality.triangleTarget;
+    customQuality.textureMaxSize = snap.quality.custom?.textureMaxSize ?? customQuality.textureMaxSize;
+    for (const id of ['quality-triangles', 'generate-quality-triangles']) ui[id].value = customQuality.triangleTarget;
+    for (const id of ['quality-texture-size', 'generate-quality-texture-size']) ui[id].value = customQuality.textureMaxSize;
+    renderQualityControls();
+  }
   refreshParts();
   openSlot = snap.openSlot;
-  regionMode = 'translate';
-  closePreviewTools();
+  regionMode = snap.regionMode || 'translate';
+  const resumeFineSelection = Boolean(
+    openSlot
+    && snap.selectionEditingSlot === openSlot
+    && bindings.get(openSlot)?.selection,
+  );
+  selectionEditingSlot = resumeFineSelection ? openSlot : null;
   renderDeletePanel();
   renderBindings();
-  if (openSlot) {
+  setActivePanel(snap.activePanel || (openSlot ? 'binding' : 'model'));
+  if (activePanel === 'binding' && openSlot) {
     const slot = SLOT_BY_ID.get(openSlot);
     const binding = bindings.get(openSlot);
     if (binding?.region) openRegionBox(slot);
+    else if (binding?.selection && resumeFineSelection && !preview.selectionState) startFineSelection(slot, { preserveState: true });
     else if (binding) playCurrentBinding();
   }
   setDirty();
   markDevicePreviewStale();
+  syncUndoRedoButtons();
+  refreshDevicePreviewForQuality();
 }
 
 function undo() {
-  const snap = undoStack.pop();
-  if (!snap) return;
-  redoStack.push(captureSnapshot());
-  restoreSnapshot(snap);
-  ui.undo.disabled = undoStack.length === 0;
-  ui.redo.disabled = false;
+  const entry = undoStack.pop();
+  if (!entry) return;
+  redoStack.push({ state: captureSnapshot(), meta: entry.meta });
+  restoreSnapshot(entry.state);
+  syncUndoRedoButtons();
 }
 
 function redo() {
-  const snap = redoStack.pop();
-  if (!snap) return;
-  undoStack.push(captureSnapshot());
-  restoreSnapshot(snap);
-  ui.undo.disabled = false;
-  ui.redo.disabled = redoStack.length === 0;
+  const entry = redoStack.pop();
+  if (!entry) return;
+  undoStack.push({ state: captureSnapshot(), meta: entry.meta });
+  restoreSnapshot(entry.state);
+  syncUndoRedoButtons();
 }
 
 ui.undo.addEventListener('click', undo);
@@ -1507,7 +1766,8 @@ function bindingEditor(slot) {
         </div>
         <div class="selection-summary" id="selection-summary">${stats.triangles.toLocaleString()} 面 · ${stats.groups} 个网格区域${stats.triangles ? '' : ' · 请在模型上选择'}</div>
         <div class="quick-row selection-actions">
-          <button type="button" class="btn small" id="selection-undo"${selectionHistory.length ? '' : ' disabled'}>撤销选区</button>
+          <button type="button" class="btn small" id="selection-undo"${historyEntryMatchesSelection(undoStack.at(-1), slot.id) ? '' : ' disabled'}>撤销选区</button>
+          <button type="button" class="btn small" id="selection-redo"${historyEntryMatchesSelection(redoStack.at(-1), slot.id) ? '' : ' disabled'}>重做选区</button>
           <button type="button" class="btn small" id="selection-clear"${stats.triangles ? '' : ' disabled'}>清空选区</button>
           <button type="button" class="btn small primary" id="selection-done">完成选择</button>
         </div>
@@ -1676,7 +1936,10 @@ function wireBindingEditor() {
   wirePartTree(slot);
   for (const id of ['bind-pivot-x', 'bind-pivot-y', 'bind-pivot-z', 'bind-angle', 'bind-axis', 'bind-color', 'bind-duration', 'bind-reverse']) {
     const input = document.getElementById(id);
-    if (input) input.addEventListener('input', () => updateBindingFromInputs(slot));
+    if (input) {
+      input.addEventListener('input', () => updateBindingFromInputs(slot));
+      wireContinuousHistory(input, { scope: 'binding-input', slotId: slot.id, field: id });
+    }
   }
   const mirror = document.getElementById('bind-mirror');
   if (mirror) mirror.addEventListener('click', () => mirrorBindingInto(slot));
@@ -1810,7 +2073,6 @@ function createSelectionBinding(slot, previous) {
   delete next.region;
   bindings.set(slot.id, next);
   selectionEditingSlot = slot.id;
-  selectionHistory = [];
   selectionLast = structuredClone(next.selection);
   selectionLastStrokeId = null;
   renderBindings();
@@ -1824,7 +2086,13 @@ function updateSelectionBinding(slot, selection, stats, change = {}) {
   const previous = selectionLast || emptySelection();
   if (JSON.stringify(previous) !== JSON.stringify(nextSelection)) {
     const strokeId = change.strokeId ?? null;
-    if (strokeId === null || strokeId !== selectionLastStrokeId) selectionHistory.push(structuredClone(previous));
+    if (strokeId === null || strokeId !== selectionLastStrokeId) {
+      const state = captureSnapshot();
+      const previousBinding = state.bindings.find(([id]) => id === slot.id)?.[1];
+      if (previousBinding) previousBinding.selection = structuredClone(previous);
+      state.selectionEditingSlot = slot.id;
+      pushHistory(state, { scope: 'selection', slotId: slot.id, strokeId });
+    }
     selectionLastStrokeId = strokeId;
   }
   selectionLast = structuredClone(nextSelection);
@@ -1874,8 +2142,7 @@ function updateSelectionSummary(stats) {
   if (label) label.textContent = `${(stats?.triangles || 0).toLocaleString()} 面 · ${stats?.groups || 0} 个网格区域${stats?.triangles ? '' : ' · 请在模型上选择'}`;
   const clear = document.getElementById('selection-clear');
   if (clear) clear.disabled = !(stats?.triangles);
-  const undoButton = document.getElementById('selection-undo');
-  if (undoButton) undoButton.disabled = selectionHistory.length === 0;
+  syncUndoRedoButtons();
   const binding = openSlot ? bindings.get(openSlot) : null;
   if (binding) updateBindingRow(SLOT_BY_ID.get(openSlot), binding);
 }
@@ -1883,14 +2150,14 @@ function updateSelectionSummary(stats) {
 function startFineSelection(slot, { preserveState = false } = {}) {
   const binding = bindings.get(slot?.id);
   if (!slot || !binding?.selection || preview.deviceMode) return;
+  const continuingSameSession = selectionEditingSlot === slot.id && Boolean(preview.selectionState);
   // 编辑选区必须始终命中原始网格；动画预览会隐藏原件并换成临时切分网格。
   preview.stopBindingPreview();
   preview.clearHighlight();
   preview.hideRegionBox();
   preview.hidePivotMarker();
   selectionEditingSlot = slot.id;
-  if (!preserveState) {
-    selectionHistory = [];
+  if (!preserveState || !continuingSameSession) {
     selectionLast = structuredClone(binding.selection);
     selectionLastStrokeId = null;
   }
@@ -1907,18 +2174,21 @@ function startFineSelection(slot, { preserveState = false } = {}) {
     },
   });
   ui['workspace-mode'].textContent = '精细选面';
-  updateSelectionSummary(preview.selectionStats(binding.selection));
+  const stats = preview.selectionStats(binding.selection);
+  updateSelectionSummary(stats);
+  updateWorkspaceSelection(stats);
+  syncUndoRedoButtons();
 }
 
 function stopFineSelection() {
   if (!selectionEditingSlot && !preview.selectionState) return;
   selectionEditingSlot = null;
-  selectionHistory = [];
   selectionLast = emptySelection();
   selectionLastStrokeId = null;
   preview.setTriangleSelection(false);
   ui['workspace-index'].textContent = '精细索引未启用';
   ui['workspace-mode'].textContent = openSlot ? '联动预览' : '浏览模式';
+  syncUndoRedoButtons();
 }
 
 function wireFineSelection(slot) {
@@ -1956,41 +2226,12 @@ function wireFineSelection(slot) {
     document.getElementById('selection-angle-output').textContent = `${previewSelectionAngle}°`;
     preview.setTriangleSelectionOptions({ angle: previewSelectionAngle });
   });
-  document.getElementById('selection-undo')?.addEventListener('click', () => {
-    const previous = selectionHistory.pop();
-    if (!previous) return;
-    const stats = preview.selectionStats(previous);
-    selectionLast = structuredClone(previous);
-    selectionLastStrokeId = null;
-    const binding = bindings.get(slot.id);
-    if (binding) {
-      binding.selection = structuredClone(previous);
-      binding.nodeIndices = [...new Set((previous.groups || []).map((group) => group.nodeIndex))];
-      binding.sourceName = stats.triangles ? `精细选面（${stats.triangles.toLocaleString()} 面）` : '精细选面（未完成）';
-      if (slot.kind === 'spin' && !binding.pivotCustom && stats.pivot) binding.pivot = stats.pivot;
-      preview.setTriangleSelection(true, previous, {
-        mode: previewSelectionMode,
-        operation: previewSelectionOperation,
-        brushRadius: previewSelectionRadius,
-        angle: previewSelectionAngle,
-        visibleOnly: previewSelectionVisibleOnly,
-        onChange: (selection, nextStats, change) => updateSelectionBinding(slot, selection, nextStats, change),
-        onStatus: ({ state, stats: nextStats }) => {
-          ui['workspace-index'].textContent = state === 'building' ? '正在构建 BVH 索引…' : 'BVH 索引就绪';
-          updateSelectionSummary(nextStats);
-        },
-      });
-      updateSelectionSummary(stats);
-      updateWorkspaceSelection(stats);
-      markDevicePreviewStale();
-      setDirty();
-    }
-  });
+  document.getElementById('selection-undo')?.addEventListener('click', undo);
+  document.getElementById('selection-redo')?.addEventListener('click', redo);
   document.getElementById('selection-clear')?.addEventListener('click', () => {
     const binding = bindings.get(slot.id);
     if (!binding) return;
-    const previous = structuredClone(binding.selection || emptySelection());
-    selectionHistory.push(previous);
+    snapshot({ scope: 'selection', slotId: slot.id, action: 'clear' });
     const next = emptySelection();
     selectionLast = structuredClone(next);
     selectionLastStrokeId = null;
@@ -2207,7 +2448,8 @@ async function generatePackage() {
   buttons.forEach((button) => { if (button) { button.disabled = true; button.classList.add('busy'); } });
   ui.generate.innerHTML = '<span class="spinner"></span><span>生成中…</span>';
   ui['mobile-generate'].innerHTML = '<span class="spinner"></span>生成中…';
-  setStatuses([['warn', '…', '正在规范化 GLB 并生成车模包']]);
+  const quality = exportQuality();
+  setStatuses([['warn', '…', `正在按“${quality.label}”质量生成车模包`]]);
   try {
     const result = await makeBydCar({
       sourceBytes: current.bytes,
@@ -2216,6 +2458,7 @@ async function generatePackage() {
       stats: current.stats,
       bindings: bindingsForOutput(),
       deletions: deletions.map((item) => item.region),
+      quality,
     });
     const blob = new Blob([result.bytes], { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
@@ -2228,6 +2471,7 @@ async function generatePackage() {
     updateSteps(4);
     setStatuses([
       ['good', '✓', `车模包已生成：${formatBytes(result.bytes.byteLength)}`],
+      ['good', '✓', `导出质量：${quality.label}`],
       ['good', '✓', `几何：${current.stats.triangles.toLocaleString()} → ${result.manifest.model.outputStats.triangles.toLocaleString()} 三角形${current.stats.triangles === result.manifest.model.outputStats.triangles ? '（未减面）' : ''}`],
       ['good', '✓', 'CarSelf.dat 和 GLB 均已写入 SHA-256 校验值'],
       ['warn', '!', '导入地图后需要重启地图进程才能生效'],

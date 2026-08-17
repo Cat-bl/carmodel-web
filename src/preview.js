@@ -1423,6 +1423,11 @@ export class ModelPreview {
   /** 撤销恢复用：直接还原快照里的模型矩阵，不经 normalize 重新推导 */
   setTransform(transform) {
     if (!this.model || !transform) return;
+    if (this.deviceMode) {
+      // 车机预览的外层模型已经烘焙到最终坐标，保持单位矩阵；这里只恢复下一次重烘焙要用的编辑态变换。
+      this.exportTransform = structuredClone(transform);
+      return;
+    }
     this.model.position.fromArray(transform.translation);
     this.model.quaternion.fromArray(transform.rotation);
     this.model.scale.fromArray(transform.scale);
