@@ -89,6 +89,97 @@ function configuredThreeClip(source, playback, { reverse = false } = {}) {
   return new THREE.AnimationClip(source.name, duration, tracks);
 }
 
+function staticTrackValue(root, track) {
+  const values = new Float32Array(track.getValueSize());
+  let binding = null;
+  try {
+    binding = THREE.PropertyBinding.create(root, track.name);
+    binding.bind();
+    binding.getValue(values, 0);
+    return Array.from(values, Number).every(Number.isFinite) ? Array.from(values, Number) : null;
+  } catch {
+    return null;
+  } finally {
+    binding?.unbind?.();
+  }
+}
+
+/** 网页质感使用与导出相同的静态姿态 → 动作首帧 smoothstep 过渡。 */
+function enterThreeClip(root, active, transitionMs, name) {
+  const duration = Math.max(0, Number(transitionMs) || 0) / 1000;
+  if (!(duration > 0)) return null;
+  const frameCount = 8;
+  const times = Array.from({ length: frameCount }, (_, frame) => duration * frame / (frameCount - 1));
+  const tracks = active.tracks.map((track) => {
+    const components = track.getValueSize();
+    const end = Array.from(track.values.slice(0, components), Number);
+    const start = staticTrackValue(root, track) || end;
+    const values = [];
+    const isQuaternion = track instanceof THREE.QuaternionKeyframeTrack;
+    const startQuaternion = isQuaternion ? new THREE.Quaternion().fromArray(start).normalize() : null;
+    const endQuaternion = isQuaternion ? new THREE.Quaternion().fromArray(end).normalize() : null;
+    for (let frame = 0; frame < frameCount; frame++) {
+      const progress = frame / (frameCount - 1);
+      const eased = progress * progress * (3 - 2 * progress);
+      if (isQuaternion) {
+        values.push(...startQuaternion.clone().slerp(endQuaternion, eased).toArray());
+      } else {
+        values.push(...start.map((value, index) => value + (end[index] - value) * eased));
+      }
+    }
+    return new track.constructor(track.name, times, values, THREE.InterpolateLinear);
+  });
+  return tracks.length ? new THREE.AnimationClip(name, duration, tracks) : null;
+}
+
+function captureTrackRestValues(root, tracks, existing = null) {
+  const values = new Map(existing || []);
+  for (const track of tracks || []) {
+    if (values.has(track.name)) continue;
+    const value = staticTrackValue(root, track);
+    if (value) values.set(track.name, value);
+  }
+  return values;
+}
+
+/** 从网页当前实际显示姿态平滑回到首次播放前的模型静态姿态。 */
+function resetThreeClip(root, source, restValues, transitionMs, name) {
+  const duration = Math.max(0, Number(transitionMs) || 0) / 1000;
+  if (!(duration > 0) || !source?.tracks?.length) return null;
+  const frameCount = 8;
+  const times = Array.from({ length: frameCount }, (_, frame) => duration * frame / (frameCount - 1));
+  const tracks = [];
+  for (const track of source.tracks) {
+    const start = staticTrackValue(root, track);
+    const end = restValues?.get(track.name);
+    if (!start || !end || start.length !== end.length) continue;
+    const values = [];
+    const isQuaternion = track instanceof THREE.QuaternionKeyframeTrack;
+    const startQuaternion = isQuaternion ? new THREE.Quaternion().fromArray(start).normalize() : null;
+    const endQuaternion = isQuaternion ? new THREE.Quaternion().fromArray(end).normalize() : null;
+    for (let frame = 0; frame < frameCount; frame++) {
+      const progress = frame / (frameCount - 1);
+      const eased = progress * progress * (3 - 2 * progress);
+      if (isQuaternion) {
+        values.push(...startQuaternion.clone().slerp(endQuaternion, eased).toArray());
+      } else {
+        values.push(...start.map((value, index) => value + (end[index] - value) * eased));
+      }
+    }
+    tracks.push(new track.constructor(track.name, times, values, THREE.InterpolateLinear));
+  }
+  return tracks.length ? new THREE.AnimationClip(name, duration, tracks) : null;
+}
+
+function isShadowObject(object) {
+  const materials = object?.isMesh
+    ? (Array.isArray(object.material) ? object.material : [object.material])
+    : [];
+  return String(object?.name || '').startsWith('CS_Shadow')
+    || String(object?.name || '').startsWith('Imported_CS_Shadow')
+    || materials.some((material) => String(material?.name || '').startsWith('CS_Shadow'));
+}
+
 function readFileWithProgress(file, onProgress) {
   if (typeof FileReader === 'undefined') return file.arrayBuffer();
   return new Promise((resolve, reject) => {
@@ -113,6 +204,7 @@ export class ModelPreview {
     this.rotation = { x: 0, y: 0, z: 0 };
     this.targetLength = TARGET.x;
     this.heightOffset = 0;
+    this.removeShadow = false;
     this.nodeObjects = [];
     this.loadedAnimations = [];
     this.mixer = null;
@@ -195,7 +287,7 @@ export class ModelPreview {
   }
 
   updateAutomaticShadow(box) {
-    if (!this.autoShadow || this.deviceMode || !box || box.isEmpty()) {
+    if (!this.autoShadow || this.removeShadow || this.deviceMode || !box || box.isEmpty()) {
       if (this.autoShadow) this.autoShadow.visible = false;
       return;
     }
@@ -209,11 +301,27 @@ export class ModelPreview {
     this.autoShadow.visible = true;
   }
 
+  setRemoveShadow(enabled) {
+    this.removeShadow = Boolean(enabled);
+    this.syncModelShadowVisibility();
+    if (!this.model) {
+      if (this.autoShadow) this.autoShadow.visible = false;
+      return;
+    }
+    this.updateAutomaticShadow(new THREE.Box3().setFromObject(this.model));
+  }
+
+  syncModelShadowVisibility() {
+    this.model?.traverse((object) => {
+      if (isShadowObject(object)) object.visible = Boolean(this.deviceMode && !this.removeShadow);
+    });
+  }
+
   groundShadowSamples(box) {
     const meshes = [];
     let totalVertices = 0;
     this.model?.traverse((object) => {
-      if (!object.isMesh || object.name === 'CS_Shadow') return;
+      if (!object.isMesh || isShadowObject(object)) return;
       const position = object.geometry?.attributes?.position;
       if (!position) return;
       meshes.push({ object, position });
@@ -353,6 +461,7 @@ export class ModelPreview {
     this.loadedAnimations = gltf.animations || [];
     this.model.name = 'CS_Car';
     this.scene.add(this.model);
+    this.syncModelShadowVisibility();
     const isVehicle = modelType !== 'other';
     report(0.72, isVehicle ? '正在分析模型朝向' : '正在保留模型原始朝向');
     const orientation = isVehicle
@@ -965,32 +1074,150 @@ export class ModelPreview {
    * 关键帧与导出用同一份 buildKeyframes，保证所见即所得；
    * 灯光/闪烁类会把目标换成点亮纯色，对应车机端换纯色贴图的效果。
    */
+  startSourceResetPreview(slot, playback) {
+    const current = this.bindingPreview?.sourceEvent && this.bindingPreview.eventId === slot.id
+      ? this.bindingPreview
+      : null;
+    if (!current || !this.mixer || !(playback.transitionMs > 0)) {
+      this.stopBindingPreview();
+      return false;
+    }
+    const clip = resetThreeClip(
+      this.model,
+      current.currentClip,
+      current.restValues,
+      playback.transitionMs,
+      `BYD_RST_${slot.id}_PREVIEW`,
+    );
+    if (!clip) {
+      this.stopBindingPreview();
+      return false;
+    }
+    const mixer = this.mixer;
+    for (const handler of current.mixerFinishedHandlers || []) mixer.removeEventListener('finished', handler);
+    current.mixerFinishedHandlers = [];
+    current.currentAction?.stop();
+    const action = mixer.clipAction(clip);
+    action.setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+    current.currentAction = action;
+    current.currentClip = clip;
+    const onFinished = (event) => {
+      if (event.action !== action || this.mixer !== mixer || this.bindingPreview !== current) return;
+      mixer.removeEventListener('finished', onFinished);
+      current.mixerFinishedHandlers = current.mixerFinishedHandlers
+        .filter((handler) => handler !== onFinished);
+      this.stopBindingPreview();
+    };
+    mixer.addEventListener('finished', onFinished);
+    current.mixerFinishedHandlers.push(onFinished);
+    action.reset().play();
+    return true;
+  }
+
   previewBinding(slot, params, phase = 'on') {
-    this.stopBindingPreview();
     if (!this.model || !slot) return;
     if (this.deviceMode && this.previewExportedBinding(slot, params, phase)) return;
     if (Number.isInteger(params.sourceAnimationIndex)) {
       const playback = normalizeOtherPlayback(slot, params.playback);
-      if (phase === 'off' && playback.endMode === 'reset') return;
+      if (phase === 'off' && playback.endMode === 'reset') {
+        this.startSourceResetPreview(slot, playback);
+        return;
+      }
       const source = this.loadedAnimations[params.sourceAnimationIndex];
       if (!source) return;
       const clip = configuredThreeClip(source, playback, { reverse: phase === 'off' && playback.endMode === 'reverse' });
-      this.mixer = new THREE.AnimationMixer(this.model);
+      const previous = phase === 'on' && this.bindingPreview?.sourceEvent
+        && this.bindingPreview.eventId !== slot.id && this.mixer
+        ? this.bindingPreview
+        : null;
+      if (!previous) this.stopBindingPreview();
+      if (!this.mixer) this.mixer = new THREE.AnimationMixer(this.model);
+      const mixer = this.mixer;
       const action = this.mixer.clipAction(clip);
       const loop = phase === 'on' && ['loop', 'pingpong'].includes(playback.mode);
       action.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
       action.clampWhenFinished = phase === 'off'
         ? playback.endMode !== 'reverse'
         : playback.mode === 'hold';
-      action.reset();
-      if (phase === 'off' && playback.endMode === 'hold') {
-        action.time = clip.duration;
-        action.paused = true;
+      const nextPreview = {
+        sourceEvent: true,
+        eventId: slot.id,
+        currentAction: action,
+        currentClip: clip,
+        restValues: captureTrackRestValues(this.model, clip.tracks, previous?.restValues),
+        mixerFinishedHandlers: [],
+        transitionTimers: previous?.transitionTimers || new Set(),
+      };
+      const startActive = () => {
+        action.reset();
+        if (phase === 'off' && playback.endMode === 'hold') {
+          action.time = clip.duration;
+          action.paused = true;
+        }
+        action.play();
+        if (action.paused) this.mixer?.update(0);
+      };
+      if ((phase === 'on' && playback.mode === 'once')
+        || (phase === 'off' && playback.endMode === 'reverse')) {
+        const onFinished = (event) => {
+          if (event.action !== action || this.mixer !== mixer || this.bindingPreview !== nextPreview) return;
+          mixer.removeEventListener('finished', onFinished);
+          nextPreview.mixerFinishedHandlers = nextPreview.mixerFinishedHandlers
+            .filter((handler) => handler !== onFinished);
+          this.startSourceResetPreview(slot, playback);
+        };
+        mixer.addEventListener('finished', onFinished);
+        nextPreview.mixerFinishedHandlers.push(onFinished);
       }
-      action.play();
-      if (action.paused) this.mixer.update(0);
+      if (previous) {
+        for (const handler of previous.mixerFinishedHandlers || []) mixer.removeEventListener('finished', handler);
+        previous.mixerFinishedHandlers = [];
+        startActive();
+        const duration = Math.max(0, playback.transitionMs) / 1000;
+        if (duration > 0 && previous.currentAction) {
+          previous.currentAction.crossFadeTo(action, duration, false);
+          let timer = null;
+          timer = setTimeout(() => {
+            previous.currentAction?.stop();
+            nextPreview.transitionTimers.delete(timer);
+          }, playback.transitionMs + 34);
+          nextPreview.transitionTimers.add(timer);
+        } else {
+          previous.currentAction?.stop();
+        }
+        this.bindingPreview = nextPreview;
+        return;
+      }
+      this.bindingPreview = nextPreview;
+      const enter = phase === 'on'
+        ? enterThreeClip(this.model, clip, playback.transitionMs, `BYD_EVT_${slot.id}_ENTER`)
+        : null;
+      if (enter) {
+        const enterAction = mixer.clipAction(enter);
+        nextPreview.currentAction = enterAction;
+        nextPreview.currentClip = enter;
+        enterAction.setLoop(THREE.LoopOnce, 1);
+        enterAction.clampWhenFinished = true;
+        const onFinished = (event) => {
+          if (event.action !== enterAction || this.mixer !== mixer) return;
+          mixer.removeEventListener('finished', onFinished);
+          nextPreview.mixerFinishedHandlers = nextPreview.mixerFinishedHandlers
+            .filter((handler) => handler !== onFinished);
+          startActive();
+          nextPreview.currentAction = action;
+          nextPreview.currentClip = clip;
+          enterAction.stop();
+        };
+        mixer.addEventListener('finished', onFinished);
+        this.bindingPreview.mixerFinishedHandlers.push(onFinished);
+        enterAction.reset().play();
+      } else {
+        startActive();
+      }
       return;
     }
+    this.stopBindingPreview();
     const selectionNodes = (params.selection?.groups || []).map((group) => group.nodeIndex);
     const targetIndices = selectionNodes.length ? [...new Set(selectionNodes)] : (params.nodeIndices || []);
     const targets = targetIndices.flatMap((i) => this.meshesOfNode(i));
@@ -1060,41 +1287,74 @@ export class ModelPreview {
   }
 
   /** 车机模式直接播放最终 GLB 中导出的节点和动画，不再依赖原模型节点下标。 */
+  startExportedResetPreview(slot, playback, phaseIndex = null) {
+    const current = this.bindingPreview?.sourceEvent && this.bindingPreview.eventId === slot.id
+      ? this.bindingPreview
+      : null;
+    if (!current || !this.mixer || !(playback.transitionMs > 0)) {
+      this.stopBindingPreview();
+      return false;
+    }
+    const sourceDuration = current.currentClip?.duration || 0;
+    const sourceTime = current.currentAction?.time || 0;
+    const progress = sourceDuration > 0
+      ? ((sourceTime % sourceDuration) + sourceDuration) % sourceDuration / sourceDuration
+      : 0;
+    const index = phaseIndex === null
+      ? Math.min(3, Math.max(0, Math.round(progress * 3)))
+      : Math.min(3, Math.max(0, phaseIndex));
+    const clip = this.loadedAnimations.find(
+      (animation) => animation.name === `BYD_RST_${slot.id}_P${index}`,
+    );
+    if (!clip) {
+      this.stopBindingPreview();
+      return false;
+    }
+    const mixer = this.mixer;
+    for (const handler of current.mixerFinishedHandlers || []) mixer.removeEventListener('finished', handler);
+    current.mixerFinishedHandlers = [];
+    current.currentAction?.stop();
+    const action = mixer.clipAction(clip);
+    action.setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+    current.currentAction = action;
+    current.currentClip = clip;
+    const onFinished = (event) => {
+      if (event.action !== action || this.mixer !== mixer || this.bindingPreview !== current) return;
+      mixer.removeEventListener('finished', onFinished);
+      current.mixerFinishedHandlers = current.mixerFinishedHandlers
+        .filter((handler) => handler !== onFinished);
+      this.stopBindingPreview();
+    };
+    mixer.addEventListener('finished', onFinished);
+    current.mixerFinishedHandlers.push(onFinished);
+    action.reset().play();
+    return true;
+  }
+
   previewExportedBinding(slot, params, phase = 'on') {
     // 其他模型导出时保留完整骨架，并统一用 CS_Car 作为事件部件；
     // 车辆模式仍然使用各槽位自己的 CS_* 节点。
     const isSourceAnimation = Number.isInteger(params.sourceAnimationIndex);
+    const playback = normalizeOtherPlayback(slot, params.playback);
+    if (isSourceAnimation && phase === 'off' && playback.endMode === 'reset') {
+      this.startExportedResetPreview(slot, playback);
+      return true;
+    }
+    const previous = isSourceAnimation && phase === 'on' && this.bindingPreview?.sourceEvent
+      && this.bindingPreview.eventId !== slot.id && this.mixer
+      ? this.bindingPreview
+      : null;
+    if (!previous) this.stopBindingPreview();
     const exportedRootName = isSourceAnimation ? 'CS_Car' : slot.id;
     const nodeIndex = this.gltfJson?.nodes?.findIndex((node) => node.name === exportedRootName) ?? -1;
-    if (nodeIndex < 0) return false;
+    if (nodeIndex < 0) return isSourceAnimation;
     const target = this.nodeObjects?.[nodeIndex];
     const meshes = this.meshesOfNode(nodeIndex);
     // CS_Car 可能只是骨架/控制根，没有直接 mesh；只要节点存在即可交给
     // AnimationMixer 驱动其整个子树。
-    if (!target || (!isSourceAnimation && meshes.length === 0)) return false;
+    if (!target || (!isSourceAnimation && meshes.length === 0)) return isSourceAnimation;
 
-    const materialRestores = [];
-    if (!isSourceAnimation && (slot.kind === 'lamp' || slot.kind === 'blink')) {
-      for (const mesh of meshes) {
-        const original = mesh.material;
-        const originals = Array.isArray(original) ? original : [original];
-        const replacements = originals.map(() => makeLitMaterial(params.color || slot.color));
-        mesh.material = Array.isArray(original) ? replacements : replacements[0];
-        materialRestores.push({ mesh, original, replacements });
-      }
-    }
-
-    this.bindingPreview = {
-      deviceTarget: {
-        object: target,
-        position: target.position.clone(),
-        quaternion: target.quaternion.clone(),
-        scale: target.scale.clone(),
-      },
-      materialRestores,
-    };
-
-    const playback = normalizeOtherPlayback(slot, params.playback);
     const activeAnimationName = `BYD_EVT_${slot.id}_${playback.mode === 'pingpong' ? 'PINGPONG' : playback.mode === 'loop' ? 'LOOP' : 'ON'}`;
     const expectedEventAnimation = phase === 'off'
       ? (playback.endMode === 'reverse'
@@ -1111,42 +1371,158 @@ export class ModelPreview {
     const clip = animationName
       ? this.loadedAnimations.find((animation) => animation.name === animationName)
       : null;
+    // 车机质感只能播放最终导出的动画。缓存异常时保留上一动作，不能拿
+    // 原模型的动画下标去误播导出 GLB 中的另一段动画。
     if (!clip) return true;
 
-    this.mixer = new THREE.AnimationMixer(this.model);
+    const materialRestores = [];
+    if (!isSourceAnimation && (slot.kind === 'lamp' || slot.kind === 'blink')) {
+      for (const mesh of meshes) {
+        const original = mesh.material;
+        const originals = Array.isArray(original) ? original : [original];
+        const replacements = originals.map(() => makeLitMaterial(params.color || slot.color));
+        mesh.material = Array.isArray(original) ? replacements : replacements[0];
+        materialRestores.push({ mesh, original, replacements });
+      }
+    }
+
+    const nextPreview = {
+      sourceEvent: isSourceAnimation,
+      eventId: isSourceAnimation ? slot.id : null,
+      currentAction: null,
+      currentClip: null,
+      deviceTarget: previous?.deviceTarget || {
+        object: target,
+        position: target.position.clone(),
+        quaternion: target.quaternion.clone(),
+        scale: target.scale.clone(),
+      },
+      materialRestores,
+      mixerFinishedHandlers: [],
+      transitionTimers: previous?.transitionTimers || new Set(),
+    };
+
+    if (!this.mixer) this.mixer = new THREE.AnimationMixer(this.model);
     const action = this.mixer.clipAction(clip);
+    const mixer = this.mixer;
+    if (previous) {
+      for (const handler of previous.mixerFinishedHandlers || []) mixer.removeEventListener('finished', handler);
+      previous.mixerFinishedHandlers = [];
+    }
+    this.bindingPreview = nextPreview;
+    const registerFinished = (handler) => {
+      mixer.addEventListener('finished', handler);
+      nextPreview.mixerFinishedHandlers.push(handler);
+    };
+    const unregisterFinished = (handler) => {
+      mixer.removeEventListener('finished', handler);
+      nextPreview.mixerFinishedHandlers = nextPreview.mixerFinishedHandlers
+        .filter((candidate) => candidate !== handler);
+    };
+    const startActive = () => {
+      action.reset().play();
+      nextPreview.currentAction = action;
+      nextPreview.currentClip = clip;
+    };
     if (isSourceAnimation) {
       const isLoop = (phase === 'on' && ['loop', 'pingpong'].includes(playback.mode))
         || (phase === 'off' && playback.endMode === 'hold');
       action.setLoop(isLoop ? THREE.LoopRepeat : THREE.LoopOnce, isLoop ? Infinity : 1);
       action.clampWhenFinished = phase === 'on' ? playback.mode === 'hold' : false;
-
-      if (phase === 'off' && playback.endMode === 'finish') {
-        const holdName = `BYD_EVT_${slot.id}_HOLD`;
-        const holdClip = this.loadedAnimations.find((animation) => animation.name === holdName);
-        const mixer = this.mixer;
-        const onFinished = (event) => {
-          if (event.action !== action || this.mixer !== mixer) return;
-          mixer.removeEventListener('finished', onFinished);
-          if (!holdClip) return;
-          const holdAction = mixer.clipAction(holdClip);
-          holdAction.setLoop(THREE.LoopRepeat, Infinity);
-          holdAction.reset().play();
-        };
-        mixer.addEventListener('finished', onFinished);
-        this.bindingPreview.mixerFinishedHandler = onFinished;
-      }
     } else {
       action.setLoop(['hinge', 'scale'].includes(actionKindOf(slot, params)) ? THREE.LoopPingPong : THREE.LoopRepeat, Infinity);
     }
-    action.reset().play();
+    if ((isSourceAnimation && phase === 'on' && playback.mode === 'once')
+      || (isSourceAnimation && phase === 'off' && playback.endMode === 'reverse')) {
+      const resetPhase = phase === 'off' ? 0 : 3;
+      const onFinished = (event) => {
+        if (event.action !== action || this.mixer !== mixer || this.bindingPreview !== nextPreview) return;
+        unregisterFinished(onFinished);
+        this.startExportedResetPreview(slot, playback, resetPhase);
+      };
+      registerFinished(onFinished);
+    }
+    let pairTransitionClip = null;
+    if (previous && playback.transitionMs > 0) {
+      const sourceClip = previous.currentClip;
+      const sourceAction = previous.currentAction;
+      const progress = sourceClip?.duration > 0 && sourceAction
+        ? ((sourceAction.time % sourceClip.duration) + sourceClip.duration) % sourceClip.duration / sourceClip.duration
+        : 0;
+      const phaseIndex = Math.min(3, Math.max(0, Math.round(progress * 3)));
+      pairTransitionClip = this.loadedAnimations.find(
+        (animation) => animation.name === `BYD_TR_${previous.eventId}_${slot.id}_P${phaseIndex}`,
+      ) || null;
+    }
+    if (pairTransitionClip) {
+      previous.currentAction?.stop();
+      const transitionAction = mixer.clipAction(pairTransitionClip);
+      nextPreview.currentAction = transitionAction;
+      nextPreview.currentClip = pairTransitionClip;
+      transitionAction.setLoop(THREE.LoopOnce, 1);
+      transitionAction.clampWhenFinished = true;
+      const onFinished = (event) => {
+        if (event.action !== transitionAction || this.mixer !== mixer) return;
+        unregisterFinished(onFinished);
+        startActive();
+        transitionAction.stop();
+      };
+      registerFinished(onFinished);
+      transitionAction.reset().play();
+      return true;
+    }
+    if (isSourceAnimation && phase === 'off' && playback.endMode === 'finish') {
+      const holdName = `BYD_EVT_${slot.id}_HOLD`;
+      const holdClip = this.loadedAnimations.find((animation) => animation.name === holdName);
+      const onFinished = (event) => {
+        if (event.action !== action || this.mixer !== mixer) return;
+        unregisterFinished(onFinished);
+        if (!holdClip) return;
+        const holdAction = mixer.clipAction(holdClip);
+        holdAction.setLoop(THREE.LoopRepeat, Infinity);
+        holdAction.reset().play();
+        nextPreview.currentAction = holdAction;
+        nextPreview.currentClip = holdClip;
+      };
+      registerFinished(onFinished);
+    }
+    if (previous) previous.currentAction?.stop();
+    const enterClip = isSourceAnimation && phase === 'on' && playback.transitionMs > 0
+      ? this.loadedAnimations.find((animation) => animation.name === `BYD_EVT_${slot.id}_ENTER`)
+      : null;
+    if (enterClip) {
+      const enterAction = mixer.clipAction(enterClip);
+      nextPreview.currentAction = enterAction;
+      nextPreview.currentClip = enterClip;
+      enterAction.setLoop(THREE.LoopOnce, 1);
+      enterAction.clampWhenFinished = true;
+      const onFinished = (event) => {
+        if (event.action !== enterAction || this.mixer !== mixer) return;
+        unregisterFinished(onFinished);
+        startActive();
+        enterAction.stop();
+      };
+      registerFinished(onFinished);
+      enterAction.reset().play();
+    } else {
+      startActive();
+    }
     return true;
   }
 
   stopBindingPreview() {
+    if (this.bindingPreview?.transitionTimer) {
+      clearTimeout(this.bindingPreview.transitionTimer);
+      this.bindingPreview.transitionTimer = null;
+    }
+    for (const timer of this.bindingPreview?.transitionTimers || []) {
+      clearTimeout(timer);
+    }
+    this.bindingPreview?.transitionTimers?.clear();
     if (this.mixer) {
-      if (this.bindingPreview?.mixerFinishedHandler) {
-        this.mixer.removeEventListener('finished', this.bindingPreview.mixerFinishedHandler);
+      const handlers = this.bindingPreview?.mixerFinishedHandlers || [];
+      for (const handler of handlers) {
+        this.mixer.removeEventListener('finished', handler);
       }
       this.mixer.stopAllAction();
       this.mixer = null;
@@ -1578,6 +1954,7 @@ export class ModelPreview {
     }
     this.scene.add(this.model);
     this.deviceMode = enabled;
+    this.syncModelShadowVisibility();
     this.autoShadow.visible = false;
     this.exportTransform = enabled && exportTransform ? structuredClone(exportTransform) : null;
     const rig = this.lightRig[enabled ? 'device' : 'web'];

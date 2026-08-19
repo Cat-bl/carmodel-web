@@ -200,6 +200,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .field input, .field select, .part-tools input { width: 100%; min-height: 36px; padding: 7px 9px; color: var(--ink); border: 1px solid var(--line-strong); border-radius: 5px; background: #11161a; }
 .field input:disabled { color: var(--ink-3); background: var(--surface-2); }
 .field input[type="color"] { padding: 3px; }
+.setting-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 42px; margin-top: 4px; color: var(--ink-2); font-size: 11px; cursor: pointer; }
+.setting-switch input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
+.setting-switch-track { position: relative; width: 36px; height: 20px; flex: none; border: 1px solid #46535a; border-radius: 10px; background: #11161a; transition: border-color .16s ease, background .16s ease; }
+.setting-switch-track > span { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #7f8d94; transition: transform .16s ease, background .16s ease; }
+.setting-switch input:checked + .setting-switch-track { border-color: #3999a8; background: #237f90; }
+.setting-switch input:checked + .setting-switch-track > span { background: #f5fbfc; transform: translateX(16px); }
+.setting-switch input:focus-visible + .setting-switch-track { outline: 2px solid rgba(91, 189, 202, .28); outline-offset: 2px; }
+.setting-switch input:disabled + .setting-switch-track { opacity: .42; cursor: not-allowed; }
 .quick-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 36px; padding: 7px 11px; color: var(--ink); border: 1px solid var(--line-strong); border-radius: 5px; background: #20262b; font-size: 12px; cursor: pointer; }
 .btn:hover { border-color: #4a9eab; background: #26343a; }
@@ -257,6 +265,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .other-playback-grid select { width: 100%; min-height: 36px; color: var(--ink); border: 1px solid #3a464d; background: #171e22; border-radius: 5px; }
 .other-playback-grid select:focus { border-color: var(--brand); outline: 2px solid rgba(91, 189, 202, .14); outline-offset: 1px; }
 .playback-end-field { grid-column: 1 / -1; }
+.playback-behavior { display: flex; align-items: center; min-height: 34px; padding: 8px 10px; color: #9eacb2; border: 1px solid #303a3f; background: #151c20; border-radius: 5px; font-size: 10px; line-height: 1.55; }
+.playback-behavior.warning { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 9px; color: #f2d190; border-color: #705728; background: rgba(97, 68, 20, .28); }
+.playback-behavior-copy { display: grid; min-width: 0; gap: 2px; }
+.playback-behavior-copy strong { color: #ffd887; font-size: 11px; }
+.playback-behavior-copy span { color: #d8c39b; }
+.playback-behavior.warning .btn { align-self: center; min-height: 32px; color: #ffe3a5; border-color: #80652f; background: #3b2d15; white-space: normal; }
+.playback-behavior.warning .btn:hover { border-color: #b68b3b; background: #4a3819; }
+.playback-behavior.warning .btn svg { width: 13px; height: 13px; }
 .playback-advanced { border-top: 1px solid #2b353a; }
 .playback-advanced summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 36px; color: #aebbc1; cursor: pointer; list-style: none; font-size: 10px; }
 .playback-advanced summary::-webkit-details-marker { display: none; }
@@ -265,7 +281,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .playback-advanced summary span { margin-right: auto; font-weight: 700; }
 .playback-advanced summary small { color: #75858d; font-size: 9px; font-variant-numeric: tabular-nums; }
 .playback-advanced-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; padding: 2px 0 9px 15px; }
-.playback-advanced-grid .field:first-child { grid-column: 1 / -1; }
 .playback-advanced-grid input { width: 100%; min-height: 35px; color: var(--ink); border: 1px solid #3a464d; background: #171e22; border-radius: 5px; }
 .input-suffix { position: relative; }
 .input-suffix input { padding-right: 25px; }
@@ -430,6 +445,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
   .field-grid { gap: 6px; }
   .source-tabs .btn { padding-inline: 5px; }
   .quality-presets { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .playback-behavior.warning { grid-template-columns: 1fr; }
+  .playback-behavior.warning .btn { width: 100%; }
   .quality-presets button { min-height: 34px; font-size: 11px; }
   .generate-dialog { align-items: end; padding: 0; }
   .generate-dialog-panel { width: 100%; border-right: 0; border-bottom: 0; border-left: 0; border-radius: 7px 7px 0 0; padding-bottom: env(safe-area-inset-bottom); }

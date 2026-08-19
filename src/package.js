@@ -8,7 +8,7 @@ import {
   normalizeOtherPlayback,
   parseColor,
 } from './bindings.js';
-import { createCarShadowCanvas, shadowFootprint } from './shadow.js';
+import { createCarShadowCanvas, createTransparentShadowCanvas, shadowFootprint } from './shadow.js';
 import { selectedTriangles } from './selection.js';
 
 const CARSELF_HEADER_URL = './templates/hcmodel-header.bin';
@@ -19,21 +19,37 @@ const LAMP_SLOT_IDS = new Set(
   [...SLOT_BY_ID.values()].filter((slot) => slot.kind === 'lamp' || slot.kind === 'blink').map((slot) => slot.id),
 );
 
+function isShadowNodeName(name) {
+  return /^(?:CS_Shadow|Imported_CS_Shadow)(?:[._-]|$)/.test(String(name || ''));
+}
+
+function isShadowMaterialName(name) {
+  return /^(?:CS_Shadow|Imported_CS_Shadow)(?:[._-]|$)/.test(String(name || ''));
+}
+
+function isShadowNode(json, node) {
+  if (!node) return false;
+  if (isShadowNodeName(node.name)) return true;
+  const mesh = json?.meshes?.[node.mesh];
+  return (mesh?.primitives || []).some((primitive) => (
+    isShadowMaterialName(json?.materials?.[primitive.material]?.name)
+  ));
+}
+
 export async function makeBydCar(options) {
   if (options?.modelType === 'other') return makeAnimatedOtherBydCar(options);
-  const { sourceBytes, sourceName, transform, stats, bindings, deletions, quality } = options;
+  const { sourceBytes, sourceName, transform, stats, bindings, deletions, quality, removeShadow = false } = options;
   const exportQuality = normalizeExportQuality(quality);
   const parsed = parseGlb(sourceBytes);
   const baked = await bakeMaterialsForVehicle(parsed);
   const lamps = [];
-  const normalizedState = await normalizeParsedGlb(baked, transform, bindings, lamps, deletions);
+  const normalizedState = await normalizeParsedGlb(baked, transform, bindings, lamps, deletions, removeShadow);
   await resizeEmbeddedImages(normalizedState, exportQuality.textureMaxSize);
   await simplifyMeshToTarget(normalizedState, exportQuality.triangleTarget);
   const normalized = buildGlb(normalizedState.json, normalizedState.bin);
   const outputStats = collectGlbStats(normalizedState.json);
   // 外部 CarSelf_Main.png 必须与最终 GLB 内嵌主贴图逐像素一致，原厂资源也是这个约定。
   const mainTexture = await extractMainTexture(normalizedState);
-  const shadowTexture = extractNamedTexture(normalizedState, 'CS_Shadow');
   const dat = await wrapCarSelf(normalized);
   const datHash = await sha256(dat);
   const glbHash = await sha256(normalized);
@@ -44,6 +60,7 @@ export async function makeBydCar(options) {
     name: sourceName.replace(/\.glb$/i, ''),
     generator: 'byd-car-converter-web/0.1.0',
     target: 'lane-car-v1',
+    shadow: { removed: Boolean(removeShadow) },
     model: {
       path: 'payload/CarSelf.dat',
       size: dat.byteLength,
@@ -60,7 +77,12 @@ export async function makeBydCar(options) {
 
   const files = [
     { path: 'payload/Texture/CarSelf_Main.png', bytes: mainTexture.bytes },
-    { path: 'payload/Texture/CS_Shadow.png', bytes: shadowTexture.bytes },
+    {
+      path: 'payload/Texture/CS_Shadow.png',
+      bytes: removeShadow
+        ? await makeTransparentShadowTexture()
+        : extractNamedTexture(normalizedState, 'CS_Shadow').bytes,
+    },
   ];
   // 每个灯位随包附带一张纯色贴图，车机点亮时按 CS_XXX.png 取用
   for (const lamp of lamps) {
@@ -92,7 +114,7 @@ export async function makeBydCar(options) {
 }
 
 async function makeAnimatedOtherBydCar({
-  sourceBytes, sourceName, transform, stats, bindings, deletions, quality,
+  sourceBytes, sourceName, transform, stats, bindings, deletions, quality, removeShadow = false,
 }) {
   const exportQuality = normalizeExportQuality(quality);
   const parsed = parseGlb(sourceBytes);
@@ -101,7 +123,7 @@ async function makeAnimatedOtherBydCar({
   }
   const baked = await bakeMaterialsForVehicle(parsed);
   const { state, eventBindings } = await normalizeAnimatedOtherGlb(
-    baked, transform, bindings, deletions,
+    baked, transform, bindings, deletions, removeShadow,
   );
   await resizeEmbeddedImages(state, exportQuality.textureMaxSize);
   const simplified = await simplifyMeshToTarget(state, exportQuality.triangleTarget);
@@ -115,7 +137,6 @@ async function makeAnimatedOtherBydCar({
   const normalized = buildGlb(state.json, state.bin);
   const outputStats = collectGlbStats(state.json);
   const mainTexture = await extractMainTexture(state);
-  const shadowTexture = extractNamedTexture(state, 'CS_Shadow');
   const dat = await wrapCarSelf(normalized);
   const datHash = await sha256(dat);
   const glbHash = await sha256(normalized);
@@ -126,6 +147,7 @@ async function makeAnimatedOtherBydCar({
     name: sourceName.replace(/\.(?:glb|gltf|fbx|obj|zip)$/i, ''),
     generator: 'byd-car-converter-web/0.1.0',
     target: 'lane-car-v1',
+    shadow: { removed: Boolean(removeShadow) },
     eventBindings,
     model: {
       path: 'payload/CarSelf.dat',
@@ -150,7 +172,12 @@ async function makeAnimatedOtherBydCar({
   }
   const files = [
     { path: 'payload/Texture/CarSelf_Main.png', bytes: mainTexture.bytes },
-    { path: 'payload/Texture/CS_Shadow.png', bytes: shadowTexture.bytes },
+    {
+      path: 'payload/Texture/CS_Shadow.png',
+      bytes: removeShadow
+        ? await makeTransparentShadowTexture()
+        : extractNamedTexture(state, 'CS_Shadow').bytes,
+    },
   ];
   manifest.resources = [];
   for (const file of files) {
@@ -1775,6 +1802,195 @@ function holdAnimationClip(state, source, name) {
   return output;
 }
 
+/**
+ * 从模型静态姿态平滑进入事件动画首帧。过渡单独导出，避免循环动画每轮
+ * 都重复播放过渡；地图端播放完成后会无缝切到原有 ON/LOOP 动画。
+ */
+function enterAnimationClip(state, source, name, durationMs) {
+  const duration = Math.max(0, Number(durationMs) || 0) / 1000;
+  if (!(duration > 0)) return null;
+  const frameCount = 8;
+  const times = new Float32Array(frameCount);
+  for (let frame = 0; frame < frameCount; frame++) {
+    times[frame] = duration * frame / (frameCount - 1);
+  }
+  const output = { name, samplers: [], channels: [] };
+  for (const channel of source.channels || []) {
+    const target = channel.target || {};
+    const path = target.path;
+    const sampler = source.samplers?.[channel.sampler];
+    const values = readAccessorData(state, sampler?.output);
+    const node = state.json.nodes?.[target.node];
+    const components = path === 'rotation' ? 4 : 3;
+    if (!node || !values || values.comps !== components || values.data.length < components) {
+      throw new Error(`${name}：无法生成进入过渡`);
+    }
+    const start = path === 'translation'
+      ? Array.from(node.translation || [0, 0, 0], Number)
+      : path === 'rotation'
+        ? quatNormalize(Array.from(node.rotation || [0, 0, 0, 1], Number))
+        : Array.from(node.scale || [1, 1, 1], Number);
+    const end = Array.from(values.data.slice(0, components), Number);
+    const normalizedEnd = path === 'rotation' ? quatNormalize(end) : end;
+    if (![...start, ...normalizedEnd].every(Number.isFinite)) {
+      throw new Error(`${name}：进入过渡包含无效数值`);
+    }
+    const samples = new Float32Array(frameCount * components);
+    for (let frame = 0; frame < frameCount; frame++) {
+      const progress = frame / (frameCount - 1);
+      const eased = progress * progress * (3 - 2 * progress);
+      const value = path === 'rotation'
+        ? quatSlerp(start, normalizedEnd, eased)
+        : start.map((item, index) => item + (normalizedEnd[index] - item) * eased);
+      samples.set(value, frame * components);
+    }
+    const samplerIndex = output.samplers.length;
+    output.samplers.push({
+      input: writeAccessor(state, times, 5126, 'SCALAR', { min: [0], max: [duration] }),
+      output: writeAccessor(state, samples, 5126, values.accessor.type),
+      interpolation: 'LINEAR',
+    });
+    output.channels.push({ sampler: samplerIndex, target: { node: target.node, path } });
+  }
+  return output.channels.length ? output : null;
+}
+
+// 固定四个来源相位，地图端无需读取原生动画进度也能选择最接近的一段。
+const EVENT_TRANSITION_PHASES = [0, 1 / 3, 2 / 3, 1];
+function restAnimationValue(node, path) {
+  if (path === 'translation') return Array.from(node?.translation || [0, 0, 0], Number);
+  if (path === 'rotation') return quatNormalize(Array.from(node?.rotation || [0, 0, 0, 1], Number));
+  return Array.from(node?.scale || [1, 1, 1], Number);
+}
+
+/** 采样一段已经按用户设置裁剪、变速后的动画姿态。 */
+function animationPoseAt(state, animation, ratio) {
+  const pose = new Map();
+  const duration = animationDurationOf(state, animation);
+  const time = duration * Math.min(1, Math.max(0, Number(ratio) || 0));
+  for (const channel of animation?.channels || []) {
+    const target = channel.target || {};
+    const sampler = animation.samplers?.[channel.sampler];
+    const input = readAccessorData(state, sampler?.input);
+    const output = readAccessorData(state, sampler?.output);
+    const path = target.path;
+    if (!Number.isInteger(target.node) || !['translation', 'rotation', 'scale'].includes(path)
+      || !input || !output || !input.data.length) continue;
+    const value = sampleAnimationValue(input, output, path, time, sampler.interpolation || 'LINEAR');
+    pose.set(`${target.node}:${path}`, {
+      node: target.node,
+      path,
+      type: output.accessor.type,
+      value: path === 'rotation' ? quatNormalize(value) : value,
+    });
+  }
+  return pose;
+}
+
+/**
+ * 生成“来源事件当前姿态 -> 目标事件首帧”的动画。来源与目标的轨道不必完全
+ * 相同：缺失的一侧自动使用节点静态姿态，避免切换时某些骨骼突然复位。
+ */
+function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
+  const duration = Math.max(0, Number(durationMs) || 0) / 1000;
+  if (!(duration > 0)) return null;
+  const frameCount = 6;
+  const times = new Float32Array(frameCount);
+  for (let frame = 0; frame < frameCount; frame++) {
+    times[frame] = duration * frame / (frameCount - 1);
+  }
+  const timeAccessor = writeAccessor(state, times, 5126, 'SCALAR', { min: [0], max: [duration] });
+  const output = { name, samplers: [], channels: [] };
+  const keys = new Set([...sourcePose.keys(), ...targetPose.keys()]);
+  for (const key of keys) {
+    const source = sourcePose.get(key);
+    const target = targetPose.get(key);
+    const descriptor = target || source;
+    const node = state.json.nodes?.[descriptor?.node];
+    if (!descriptor || !node) continue;
+    const path = descriptor.path;
+    const start = source?.value || restAnimationValue(node, path);
+    const end = target?.value || restAnimationValue(node, path);
+    const components = path === 'rotation' ? 4 : 3;
+    if (start.length !== components || end.length !== components
+      || ![...start, ...end].every(Number.isFinite)) {
+      throw new Error(`${name}：事件切换过渡包含无效姿态`);
+    }
+    const normalizedStart = path === 'rotation' ? quatNormalize(start) : start;
+    const normalizedEnd = path === 'rotation' ? quatNormalize(end) : end;
+    const samples = new Float32Array(frameCount * components);
+    for (let frame = 0; frame < frameCount; frame++) {
+      const progress = frame / (frameCount - 1);
+      const eased = progress * progress * (3 - 2 * progress);
+      const value = path === 'rotation'
+        ? quatSlerp(normalizedStart, normalizedEnd, eased)
+        : normalizedStart.map((item, index) => item + (normalizedEnd[index] - item) * eased);
+      samples.set(value, frame * components);
+    }
+    const samplerIndex = output.samplers.length;
+    output.samplers.push({
+      input: timeAccessor,
+      output: writeAccessor(state, samples, 5126, descriptor.type || (path === 'rotation' ? 'VEC4' : 'VEC3')),
+      interpolation: 'LINEAR',
+    });
+    output.channels.push({ sampler: samplerIndex, target: { node: descriptor.node, path } });
+  }
+  return output.channels.length ? output : null;
+}
+
+function eventTransitionSet(state, sourceEvent, targetEvent) {
+  const durationMs = targetEvent.playback.transitionMs;
+  if (!(durationMs > 0)) return null;
+  const phases = EVENT_TRANSITION_PHASES;
+  const targetPose = animationPoseAt(state, targetEvent.active, 0);
+  const animations = [];
+  for (let index = 0; index < phases.length; index++) {
+    const name = `BYD_TR_${sourceEvent.slot.id}_${targetEvent.slot.id}_P${index}`;
+    const animation = poseTransitionClip(
+      state,
+      animationPoseAt(state, sourceEvent.active, phases[index]),
+      targetPose,
+      name,
+      durationMs,
+    );
+    if (animation) animations.push(animation);
+  }
+  if (!animations.length) return null;
+  return {
+    animations,
+    spec: {
+      animations: animations.map((animation) => animation.name),
+      durationMs,
+    },
+  };
+}
+
+/** 为事件的四个代表相位生成“当前动作姿态 -> 模型静态默认姿态”的退出过渡。 */
+function eventResetSet(state, event) {
+  const durationMs = event.playback.transitionMs;
+  if (!(durationMs > 0)) return null;
+  const animations = [];
+  for (let index = 0; index < EVENT_TRANSITION_PHASES.length; index++) {
+    const name = `BYD_RST_${event.slot.id}_P${index}`;
+    const animation = poseTransitionClip(
+      state,
+      animationPoseAt(state, event.active, EVENT_TRANSITION_PHASES[index]),
+      new Map(),
+      name,
+      durationMs,
+    );
+    if (animation) animations.push(animation);
+  }
+  if (!animations.length) return null;
+  return {
+    animations,
+    spec: {
+      animations: animations.map((animation) => animation.name),
+      durationMs,
+    },
+  };
+}
+
 function eventAnimationSet(state, source, slot, binding) {
   const playback = normalizeOtherPlayback(slot, binding?.playback);
   const base = `BYD_EVT_${slot.id}`;
@@ -1787,6 +2003,7 @@ function eventAnimationSet(state, source, slot, binding) {
   if (mode === 'pingpong') active = pingPongAnimationClip(state, active, `${base}_PINGPONG`);
   const on = structuredClone(active);
   on.name = `${base}_${mode === 'loop' || mode === 'pingpong' ? (mode === 'pingpong' ? 'PINGPONG' : 'LOOP') : 'ON'}`;
+  const enter = enterAnimationClip(state, active, `${base}_ENTER`, playback.transitionMs);
   const oneWay = animationDurationOf(state, trimmed);
   const activeDuration = animationDurationOf(state, active);
   const needHold = playback.mode === 'hold' || ['hold', 'finish'].includes(playback.endMode);
@@ -1794,7 +2011,9 @@ function eventAnimationSet(state, source, slot, binding) {
   const off = playback.endMode === 'reverse'
     ? reverseAnimationClip(state, active, `${base}_OFF`)
     : null;
+  const reset = eventResetSet(state, { slot, active, playback });
   const spec = {
+    enter: enter?.name || '',
     on: on.name,
     off: off?.name || '',
     hold: hold?.name || '',
@@ -1803,16 +2022,31 @@ function eventAnimationSet(state, source, slot, binding) {
     onRepeat: playback.mode === 'once' || playback.mode === 'hold' ? 1 : -1,
     offRepeat: 1,
     onDurationMs: Math.max(1, Math.round(activeDuration * 1000)),
+    enterDurationMs: enter ? playback.transitionMs : 0,
     offDurationMs: Math.max(1, Math.round(animationDurationOf(state, off || active) * 1000)),
     cycleDurationMs: Math.max(1, Math.round((playback.mode === 'pingpong' ? activeDuration : oneWay) * 1000)),
+    transitionDurationMs: playback.transitionMs,
+    transitionPhases: EVENT_TRANSITION_PHASES.length,
     activeEnd: playback.mode === 'hold' ? 'hold' : playback.mode === 'once' ? 'reset' : 'none',
     endMode: playback.endMode,
+    ...(reset ? { reset: reset.spec } : {}),
     playback,
   };
-  return { animations: [on, ...(off ? [off] : []), ...(hold ? [hold] : [])], spec };
+  return {
+    animations: [
+      ...(enter ? [enter] : []),
+      on,
+      ...(off ? [off] : []),
+      ...(hold ? [hold] : []),
+      ...(reset?.animations || []),
+    ],
+    spec,
+    active,
+    playback,
+  };
 }
 
-async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions) {
+async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions, removeShadow = false) {
   const state = { json: structuredClone(parsed.json), bin: parsed.bin };
   const { json } = state;
   const sceneIndex = Number.isInteger(json.scene) ? json.scene : 0;
@@ -1824,7 +2058,7 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions)
   for (let nodeIndex = 0; nodeIndex < (json.nodes || []).length; nodeIndex++) {
     const node = json.nodes[nodeIndex];
     if (node.name === 'CS_Car') node.name = 'Imported_CS_Car';
-    if (node.name === 'CS_Shadow') {
+    if (isShadowNode(json, node)) {
       node.name = 'Imported_CS_Shadow';
       detachNode(json, sourceRoots, nodeIndex);
     }
@@ -1836,6 +2070,7 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions)
 
   const outputAnimations = [];
   const eventBindings = {};
+  const eventRecords = [];
   for (const binding of bindings || []) {
     const slot = SLOT_BY_ID.get(binding.slotId);
     const source = sourceAnimations[binding.sourceAnimationIndex];
@@ -1843,20 +2078,36 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions)
     validateAnimatedOtherClip(state, source, slot);
     const event = eventAnimationSet(state, source, slot, binding);
     outputAnimations.push(...event.animations);
-    const spec = event.spec;
+    eventRecords.push({ slot, binding, ...event });
+  }
+
+  // 为每一对已绑定事件生成切换过渡。过渡时长取目标事件的设置，因此用户
+  // 可以单独控制“切入左转”与“恢复前进”的速度。
+  for (const target of eventRecords) {
+    const transitions = {};
+    for (const source of eventRecords) {
+      if (source.slot.id === target.slot.id) continue;
+      const transition = eventTransitionSet(state, source, target);
+      if (!transition) continue;
+      outputAnimations.push(...transition.animations);
+      transitions[source.slot.id] = transition.spec;
+    }
+    const spec = target.spec;
     const { playback, ...eventSpec } = spec;
-    eventBindings[slot.id] = {
+    eventBindings[target.slot.id] = {
       part: 'CS_Car',
       ...eventSpec,
-      ...(slot.id === 'CS_Idle' ? {
-        triggerDelayMs: normalizeIdleDelaySeconds(binding.triggerDelaySeconds) * 1000,
+      ...(Object.keys(transitions).length ? { transitions } : {}),
+      ...(target.slot.id === 'CS_Idle' ? {
+        triggerDelayMs: normalizeIdleDelaySeconds(target.binding.triggerDelaySeconds) * 1000,
       } : {}),
     };
   }
   json.animations = outputAnimations.length ? outputAnimations : undefined;
 
-  const modelBounds = boundsOfOutputGeometry(state, sourceRoots, [], bake);
-  const shadowIndex = await addAutomaticShadow(state, modelBounds);
+  const shadowIndex = removeShadow
+    ? null
+    : await addAutomaticShadow(state, boundsOfOutputGeometry(state, sourceRoots, [], bake));
   const rootIndex = json.nodes.length;
   json.nodes.push({
     name: 'CS_Car',
@@ -1865,7 +2116,7 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions)
     rotation: transform?.rotation || [0, 0, 0, 1],
     scale: transform?.scale || [1, 1, 1],
   });
-  json.scenes = [{ name: 'Scene', nodes: [rootIndex, shadowIndex] }];
+  json.scenes = [{ name: 'Scene', nodes: [rootIndex, ...(shadowIndex === null ? [] : [shadowIndex])] }];
   json.scene = 0;
   json.cameras = undefined;
   json.lights = undefined;
@@ -2079,7 +2330,7 @@ function collectGlbStats(json) {
 }
 
 
-async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletions) {
+async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletions, removeShadow = false) {
   const state = { json: structuredClone(parsed.json), bin: parsed.bin };
   const { json } = state;
   const oldScene = Number.isInteger(json.scene) ? json.scene : 0;
@@ -2091,11 +2342,11 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
   const sourceRoots = [...(scene.nodes || [])];
   for (const node of json.nodes) {
     if (node.name === 'CS_Car') node.name = 'CS_Car_Imported';
-    if (node.name === 'CS_Shadow') node.name = 'CS_Shadow_Imported';
+    if (isShadowNode(json, node)) node.name = 'CS_Shadow_Imported';
     delete node.camera;
   }
   // 一旦输入包自带阴影，统一换成按当前车身轮廓重建的 CS_Shadow，避免两层阴影叠加。
-  for (const nodeIndex of [...sourceRoots]) {
+  for (let nodeIndex = 0; nodeIndex < json.nodes.length; nodeIndex++) {
     if (json.nodes[nodeIndex]?.name === 'CS_Shadow_Imported') detachNode(json, sourceRoots, nodeIndex);
   }
 
@@ -2127,8 +2378,9 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
   // 合并后再去重一次材质（extractPart 为每个部件创建了新材质，很多实际内容重复）
   dedupeMaterials(state);
 
-  const modelBounds = boundsOfOutputGeometry(state, sourceRoots, parts.nodeIndices, bake);
-  const shadowIndex = await addAutomaticShadow(state, modelBounds);
+  const shadowIndex = removeShadow
+    ? null
+    : await addAutomaticShadow(state, boundsOfOutputGeometry(state, sourceRoots, parts.nodeIndices, bake));
 
   const rootIndex = json.nodes.length;
   json.nodes.push({
@@ -2138,7 +2390,7 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
     rotation: transform.rotation,
     scale: transform.scale,
   });
-  json.scenes = [{ name: 'Scene', nodes: [rootIndex, shadowIndex, ...parts.nodeIndices] }];
+  json.scenes = [{ name: 'Scene', nodes: [rootIndex, ...(shadowIndex === null ? [] : [shadowIndex]), ...parts.nodeIndices] }];
   json.scene = 0;
   json.cameras = undefined;
   json.lights = undefined;
@@ -2177,7 +2429,7 @@ function boundsOfOutputGeometry(state, sourceRoots, partNodes, bake) {
     if (seen.has(`${nodeIndex}|${applyBake ? 1 : 0}`)) return;
     seen.add(`${nodeIndex}|${applyBake ? 1 : 0}`);
     const node = json.nodes?.[nodeIndex];
-    if (!node || node.name === 'CS_Shadow_Imported') return;
+    if (!node || isShadowNode(json, node)) return;
     const mesh = json.meshes?.[node.mesh];
     let world = worldMatrixOf(json, nodeIndex, parents);
     if (applyBake) world = mat4Multiply(bake, world);
@@ -2265,6 +2517,10 @@ async function addAutomaticShadow(state, bounds) {
     translation: [0, 0.012, 0],
   });
   return json.nodes.length - 1;
+}
+
+async function makeTransparentShadowTexture() {
+  return encodeCanvasPng(createTransparentShadowCanvas());
 }
 
 /**
@@ -3046,13 +3302,14 @@ export async function makeVehiclePreviewGlb(
   deletions = [],
   quality,
   modelType = 'vehicle',
+  removeShadow = false,
 ) {
   const exportQuality = normalizeExportQuality(quality);
   const parsed = parseGlb(sourceBytes);
   const baked = await bakeMaterialsForVehicle(parsed);
   const normalized = modelType === 'other'
-    ? (await normalizeAnimatedOtherGlb(baked, transform, bindings, deletions)).state
-    : await normalizeParsedGlb(baked, transform, bindings, [], deletions);
+    ? (await normalizeAnimatedOtherGlb(baked, transform, bindings, deletions, removeShadow)).state
+    : await normalizeParsedGlb(baked, transform, bindings, [], deletions, removeShadow);
   await resizeEmbeddedImages(normalized, exportQuality.textureMaxSize);
   const simplified = await simplifyMeshToTarget(normalized, exportQuality.triangleTarget);
   if (modelType === 'other' && simplified > 0) {

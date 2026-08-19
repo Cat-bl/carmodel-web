@@ -24,6 +24,14 @@ const REAR_CUES = [
   { pattern: /(?:车尾|尾灯|后灯|后保险杠|后备箱|尾门)/, weight: 5, label: '中文后部命名' },
 ];
 
+function isShadowObject(object) {
+  const materials = object?.isMesh
+    ? (Array.isArray(object.material) ? object.material : [object.material])
+    : [];
+  return /^(?:CS_Shadow|Imported_CS_Shadow)(?:[._-]|$)/.test(String(object?.name || ''))
+    || materials.some((material) => /^(?:CS_Shadow|Imported_CS_Shadow)(?:[._-]|$)/.test(String(material?.name || '')));
+}
+
 /**
  * 推断模型正面并计算对齐到车道级车头方向（-X）所需的 Y 轴旋转。
  * 部件命名是强证据；只有外形明显像车辆时，才会使用座舱偏置作低置信度推断。
@@ -50,7 +58,7 @@ function inferFromSemantics(model, box, axis) {
   const center = new THREE.Vector3();
 
   model.traverse((object) => {
-    if (!object.isMesh || object.name === 'CS_Shadow' || !object.geometry) return;
+    if (!object.isMesh || isShadowObject(object) || !object.geometry) return;
     const cues = semanticCues(object);
     if (!cues.front && !cues.rear) return;
 
@@ -145,7 +153,7 @@ function sampleModel(model) {
   const meshes = [];
   let totalVertices = 0;
   model.traverse((object) => {
-    const position = object.isMesh && object.name !== 'CS_Shadow'
+    const position = object.isMesh && !isShadowObject(object)
       ? object.geometry?.attributes?.position
       : null;
     if (!position) return;

@@ -237,6 +237,11 @@ app.innerHTML = `
                 <div class="field"><label for="target-length" id="target-length-label">车身最长边（米）</label><input id="target-length" type="number" min="0.5" max="10" step="0.1" value="5.2" disabled /></div>
                 <div class="field"><label for="height-offset">离地高度（米）</label><input id="height-offset" type="number" min="0" max="3" step="0.05" value="0" disabled /></div>
               </div>
+              <label class="setting-switch" for="remove-shadow">
+                <span>去掉模型阴影</span>
+                <input id="remove-shadow" type="checkbox" role="switch" disabled />
+                <span class="setting-switch-track" aria-hidden="true"><span></span></span>
+              </label>
             </section>
             <section class="tool-section">
               <div class="section-title"><h3>删除多余部分</h3><span id="delete-summary">未删除</span></div>
@@ -353,7 +358,7 @@ const ui = Object.fromEntries([
   'model-type-home', 'editor-shell', 'home-open-project', 'home-open-project-mobile', 'model-type-switch',
   'model-type-icon', 'model-type-label', 'editor-brand-title', 'empty-state-title', 'model-file', 'project-file', 'drop-zone', 'file-name', 'save-status', 'analysis-state', 'empty-state',
   'source-format-label',
-  'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'target-length-label', 'height-offset', 'orientation-mode-hint', 'status-list',
+  'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'target-length-label', 'height-offset', 'remove-shadow', 'orientation-mode-hint', 'status-list',
   'generate', 'mobile-generate', 'mobile-generate-shortcut', 'save-project', 'mobile-save-project',
   'open-project', 'inspector-open-project', 'reset-rotation', 'mobile-reset', 'mode-web', 'mode-device',
   'mode-web-mobile', 'mode-device-mobile',
@@ -375,6 +380,7 @@ let modelType = null;
 let dirty = false;
 let projectSaved = false;
 let activePanel = 'model';
+let removeShadow = false;
 const QUALITY_PRESETS = {
   smooth: { label: '流畅', triangleTarget: 80000, textureMaxSize: 1024 },
   balanced: { label: '均衡', triangleTarget: 160000, textureMaxSize: 2048 },
@@ -440,6 +446,7 @@ function resetWorkspaceForTypeSelection() {
   dirty = false;
   projectSaved = false;
   selectedQuality = 'original';
+  removeShadow = false;
   customQuality.triangleTarget = 300000;
   customQuality.textureMaxSize = 4096;
   deletions = [];
@@ -467,8 +474,10 @@ function resetWorkspaceForTypeSelection() {
   ui['rotation-z'].value = 0;
   ui['target-length'].value = 5.2;
   ui['height-offset'].value = 0;
+  ui['remove-shadow'].checked = false;
   preview.targetLength = 5.2;
   preview.heightOffset = 0;
+  preview.setRemoveShadow(false);
   undoStack.length = 0;
   redoStack.length = 0;
   syncUndoRedoButtons();
@@ -763,6 +772,15 @@ ui['height-offset'].addEventListener('input', () => {
   });
 });
 wireContinuousHistory(ui['height-offset'], { scope: 'model-input', field: 'height-offset' });
+ui['remove-shadow'].addEventListener('change', () => {
+  if (!current) return;
+  snapshot({ scope: 'shadow' });
+  removeShadow = ui['remove-shadow'].checked;
+  preview.setRemoveShadow(removeShadow);
+  markDevicePreviewStale();
+  setDirty();
+  refreshDevicePreviewForQuality();
+});
 ui['reset-rotation'].addEventListener('click', reset);
 ui['mobile-reset'].addEventListener('click', reset);
 
@@ -838,7 +856,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
     const previewBindings = bindingsForOutput();
     const previewDeletions = deletions.map((item) => item.region);
     const quality = exportQuality();
-    const cacheKey = JSON.stringify({ modelType, transform, bindings: previewBindings, deletions: previewDeletions, quality });
+    const cacheKey = JSON.stringify({ modelType, transform, bindings: previewBindings, deletions: previewDeletions, quality, removeShadow });
     if (device && (!deviceGlbCache || deviceGlbCacheKey !== cacheKey)) {
       ui['mode-device'].textContent = '烘焙中…';
       ui['mode-device-mobile'].textContent = '处理中…';
@@ -849,6 +867,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
         previewDeletions,
         quality,
         modelType,
+        removeShadow,
       );
       if (requestId !== previewModeRequestId) return false;
       deviceGlbCache = nextDeviceGlb;
@@ -994,6 +1013,9 @@ async function activatePreparedModel(prepared, {
 }) {
   const activeModelType = normalizeModelType(modelType || prepared.modelType);
   modelType = activeModelType;
+  removeShadow = editorState?.removeShadow === true;
+  ui['remove-shadow'].checked = removeShadow;
+  preview.setRemoveShadow(removeShadow);
   updateModelTypeUi();
   const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {
     updateImportProgress({ progress: previewProgressStart + progress * previewProgressScale, label, indeterminate });
@@ -1187,6 +1209,7 @@ function normalizeProjectState(raw) {
     rotation: validNumberArray(raw.rotation, 3) ? raw.rotation.map(Number) : [0, 0, 0],
     targetLength: finiteNumber(raw.targetLength, 5.2),
     heightOffset: finiteNumber(raw.heightOffset, 0),
+    removeShadow: raw.removeShadow === true,
     transform: structuredClone(transform),
     activePanel: activePanelValue,
     openSlot: openSlotValue,
@@ -1287,7 +1310,7 @@ function setStatuses(items) {
 }
 
 function setControls(enabled) {
-  for (const id of ['rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'height-offset']) ui[id].disabled = !enabled;
+  for (const id of ['rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'height-offset', 'remove-shadow']) ui[id].disabled = !enabled;
   ui.generate.disabled = !enabled;
   ui['mobile-generate'].disabled = !enabled;
   document.getElementById('mobile-generate-shortcut').disabled = !enabled;
@@ -1591,6 +1614,7 @@ function captureSnapshot() {
     rotation: ['x', 'y', 'z'].map((axis) => Number(ui[`rotation-${axis}`].value) || 0),
     targetLength: Number(ui['target-length'].value) || 5.2,
     heightOffset: Number(ui['height-offset'].value) || 0,
+    removeShadow,
     transform: preview.getExportTransform(),
     activePanel,
     openSlot,
@@ -1690,6 +1714,9 @@ function restoreSnapshot(snap, { markDirty = true } = {}) {
   preview.targetLength = snap.targetLength;
   ui['height-offset'].value = snap.heightOffset;
   preview.heightOffset = snap.heightOffset;
+  removeShadow = snap.removeShadow === true;
+  ui['remove-shadow'].checked = removeShadow;
+  preview.setRemoveShadow(removeShadow);
   if (snap.selectionTool) {
     previewSelectionMode = snap.selectionTool.mode || 'smart';
     previewSelectionOperation = snap.selectionTool.operation || 'add';
@@ -1950,6 +1977,7 @@ window.__carmodelDebug = {
       deletions: structuredClone(deletions),
       bindings: [...bindings.entries()].map(([id, binding]) => [id, structuredClone(binding)]),
       transform: preview.getExportTransform(),
+      removeShadow,
     };
   },
   preview,
@@ -2407,6 +2435,40 @@ function onPickNode(slot, nodeIndex) {
   setBindingNodes(slot, [...selected], { revealNodeIndex: nodeIndex });
 }
 
+function playbackModeLabel(mode) {
+  return {
+    once: '打开时播放一次后复位',
+    hold: '打开时播放一次并保持尾帧',
+    loop: '打开时循环播放',
+    pingpong: '打开时往返循环',
+  }[mode] || '打开时播放一次后复位';
+}
+
+function playbackEndLabel(endMode) {
+  return {
+    reverse: '关闭时反向恢复',
+    reset: '关闭时立即复位',
+    hold: '关闭时立即保持尾帧',
+    finish: '关闭时播完本轮并保持尾帧',
+  }[endMode] || '关闭时立即复位';
+}
+
+function playbackBehaviorNotice(playback) {
+  const opening = playbackModeLabel(playback.mode);
+  const closing = playbackEndLabel(playback.endMode);
+  const needsHoldHint = playback.mode !== 'hold' && ['hold', 'finish'].includes(playback.endMode);
+  if (!needsHoldHint) {
+    return `<div class="playback-behavior"><span>当前效果：${opening}；${closing}</span></div>`;
+  }
+  return `<div class="playback-behavior warning" role="status">
+    <div class="playback-behavior-copy">
+      <strong>当前打开时不会停在尾帧</strong>
+      <span>${opening}；只有关闭事件后才会执行“${closing}”。</span>
+    </div>
+    <button class="btn small" id="bind-playback-use-hold" type="button"><i data-lucide="corner-down-right"></i>改为打开后播放一次并保持</button>
+  </div>`;
+}
+
 function otherBindingEditor(slot, binding) {
   const selected = sourceAnimationBindingValid(binding) ? binding.sourceAnimationIndex : '';
   const playback = normalizeOtherPlayback(slot, binding?.playback);
@@ -2442,43 +2504,48 @@ function otherBindingEditor(slot, binding) {
              <label for="bind-trigger-delay">停车后触发</label>
              <div class="input-suffix"><input id="bind-trigger-delay" type="number" min="1" max="600" step="1" value="${idleDelay}" /><span>秒</span></div>
            </div>` : ''}
-           <div class="field">
-             <label for="bind-playback-mode">播放方式</label>
-             <select id="bind-playback-mode">
-               <option value="once"${playback.mode === 'once' ? ' selected' : ''}>播放一次后复位</option>
-               <option value="hold"${playback.mode === 'hold' ? ' selected' : ''}>播放一次并保持尾帧</option>
-               <option value="loop"${playback.mode === 'loop' ? ' selected' : ''}>循环播放</option>
-               <option value="pingpong"${playback.mode === 'pingpong' ? ' selected' : ''}>往返循环</option>
-             </select>
-           </div>
+            <div class="field">
+              <label for="bind-playback-mode">打开时播放方式</label>
+              <select id="bind-playback-mode">
+                <option value="once"${playback.mode === 'once' ? ' selected' : ''}>播放一次后复位</option>
+                <option value="hold"${playback.mode === 'hold' ? ' selected' : ''}>播放一次并保持尾帧</option>
+                <option value="loop"${playback.mode === 'loop' ? ' selected' : ''}>循环播放</option>
+                <option value="pingpong"${playback.mode === 'pingpong' ? ' selected' : ''}>往返循环</option>
+              </select>
+            </div>
            <div class="field">
              <label for="bind-playback-direction">播放方向</label>
              <select id="bind-playback-direction">
                <option value="forward"${playback.direction === 'forward' ? ' selected' : ''}>正放</option>
                <option value="reverse"${playback.direction === 'reverse' ? ' selected' : ''}>倒放</option>
              </select>
-           </div>
-           <div class="field playback-end-field">
-             <label for="bind-playback-end">事件结束</label>
-             <select id="bind-playback-end">
-               <option value="reverse"${playback.endMode === 'reverse' ? ' selected' : ''}>反向恢复</option>
-               <option value="reset"${playback.endMode === 'reset' ? ' selected' : ''}>立即复位</option>
-               <option value="hold"${playback.endMode === 'hold' ? ' selected' : ''}>立即保持尾帧</option>
-               <option value="finish"${playback.endMode === 'finish' ? ' selected' : ''}>播完本轮并保持尾帧</option>
-             </select>
-           </div>
-         </div>
-         <details class="playback-advanced">
-           <summary><span>高级设置</span><small id="playback-duration">实际时长 ${effectiveDuration.toFixed(2)} 秒</small></summary>
-           <div class="playback-advanced-grid">
-             <div class="field">
-               <label for="bind-playback-speed">播放速度</label>
-               <input id="bind-playback-speed" type="number" min="0.1" max="4" step="0.05" value="${playback.speed}" />
-             </div>
-             <div class="field">
-               <label for="bind-playback-start">动作开始</label>
-               <div class="input-suffix"><input id="bind-playback-start" type="number" min="0" max="98" step="1" value="${Math.round(playback.range.start * 100)}" /><span>%</span></div>
-             </div>
+            </div>
+            <div class="field playback-end-field">
+              <label for="bind-playback-end">关闭时处理</label>
+              <select id="bind-playback-end">
+                <option value="reverse"${playback.endMode === 'reverse' ? ' selected' : ''}>反向恢复</option>
+                <option value="reset"${playback.endMode === 'reset' ? ' selected' : ''}>立即复位</option>
+                <option value="hold"${playback.endMode === 'hold' ? ' selected' : ''}>立即保持尾帧</option>
+                <option value="finish"${playback.endMode === 'finish' ? ' selected' : ''}>播完本轮并保持尾帧</option>
+              </select>
+            </div>
+          </div>
+          <div id="playback-behavior-host">${playbackBehaviorNotice(playback)}</div>
+          <details class="playback-advanced" open>
+            <summary><span>高级设置</span><small id="playback-duration">实际时长 ${effectiveDuration.toFixed(2)} 秒</small></summary>
+            <div class="playback-advanced-grid">
+              <div class="field">
+                <label for="bind-playback-speed">播放速度</label>
+                <input id="bind-playback-speed" type="number" min="0.1" max="4" step="0.05" value="${playback.speed}" />
+              </div>
+              <div class="field">
+                <label for="bind-transition-duration">进入/切换过渡</label>
+                <div class="input-suffix"><input id="bind-transition-duration" type="number" min="0" max="1000" step="20" value="${playback.transitionMs}" /><span>毫秒</span></div>
+              </div>
+              <div class="field">
+                <label for="bind-playback-start">动作开始</label>
+                <div class="input-suffix"><input id="bind-playback-start" type="number" min="0" max="98" step="1" value="${Math.round(playback.range.start * 100)}" /><span>%</span></div>
+              </div>
              <div class="field">
                <label for="bind-playback-end-range">动作结束</label>
                <div class="input-suffix"><input id="bind-playback-end-range" type="number" min="1" max="100" step="1" value="${Math.round(playback.range.end * 100)}" /><span>%</span></div>
@@ -2749,6 +2816,17 @@ function closeBindingEditor() {
   setActivePanel('binding');
 }
 
+function wirePlaybackHoldFix(slot) {
+  document.getElementById('bind-playback-use-hold')?.addEventListener('click', () => {
+    const mode = document.getElementById('bind-playback-mode');
+    if (!mode) return;
+    mode.value = 'hold';
+    updateOtherPlaybackBinding(slot);
+    renderBindings();
+    showMessage('已改为打开后播放一次并保持尾帧', 'success', { duration: 3500 });
+  });
+}
+
 function wireBindingEditor() {
   ui['binding-editor-host'].querySelectorAll('[data-mobile-slot]').forEach((button) => {
     button.addEventListener('click', () => toggleSlot(button.dataset.mobileSlot));
@@ -2764,10 +2842,12 @@ function wireBindingEditor() {
     });
     for (const id of [
       'bind-playback-mode', 'bind-playback-direction', 'bind-playback-end',
-      'bind-playback-speed', 'bind-playback-start', 'bind-playback-end-range', 'bind-trigger-delay',
+      'bind-playback-speed', 'bind-transition-duration', 'bind-playback-start',
+      'bind-playback-end-range', 'bind-trigger-delay',
     ]) {
       document.getElementById(id)?.addEventListener('change', () => updateOtherPlaybackBinding(slot));
     }
+    wirePlaybackHoldFix(slot);
     document.getElementById('bind-preview-source')?.addEventListener('click', () => playCurrentBinding('on'));
     document.getElementById('bind-preview-end')?.addEventListener('click', () => playCurrentBinding('off'));
     document.getElementById('bind-remove')?.addEventListener('click', () => {
@@ -2860,10 +2940,18 @@ function toggleSlot(slotId) {
   stopDemo();
   cancelDeleteDraft(false);
   const closing = openSlot === slotId;
+  const previousBinding = openSlot ? bindings.get(openSlot) : null;
+  const nextBinding = closing ? null : bindings.get(slotId);
+  const preserveBindingPreview = modelType === 'other'
+    && !closing
+    && openSlot !== null
+    && openSlot !== slotId
+    && sourceAnimationBindingValid(previousBinding)
+    && sourceAnimationBindingValid(nextBinding);
   stopFineSelection();
   openSlot = closing ? null : slotId;
   regionMode = 'translate';
-  closePreviewTools();
+  closePreviewTools({ preserveBindingPreview });
   renderBindings();
   if (closing) return;
   setActivePanel('binding');
@@ -3233,10 +3321,10 @@ function syncPivotInputs(binding) {
   });
 }
 
-function closePreviewTools() {
+function closePreviewTools({ preserveBindingPreview = false } = {}) {
   stopFineSelection();
   stopPicking();
-  preview.stopBindingPreview();
+  if (!preserveBindingPreview) preview.stopBindingPreview();
   preview.clearHighlight();
   preview.hideRegionBox();
   preview.hidePivotMarker();
@@ -3302,11 +3390,12 @@ function updateOtherPlaybackBinding(slot) {
   if (!binding) return;
   snapshot({ scope: 'binding-playback', slotId: slot.id });
   binding.playback = normalizeOtherPlayback(slot, {
-    version: 2,
+    version: 3,
     mode: document.getElementById('bind-playback-mode')?.value,
     direction: document.getElementById('bind-playback-direction')?.value,
     endMode: document.getElementById('bind-playback-end')?.value,
     speed: document.getElementById('bind-playback-speed')?.value,
+    transitionMs: document.getElementById('bind-transition-duration')?.value,
     range: {
       start: (Number(document.getElementById('bind-playback-start')?.value) || 0) / 100,
       end: (Number(document.getElementById('bind-playback-end-range')?.value) || 100) / 100,
@@ -3320,12 +3409,19 @@ function updateOtherPlaybackBinding(slot) {
   setDirty();
   markDevicePreviewStale();
   document.getElementById('bind-playback-speed').value = binding.playback.speed;
+  document.getElementById('bind-transition-duration').value = binding.playback.transitionMs;
   document.getElementById('bind-playback-start').value = Math.round(binding.playback.range.start * 100);
   document.getElementById('bind-playback-end-range').value = Math.round(binding.playback.range.end * 100);
   const animation = sourceAnimationByIndex(binding.sourceAnimationIndex);
   const duration = playbackDurationOf(animation?.duration, binding.playback);
   const durationLabel = document.getElementById('playback-duration');
   if (durationLabel) durationLabel.textContent = `实际时长 ${duration.toFixed(2)} 秒`;
+  const behaviorHost = document.getElementById('playback-behavior-host');
+  if (behaviorHost) {
+    behaviorHost.innerHTML = playbackBehaviorNotice(binding.playback);
+    renderIcons();
+    wirePlaybackHoldFix(slot);
+  }
   refreshBindingPreviewAfterExportChange('on');
 }
 
@@ -3363,6 +3459,7 @@ async function generatePackage() {
       bindings: bindingsForOutput(),
       deletions: deletions.map((item) => item.region),
       quality,
+      removeShadow,
     });
     const blob = new Blob([result.bytes], { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);

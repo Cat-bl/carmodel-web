@@ -87,21 +87,26 @@ export function normalizeOtherPlayback(slot, value = {}) {
     ? { mode: 'hold', direction: 'forward', endMode: 'reverse' }
     : { mode: 'loop', direction: 'forward', endMode: 'reset' };
   const stored = value && typeof value === 'object' ? value : {};
-  const legacy = Object.keys(stored).length > 0 && stored.version !== 2;
+  const legacy = Object.keys(stored).length > 0 && ![2, 3].includes(Number(stored.version));
   const requestedMode = legacy && stored.mode === 'once' ? 'hold' : stored.mode;
   const speed = Math.min(4, Math.max(0.1, Number(stored.speed) || 1));
+  const rawTransition = stored.transitionMs === undefined ? 200 : Number(stored.transitionMs);
+  const transitionMs = Number.isFinite(rawTransition)
+    ? Math.min(1000, Math.max(0, Math.round(rawTransition)))
+    : 200;
   const rawStart = Number(stored.range?.start ?? stored.rangeStart);
   const rawEnd = Number(stored.range?.end ?? stored.rangeEnd);
   const start = Number.isFinite(rawStart) ? Math.min(0.98, Math.max(0, rawStart)) : 0;
   const end = Number.isFinite(rawEnd) ? Math.min(1, Math.max(start + 0.01, rawEnd)) : 1;
   return {
-    version: 2,
+    version: 3,
     mode: ['once', 'hold', 'loop', 'pingpong'].includes(requestedMode) ? requestedMode : defaults.mode,
     direction: ['forward', 'reverse'].includes(stored.direction) ? stored.direction : defaults.direction,
     endMode: ['reverse', 'reset', 'hold', 'finish'].includes(stored.endMode)
       ? stored.endMode
       : stored.endMode === 'stop' ? 'reset' : defaults.endMode,
     speed,
+    transitionMs,
     range: { start, end },
   };
 }

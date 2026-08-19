@@ -31,6 +31,16 @@ export function createCarShadowCanvas(preferOffscreen = true) {
   return canvas;
 }
 
+export function createTransparentShadowCanvas(preferOffscreen = true) {
+  const canvas = preferOffscreen && typeof OffscreenCanvas !== 'undefined'
+    ? new OffscreenCanvas(1, 1)
+    : Object.assign(document.createElement('canvas'), { width: 1, height: 1 });
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('浏览器不支持 2D 画布，无法生成透明阴影贴图');
+  context.clearRect(0, 0, 1, 1);
+  return canvas;
+}
+
 export function shadowFootprint(min, max, groundSamples = []) {
   let lowX = min[0];
   let highX = max[0];
