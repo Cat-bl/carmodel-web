@@ -816,7 +816,19 @@ ui['binding-back'].addEventListener('click', closeBindingEditor);
 
 let deviceGlbCache = null;
 let deviceGlbCacheKey = '';
-async function setPreviewMode(device) {
+let previewModeRequestId = 0;
+let previewModeTask = Promise.resolve();
+
+function setPreviewMode(device, { bindingPhase = 'on' } = {}) {
+  const requestId = ++previewModeRequestId;
+  const run = () => requestId === previewModeRequestId
+    ? applyPreviewMode(device, requestId, bindingPhase)
+    : false;
+  previewModeTask = previewModeTask.then(run, run);
+  return previewModeTask;
+}
+
+async function applyPreviewMode(device, requestId, bindingPhase) {
   if (!current || (preview.deviceMode === device && (!device || deviceGlbCache))) return;
   stopFineSelection();
   for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = true;
@@ -830,7 +842,7 @@ async function setPreviewMode(device) {
     if (device && (!deviceGlbCache || deviceGlbCacheKey !== cacheKey)) {
       ui['mode-device'].textContent = '烘焙中…';
       ui['mode-device-mobile'].textContent = '处理中…';
-      deviceGlbCache = await makeVehiclePreviewGlb(
+      const nextDeviceGlb = await makeVehiclePreviewGlb(
         current.bytes,
         transform,
         previewBindings,
@@ -838,11 +850,15 @@ async function setPreviewMode(device) {
         quality,
         modelType,
       );
+      if (requestId !== previewModeRequestId) return false;
+      deviceGlbCache = nextDeviceGlb;
       deviceGlbCacheKey = cacheKey;
       ui['mode-device'].textContent = '车机质感';
       ui['mode-device-mobile'].textContent = '车机质感';
     }
+    if (requestId !== previewModeRequestId) return false;
     await preview.setDeviceMode(device, deviceGlbCache, transform);
+    if (requestId !== previewModeRequestId) return false;
     for (const id of ['mode-web', 'mode-web-mobile']) ui[id].classList.toggle('active', !device);
     for (const id of ['mode-device', 'mode-device-mobile']) ui[id].classList.toggle('active', device);
     // 模型实例换了，删除区域、部件映射与打开中的联动工具都要跟着重建
@@ -856,20 +872,25 @@ async function setPreviewMode(device) {
         applyRegionMode(slot, binding);
       } else if (binding?.selection && !device) {
         startFineSelection(slot, { preserveState: true });
-        playCurrentBinding();
+        playCurrentBinding(bindingPhase);
       } else if (binding) {
-        playCurrentBinding();
+        playCurrentBinding(bindingPhase);
         syncPivotTools(slot, binding);
       }
     }
+    return true;
   } catch (error) {
+    if (requestId !== previewModeRequestId) return false;
     console.error(error);
     ui['mode-device'].textContent = '车机质感';
     ui['mode-device-mobile'].textContent = '车机质感';
     setStatuses([['bad', '×', `车机质感预览失败：${error.message}`]]);
     showMessage(`车机质感预览失败：${error.message}`, 'error');
+    return false;
   } finally {
-    for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = false;
+    if (requestId === previewModeRequestId) {
+      for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = false;
+    }
   }
 }
 ui['mode-web'].addEventListener('click', () => setPreviewMode(false));
@@ -1351,6 +1372,17 @@ function sourceAnimationBindingValid(binding) {
     && sourceAnimationByIndex(binding.sourceAnimationIndex));
 }
 
+function refreshBindingPreviewAfterExportChange(phase = 'on') {
+  if (!preview.deviceMode) {
+    playCurrentBinding(phase);
+    return;
+  }
+  // 车机质感播放的是最终导出 GLB；配置变化后必须先重烘焙，
+  // 否则当前模型里还不存在刚选择或刚修改的 BYD_EVT_* 动画。
+  preview.stopBindingPreview();
+  void setPreviewMode(true, { bindingPhase: phase });
+}
+
 function setSourceAnimationBinding(slot, value) {
   const animation = sourceAnimationByIndex(value);
   const existing = bindings.get(slot.id);
@@ -1362,6 +1394,7 @@ function setSourceAnimationBinding(slot, value) {
     setDirty();
     markDevicePreviewStale();
     renderBindings();
+    refreshBindingPreviewAfterExportChange();
     return;
   }
   snapshot();
@@ -1379,7 +1412,7 @@ function setSourceAnimationBinding(slot, value) {
   setDirty();
   markDevicePreviewStale();
   renderBindings();
-  playCurrentBinding();
+  refreshBindingPreviewAfterExportChange();
 }
 
 /** parts 与两层部件分组一起刷新，并给每一项算好中文方位标签 */
@@ -2744,6 +2777,7 @@ function wireBindingEditor() {
       setDirty();
       markDevicePreviewStale();
       renderBindings();
+      refreshBindingPreviewAfterExportChange();
     });
     return;
   }
@@ -3292,7 +3326,7 @@ function updateOtherPlaybackBinding(slot) {
   const duration = playbackDurationOf(animation?.duration, binding.playback);
   const durationLabel = document.getElementById('playback-duration');
   if (durationLabel) durationLabel.textContent = `实际时长 ${duration.toFixed(2)} 秒`;
-  playCurrentBinding('on');
+  refreshBindingPreviewAfterExportChange('on');
 }
 
 function playCurrentBinding(phase = 'on') {

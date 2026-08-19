@@ -1618,6 +1618,37 @@ function animationDurationOf(state, animation) {
   return duration;
 }
 
+/**
+ * glTF 允许用一个采样点表示整条时间轴上的常量值。
+ * 车机动画转换需要至少两个严格递增的时间点，因此在裁剪前把这种
+ * 合法的静态轨道扩展到源动画的完整时长。这样不会改变骨骼姿态，
+ * 也不会把静态骨骼误报成“关键帧数据无效”。
+ */
+function normalizeAnimationSamplerData(input, values, duration, expectedComponents, name) {
+  if (!input || !values || input.comps !== 1 || !input.data.length
+    || values.comps !== expectedComponents
+    || values.data.length !== input.data.length * expectedComponents) {
+    throw new Error(`${name}：动画关键帧数据无效`);
+  }
+  const times = Array.from(input.data, Number);
+  if (!times.every(Number.isFinite)
+    || times.some((time, index) => index > 0 && time <= times[index - 1])) {
+    throw new Error(`${name}：动画时间轴无效`);
+  }
+  const components = values.data.length / times.length;
+  const sourceValues = Array.from(values.data, Number);
+  if (!sourceValues.every(Number.isFinite)) {
+    throw new Error(`${name}：动画包含无效数值`);
+  }
+  if (times.length > 1) return { times, values: sourceValues, components };
+
+  // 单采样点是合法的常量轨道。用源动画时长作为第二个点，保持数值不变。
+  // duration 为 0 时仍给出一个极短的有效区间，避免导出零时长 sampler。
+  const end = Math.max(Number(duration) || 0, 1 / 60);
+  const constant = sourceValues.slice(0, components);
+  return { times: [0, end], values: [...constant, ...constant], components };
+}
+
 function sampleAnimationValue(input, output, path, time, interpolation) {
   const times = input.data;
   const components = output.comps;
@@ -1636,7 +1667,8 @@ function sampleAnimationValue(input, output, path, time, interpolation) {
 }
 
 function trimmedAnimationClip(state, source, startRatio, endRatio, speed, name) {
-  const duration = animationDurationOf(state, source);
+  // 全部通道都是 t=0 的静态帧时也要导出一个可播放的最短动画。
+  const duration = Math.max(animationDurationOf(state, source), 1 / 60);
   const start = duration * startRatio;
   const end = duration * endRatio;
   const output = { name, samplers: [], channels: [] };
@@ -1646,21 +1678,36 @@ function trimmedAnimationClip(state, source, startRatio, endRatio, speed, name) 
     const input = readAccessorData(state, sampler?.input);
     const values = readAccessorData(state, sampler?.output);
     const path = target.path;
-    if (!input || !values || !sampler || !['translation', 'rotation', 'scale'].includes(path)
-      || input.comps !== 1 || input.data.length < 2 || values.data.length % input.data.length !== 0) {
+    if (!sampler || !['translation', 'rotation', 'scale'].includes(path)) {
       throw new Error(`${name}：动画关键帧数据无效`);
     }
+    const expectedComponents = path === 'rotation' ? 4 : 3;
+    const normalized = normalizeAnimationSamplerData(
+      input,
+      values,
+      duration,
+      expectedComponents,
+      name,
+    );
+    const normalizedInput = { ...input, data: normalized.times };
+    const normalizedValues = { ...values, data: normalized.values };
     const points = [start];
-    for (const time of input.data) {
+    for (const time of normalizedInput.data) {
       if (time > start && time < end) points.push(Number(time));
     }
     if (end > start && points[points.length - 1] !== end) points.push(end);
-    const components = values.data.length / input.data.length;
+    const components = normalized.components;
     const times = new Float32Array(points.length);
     const sampled = new Float32Array(points.length * components);
     for (let frame = 0; frame < points.length; frame++) {
       times[frame] = (points[frame] - start) / speed;
-      const value = sampleAnimationValue(input, values, path, points[frame], sampler.interpolation || 'LINEAR');
+      const value = sampleAnimationValue(
+        normalizedInput,
+        normalizedValues,
+        path,
+        points[frame],
+        sampler.interpolation || 'LINEAR',
+      );
       for (let component = 0; component < components; component++) sampled[frame * components + component] = value[component];
     }
     const samplerIndex = output.samplers.length;
