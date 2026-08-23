@@ -13,11 +13,27 @@ import { selectedTriangles } from './selection.js';
 
 const CARSELF_HEADER_URL = './templates/hcmodel-header.bin';
 const TAIL = new Uint8Array([0x0b, 0x00, 0x00, 0x00]);
+const BIN_STORAGE = Symbol('binStorage');
+const MAX_VEHICLE_SKIN_JOINTS = 64;
 let headerPromise = null;
 // 灯/闪烁槽位的材质不做方向渐变：灭灯态（textureId=-1）显示的是 baseColorFactor，必须保持纯色
 const LAMP_SLOT_IDS = new Set(
   [...SLOT_BY_ID.values()].filter((slot) => slot.kind === 'lamp' || slot.kind === 'blink').map((slot) => slot.id),
 );
+
+function createProgressReporter(onProgress) {
+  let lastProgress = -1;
+  return (progress, label, indeterminate = false) => {
+    const value = Math.max(0, Math.min(1, Number(progress) || 0));
+    if (value === lastProgress && !indeterminate) return;
+    lastProgress = value;
+    onProgress?.({ progress: value, label, indeterminate });
+  };
+}
+
+function yieldToBrowser() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 function isShadowNodeName(name) {
   return /^(?:CS_Shadow|Imported_CS_Shadow)(?:[._-]|$)/.test(String(name || ''));
@@ -38,14 +54,24 @@ function isShadowNode(json, node) {
 
 export async function makeBydCar(options) {
   if (options?.modelType === 'other') return makeAnimatedOtherBydCar(options);
-  const { sourceBytes, sourceName, transform, stats, bindings, deletions, quality, removeShadow = false } = options;
+  const { sourceBytes, sourceName, transform, stats, bindings, deletions, quality, removeShadow = false, onProgress } = options;
+  const report = createProgressReporter(onProgress);
   const exportQuality = normalizeExportQuality(quality);
+  report(0.02, '正在解析模型');
+  await yieldToBrowser();
   const parsed = parseGlb(sourceBytes);
+  report(0.12, '正在烘焙材质');
+  await yieldToBrowser();
   const baked = await bakeMaterialsForVehicle(parsed);
   const lamps = [];
+  report(0.32, '正在生成车模联动');
   const normalizedState = await normalizeParsedGlb(baked, transform, bindings, lamps, deletions, removeShadow);
+  report(0.62, '正在处理贴图');
   await resizeEmbeddedImages(normalizedState, exportQuality.textureMaxSize);
+  report(0.72, '正在优化网格');
   await simplifyMeshToTarget(normalizedState, exportQuality.triangleTarget);
+  report(0.82, '正在组装 GLB');
+  await yieldToBrowser();
   const normalized = buildGlb(normalizedState.json, normalizedState.bin);
   const outputStats = collectGlbStats(normalizedState.json);
   // 外部 CarSelf_Main.png 必须与最终 GLB 内嵌主贴图逐像素一致，原厂资源也是这个约定。
@@ -109,31 +135,49 @@ export async function makeBydCar(options) {
   for (const file of files) {
     zip.file(file.path, file.bytes, { compression: 'STORE', createFolders: false });
   }
-  const bytes = await zip.generateAsync({ type: 'uint8array', compression: 'STORE' });
+  report(0.94, '正在打包车模文件');
+  const bytes = await zip.generateAsync(
+    { type: 'uint8array', compression: 'STORE' },
+    ({ percent }) => report(0.94 + (percent / 100) * 0.06, '正在打包车模文件'),
+  );
+  report(1, '车模包已生成');
   return { bytes, manifest, dat, glb: normalized };
 }
 
 async function makeAnimatedOtherBydCar({
-  sourceBytes, sourceName, transform, stats, bindings, deletions, quality, removeShadow = false,
+  sourceBytes, sourceName, transform, stats, bindings, deletions, quality, removeShadow = false, onProgress,
 }) {
+  const report = createProgressReporter(onProgress);
   const exportQuality = normalizeExportQuality(quality);
+  report(0.02, '正在解析模型');
+  await yieldToBrowser();
   const parsed = parseGlb(sourceBytes);
   if (parsed.json.extensionsRequired?.length) {
     throw new Error(`该模型依赖暂不支持的 glTF 扩展：${parsed.json.extensionsRequired.join(', ')}`);
   }
+  report(0.12, '正在烘焙材质');
+  await yieldToBrowser();
   const baked = await bakeMaterialsForVehicle(parsed);
+  report(0.22, '正在生成绑定动画');
   const { state, eventBindings } = await normalizeAnimatedOtherGlb(
-    baked, transform, bindings, deletions, removeShadow,
+    baked, transform, bindings, deletions, removeShadow, (progress, label) => report(0.22 + progress * 0.36, label),
   );
+  report(0.62, '正在处理贴图');
   await resizeEmbeddedImages(state, exportQuality.textureMaxSize);
-  const simplified = await simplifyMeshToTarget(state, exportQuality.triangleTarget);
-  if (simplified > 0) {
-    normalizeSkinnedMeshesForVehicle(state);
-    markMeshBufferTargets(state);
-    pruneUnusedAccessors(state);
-    repackBin(state);
-    assertVehicleSkinCompatibility(state);
-  }
+  report(0.72, '正在优化网格');
+  await simplifyMeshToTarget(state, exportQuality.triangleTarget);
+  // 即使选择“原始”质量，也要走一遍车机蒙皮定型：源 GLB 的合法布局不
+  // 等于 AutoDice 的运行时布局，尤其是骨骼索引和多组权重属性。
+  normalizeSkinnedMeshesForVehicle(state);
+  report(0.78, '正在压缩骨架');
+  splitSkinJointsForVehicle(state);
+  isolateSharedSkinSkeletons(state);
+  markMeshBufferTargets(state);
+  pruneUnusedAccessors(state);
+  repackBin(state);
+  assertVehicleSkinCompatibility(state);
+  report(0.82, '正在组装 GLB');
+  await yieldToBrowser();
   const normalized = buildGlb(state.json, state.bin);
   const outputStats = collectGlbStats(state.json);
   const mainTexture = await extractMainTexture(state);
@@ -189,7 +233,12 @@ async function makeAnimatedOtherBydCar({
   zip.file('manifest.json', JSON.stringify(manifest, null, 2), { createFolders: false });
   zip.file('payload/CarSelf.dat', dat, { compression: 'STORE', createFolders: false });
   for (const file of files) zip.file(file.path, file.bytes, { compression: 'STORE', createFolders: false });
-  const bytes = await zip.generateAsync({ type: 'uint8array', compression: 'STORE' });
+  report(0.94, '正在打包车模文件');
+  const bytes = await zip.generateAsync(
+    { type: 'uint8array', compression: 'STORE' },
+    ({ percent }) => report(0.94 + (percent / 100) * 0.06, '正在打包车模文件'),
+  );
+  report(1, '车模包已生成');
   return { bytes, manifest, dat, glb: normalized };
 }
 
@@ -355,14 +404,23 @@ function imageIndexOf(json, textureRef) {
 }
 
 function appendImageToBin(state, bytes) {
-  const aligned = pad(state.bin, 0);
-  const merged = new Uint8Array(aligned.byteLength + bytes.byteLength);
-  merged.set(aligned);
-  merged.set(bytes, aligned.byteLength);
+  const padding = (4 - (state.bin.byteLength % 4)) % 4;
+  const offset = state.bin.byteLength + padding;
+  const required = offset + bytes.byteLength;
+  let storage = state[BIN_STORAGE];
+  if (!storage || storage.buffer !== state.bin.buffer || storage.byteOffset !== state.bin.byteOffset
+    || storage.byteLength < required) {
+    const capacity = Math.max(required, Math.ceil(Math.max(state.bin.byteLength, 1024) * 1.6));
+    storage = new Uint8Array(capacity);
+    storage.set(state.bin);
+    state[BIN_STORAGE] = storage;
+  }
+  if (padding) storage.fill(0, state.bin.byteLength, offset);
+  storage.set(bytes, offset);
   if (!Array.isArray(state.json.bufferViews)) state.json.bufferViews = [];
-  state.json.bufferViews.push({ buffer: 0, byteOffset: aligned.byteLength, byteLength: bytes.byteLength });
-  state.bin = merged;
-  if (state.json.buffers?.[0]) state.json.buffers[0].byteLength = merged.byteLength;
+  state.json.bufferViews.push({ buffer: 0, byteOffset: offset, byteLength: bytes.byteLength });
+  state.bin = storage.subarray(0, required);
+  if (state.json.buffers?.[0]) state.json.buffers[0].byteLength = required;
   return state.json.bufferViews.length - 1;
 }
 
@@ -755,7 +813,13 @@ const COMPONENT_INFO = {
   5125: { Array: Uint32Array, size: 4 },
   5126: { Array: Float32Array, size: 4 },
 };
-const TYPE_COMPONENTS = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 };
+const TYPE_COMPONENTS = {
+  SCALAR: 1,
+  VEC2: 2,
+  VEC3: 3,
+  VEC4: 4,
+  MAT4: 16,
+};
 // 车机渲染只认这几种顶点属性；TANGENT/多套 UV/JOINTS/WEIGHTS 都属于死重量
 const COPY_ATTRIBUTES = ['POSITION', 'NORMAL', 'TEXCOORD_0', 'COLOR_0'];
 const KEEP_ATTRIBUTES = new Set(COPY_ATTRIBUTES);
@@ -1221,6 +1285,361 @@ function normalizeSkinnedMeshesForVehicle(state) {
   for (const skin of json.skins || []) delete skin.skeleton;
 }
 
+function nearestJointParentSlots(json, joints, parents) {
+  const slotByNode = new Map(joints.map((node, slot) => [node, slot]));
+  return joints.map((node) => {
+    let parent = parents.get(node);
+    while (parent !== undefined) {
+      const slot = slotByNode.get(parent);
+      if (slot !== undefined) return slot;
+      parent = parents.get(parent);
+    }
+    return null;
+  });
+}
+
+function jointSlotsWithAncestors(directSlots, parentSlots) {
+  const result = new Set(directSlots);
+  const pending = [...result];
+  while (pending.length) {
+    const slot = pending.pop();
+    const parent = parentSlots[slot];
+    if (parent !== null && !result.has(parent)) {
+      result.add(parent);
+      pending.push(parent);
+    }
+  }
+  return result;
+}
+
+function partitionSkinTriangles(indices, joints, weights, parentSlots, jointCount, limit) {
+  if (indices.length % 3 !== 0) throw new Error('蒙皮网格的三角形索引数量无效');
+  const groups = [];
+  for (let at = 0; at < indices.length; at += 3) {
+    const triangle = [Number(indices[at]), Number(indices[at + 1]), Number(indices[at + 2])];
+    const direct = new Set();
+    for (const vertex of triangle) {
+      for (let component = 0; component < 4; component++) {
+        const influence = vertex * 4 + component;
+        const weight = Number(weights[influence]);
+        if (!(weight > 0)) continue;
+        const slot = Number(joints[influence]);
+        if (!Number.isInteger(slot) || slot < 0 || slot >= jointCount) {
+          throw new Error('蒙皮网格包含越界骨骼索引');
+        }
+        direct.add(slot);
+      }
+    }
+    const required = jointSlotsWithAncestors(direct, parentSlots);
+    if (required.size > limit) {
+      throw new Error(`单个三角面需要 ${required.size} 根骨骼，无法限制到 ${limit} 根`);
+    }
+    let best = null;
+    for (const group of groups) {
+      const combined = new Set([...group.joints, ...required]);
+      if (combined.size <= limit && (!best || combined.size < best.combined.size)) {
+        best = { group, combined };
+      }
+    }
+    if (best) {
+      best.group.indices.push(...triangle);
+      best.group.joints = best.combined;
+    } else {
+      groups.push({ indices: triangle, joints: required });
+    }
+  }
+  return groups;
+}
+
+function compactSkinPrimitive(state, primitive, group, keptSlots) {
+  const oldSlotByNew = new Map(keptSlots.map((slot, nextSlot) => [slot, nextSlot]));
+  const sourceVertices = [];
+  const vertexRemap = new Map();
+  const indices = new Uint16Array(group.indices.length);
+  group.indices.forEach((sourceVertex, at) => {
+    let nextVertex = vertexRemap.get(sourceVertex);
+    if (nextVertex === undefined) {
+      nextVertex = sourceVertices.length;
+      vertexRemap.set(sourceVertex, nextVertex);
+      sourceVertices.push(sourceVertex);
+    }
+    indices[at] = nextVertex;
+  });
+
+  const sourceWeights = readAttributeAsFloat(state, primitive.attributes?.WEIGHTS_0);
+  if (!sourceWeights || sourceWeights.comps !== 4) throw new Error('蒙皮网格缺少有效骨骼权重');
+  const attributes = {};
+  for (const [name, accessorIndex] of Object.entries(primitive.attributes || {})) {
+    const source = readAccessorData(state, accessorIndex);
+    if (!source) throw new Error(`蒙皮网格的 ${name} 顶点属性无效`);
+    let values = copyVertices(source.data, source.comps, sourceVertices);
+    let componentType = source.accessor.componentType;
+    if (name === 'JOINTS_0') {
+      const remapped = new Uint8Array(values.length);
+      for (let vertex = 0; vertex < sourceVertices.length; vertex++) {
+        const sourceVertex = sourceVertices[vertex];
+        for (let component = 0; component < 4; component++) {
+          const sourceAt = sourceVertex * 4 + component;
+          if (!(Number(sourceWeights.data[sourceAt]) > 0)) continue;
+          const nextSlot = oldSlotByNew.get(Number(source.data[sourceAt]));
+          if (!Number.isInteger(nextSlot)) throw new Error('拆分蒙皮时遗漏了顶点使用的骨骼');
+          remapped[vertex * 4 + component] = nextSlot;
+        }
+      }
+      values = remapped;
+      componentType = 5121;
+    }
+    const extra = {
+      ...(source.accessor.normalized ? { normalized: true } : {}),
+      ...(name === 'POSITION' ? positionBounds(values) : {}),
+    };
+    attributes[name] = writeVehicleAccessor(
+      state, values, componentType, source.accessor.type, VEHICLE_ARRAY_BUFFER, extra,
+    );
+  }
+  const { attributes: ignoredAttributes, indices: ignoredIndices, ...rest } = primitive;
+  return {
+    ...rest,
+    attributes,
+    indices: writeVehicleAccessor(
+      state, indices, 5123, 'SCALAR', VEHICLE_ELEMENT_ARRAY_BUFFER,
+      { min: [0], max: [Math.max(0, sourceVertices.length - 1)] },
+    ),
+  };
+}
+
+function attachSiblingNodes(json, sourceNodeIndex, siblingIndices) {
+  if (siblingIndices.length === 0) return;
+  let attached = false;
+  for (const node of json.nodes || []) {
+    const at = (node.children || []).indexOf(sourceNodeIndex);
+    if (at < 0) continue;
+    node.children.splice(at + 1, 0, ...siblingIndices);
+    attached = true;
+  }
+  for (const scene of json.scenes || []) {
+    const at = (scene.nodes || []).indexOf(sourceNodeIndex);
+    if (at < 0) continue;
+    scene.nodes.splice(at + 1, 0, ...siblingIndices);
+    attached = true;
+  }
+  if (!attached) throw new Error('蒙皮节点没有挂在可访问的场景层级中');
+}
+
+function duplicateNodeAnimationChannels(json, sourceNodeIndex, siblingIndices) {
+  if (siblingIndices.length === 0) return;
+  for (const animation of json.animations || []) {
+    const channels = [];
+    for (const channel of animation.channels || []) {
+      if (channel.target?.node !== sourceNodeIndex) continue;
+      for (const nodeIndex of siblingIndices) {
+        channels.push({ ...channel, target: { ...channel.target, node: nodeIndex } });
+      }
+    }
+    animation.channels.push(...channels);
+  }
+}
+
+/**
+ * 为一个拆分 draw 复制所需的完整骨骼路径。不能只复制 joints 节点，
+ * 否则 joints 之间不在表中的中间父节点会丢失，局部变换累积就会改变。
+ */
+function cloneSkinSkeleton(json, sourceJoints, parents, suffix) {
+  const sourceSet = new Set();
+  for (const joint of sourceJoints) {
+    let current = joint;
+    while (current !== undefined && !sourceSet.has(current)) {
+      if (json.nodes?.[current]?.name === 'CS_Car') break;
+      sourceSet.add(current);
+      current = parents.get(current);
+    }
+  }
+  const depthOf = (nodeIndex) => {
+    let depth = 0;
+    let current = nodeIndex;
+    while (parents.has(current)) {
+      depth += 1;
+      current = parents.get(current);
+    }
+    return depth;
+  };
+  const sourceNodes = [...sourceSet].sort((left, right) => depthOf(left) - depthOf(right));
+  const cloneMap = new Map();
+  for (const sourceIndex of sourceNodes) {
+    const source = json.nodes?.[sourceIndex];
+    if (!source) throw new Error('拆分蒙皮时找不到骨骼节点');
+    const { children: ignoredChildren, mesh: ignoredMesh, skin: ignoredSkin,
+      camera: ignoredCamera, name, ...rest } = structuredClone(source);
+    const cloneIndex = json.nodes.length;
+    json.nodes.push({ ...rest, ...(name ? { name: `${name}${suffix}` } : {}) });
+    cloneMap.set(sourceIndex, cloneIndex);
+  }
+  for (const sourceIndex of sourceNodes) {
+    const cloneIndex = cloneMap.get(sourceIndex);
+    const parent = parents.get(sourceIndex);
+    const clonedParent = cloneMap.get(parent);
+    if (clonedParent !== undefined) {
+      const parentNode = json.nodes[clonedParent];
+      parentNode.children = [...(parentNode.children || []), cloneIndex];
+    } else if (parent !== undefined) {
+      const parentNode = json.nodes[parent];
+      parentNode.children = [...(parentNode.children || []), cloneIndex];
+    } else {
+      for (const scene of json.scenes || []) {
+        scene.nodes = [...(scene.nodes || []), cloneIndex];
+      }
+    }
+  }
+  return { joints: sourceJoints.map((sourceIndex) => cloneMap.get(sourceIndex)), cloneMap };
+}
+
+/** 把已经生成的所有动作轨道复制到一套新的骨骼节点。 */
+function duplicateAnimationChannelsForNodeMap(json, nodeMap) {
+  if (!nodeMap?.size) return;
+  for (const animation of json.animations || []) {
+    const channels = [];
+    for (const channel of animation.channels || []) {
+      const clonedNode = nodeMap.get(channel.target?.node);
+      if (clonedNode === undefined) continue;
+      channels.push({ ...channel, target: { ...channel.target, node: clonedNode } });
+    }
+    animation.channels.push(...channels);
+  }
+}
+
+/**
+ * AutoDice 的单次蒙皮绘制最多稳定支持 64 根骨骼。不能删除人物模型的
+ * 骨骼或合并权重，否则头发、裙摆等独立骨骼链会失真。这里按三角面把
+ * 网格拆成多个 draw，每个 draw 使用独立的 <=64 骨骼调色板；骨骼节点、
+ * 父子层级、顶点权重、逆绑定矩阵和动画采样值全部保持原样。
+ */
+function splitSkinJointsForVehicle(state, limit = MAX_VEHICLE_SKIN_JOINTS) {
+  const { json } = state;
+  if (!Array.isArray(json.skins) || json.skins.length === 0) return;
+  const parents = parentMapOf(json);
+  const work = (json.nodes || []).map((node, nodeIndex) => ({
+    nodeIndex,
+    node: structuredClone(node),
+    mesh: Number.isInteger(node.mesh) ? structuredClone(json.meshes?.[node.mesh]) : null,
+    skin: Number.isInteger(node.skin) ? structuredClone(json.skins?.[node.skin]) : null,
+  })).filter(({ mesh, skin }) => mesh && skin && Array.isArray(skin.joints) && skin.joints.length > limit);
+  if (work.length === 0) return;
+
+  for (const item of work) {
+    const { nodeIndex, node: sourceNode, mesh: sourceMesh, skin: sourceSkin } = item;
+    const parentSlots = nearestJointParentSlots(json, sourceSkin.joints, parents);
+    const inverse = Number.isInteger(sourceSkin.inverseBindMatrices)
+      ? readAccessorData(state, sourceSkin.inverseBindMatrices)
+      : null;
+    if (inverse && (inverse.comps !== 16 || inverse.data.length < sourceSkin.joints.length * 16)) {
+      throw new Error('蒙皮模型的 inverseBindMatrices 数据无效');
+    }
+    const records = [];
+    for (let primitiveIndex = 0; primitiveIndex < (sourceMesh.primitives || []).length; primitiveIndex++) {
+      const primitive = sourceMesh.primitives[primitiveIndex];
+      const indexData = readAccessorData(state, primitive.indices);
+      const jointData = readAccessorData(state, primitive.attributes?.JOINTS_0);
+      const weightData = readAttributeAsFloat(state, primitive.attributes?.WEIGHTS_0);
+      if (!indexData || indexData.comps !== 1 || !jointData || jointData.comps !== 4
+        || !weightData || weightData.comps !== 4 || jointData.data.length !== weightData.data.length) {
+        throw new Error('蒙皮网格的索引、骨骼或权重数据无效');
+      }
+      const groups = partitionSkinTriangles(
+        indexData.data, jointData.data, weightData.data, parentSlots, sourceSkin.joints.length, limit,
+      );
+      for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+        const group = groups[groupIndex];
+        const keptSlots = [...group.joints].sort((left, right) => left - right);
+        const values = inverse ? new Float32Array(keptSlots.length * 16) : null;
+        if (values) {
+          keptSlots.forEach((oldSlot, nextSlot) => {
+            values.set(inverse.data.subarray(oldSlot * 16, oldSlot * 16 + 16), nextSlot * 16);
+          });
+        }
+        const { joints: ignoredJoints, inverseBindMatrices: ignoredInverse,
+          skeleton: ignoredSkeleton, name: skinName, ...skinRest } = sourceSkin;
+        records.push({
+          primitiveIndex,
+          groupIndex,
+          primitive: compactSkinPrimitive(state, primitive, group, keptSlots),
+          skin: {
+            ...skinRest,
+            ...(skinName ? { name: `${skinName}_P${primitiveIndex}_G${groupIndex}` } : {}),
+            joints: keptSlots.map((slot) => sourceSkin.joints[slot]),
+            ...(values ? { inverseBindMatrices: writeAccessor(state, values, 5126, 'MAT4') } : {}),
+          },
+        });
+      }
+    }
+    if (records.length === 0) throw new Error('蒙皮网格拆分后没有可导出的三角面');
+
+    const siblingIndices = [];
+    records.forEach((record, recordIndex) => {
+      const suffix = `_P${record.primitiveIndex}_G${record.groupIndex}`;
+      const { primitives: ignoredPrimitives, name: meshName, ...meshRest } = sourceMesh;
+      const meshIndex = json.meshes.length;
+      json.meshes.push({
+        ...meshRest,
+        ...(meshName ? { name: `${meshName}${suffix}` } : {}),
+        primitives: [record.primitive],
+      });
+      const skinIndex = json.skins.length;
+      json.skins.push(record.skin);
+      const cloned = cloneSkinSkeleton(
+        json,
+        record.skin.joints,
+        parents,
+        `${suffix}_Skeleton`,
+      );
+      record.skin.joints = cloned.joints;
+      duplicateAnimationChannelsForNodeMap(json, cloned.cloneMap);
+
+      if (recordIndex === 0) {
+        json.nodes[nodeIndex] = { ...sourceNode, mesh: meshIndex, skin: skinIndex };
+      } else {
+        const { children: ignoredChildren, name, ...nodeRest } = sourceNode;
+        const siblingIndex = json.nodes.length;
+        json.nodes.push({ ...nodeRest, ...(name ? { name: `${name}${suffix}` } : {}), mesh: meshIndex, skin: skinIndex });
+        siblingIndices.push(siblingIndex);
+      }
+    });
+    attachSiblingNodes(json, nodeIndex, siblingIndices);
+    duplicateNodeAnimationChannels(json, nodeIndex, siblingIndices);
+  }
+  pruneUnusedSkins(state);
+}
+
+/** 即使各自不超过 64 根，不同 Skin 之间也不能共享关节节点。 */
+function isolateSharedSkinSkeletons(state) {
+  const { json } = state;
+  const parents = parentMapOf(json);
+  const usedSkinIndices = [...new Set(
+    (json.nodes || []).map((node) => node.skin).filter(Number.isInteger),
+  )];
+  const ownerByJoint = new Map();
+  for (const skinIndex of usedSkinIndices) {
+    const skin = json.skins?.[skinIndex];
+    if (!skin || !Array.isArray(skin.joints)) continue;
+    const overlaps = skin.joints.some((joint) => {
+      const owner = ownerByJoint.get(joint);
+      return owner !== undefined && owner !== skinIndex;
+    });
+    if (!overlaps) {
+      for (const joint of skin.joints) ownerByJoint.set(joint, skinIndex);
+      continue;
+    }
+    const cloned = cloneSkinSkeleton(json, skin.joints, parents, `_SharedSkin${skinIndex}`);
+    const replacement = json.skins.length;
+    json.skins.push({ ...structuredClone(skin), joints: cloned.joints });
+    for (const node of json.nodes || []) {
+      if (node.skin === skinIndex) node.skin = replacement;
+    }
+    for (const joint of cloned.joints) ownerByJoint.set(joint, replacement);
+    duplicateAnimationChannelsForNodeMap(json, cloned.cloneMap);
+  }
+  pruneUnusedSkins(state);
+}
+
 function markMeshBufferTargets(state) {
   const { json } = state;
   for (const mesh of json.meshes || []) {
@@ -1255,8 +1674,29 @@ function dedupeAnimationInputs(state) {
 
 function assertVehicleSkinCompatibility(state) {
   const { json } = state;
+  const jointOwner = new Map();
   for (const node of json.nodes || []) {
     if (!Number.isInteger(node.skin) || !Number.isInteger(node.mesh)) continue;
+    const skin = json.skins?.[node.skin];
+    if (!skin || !Array.isArray(skin.joints) || skin.joints.length > MAX_VEHICLE_SKIN_JOINTS) {
+      throw new Error(`车机蒙皮骨骼数量不能超过 ${MAX_VEHICLE_SKIN_JOINTS} 根`);
+    }
+    if (Number.isInteger(skin.inverseBindMatrices)) {
+      const inverse = readAccessorData(state, skin.inverseBindMatrices);
+      if (!inverse || inverse.comps !== 16 || inverse.accessor.count !== skin.joints.length) {
+        throw new Error('蒙皮模型的 inverseBindMatrices 数量与骨骼数量不匹配');
+      }
+    }
+    for (const joint of skin.joints) {
+      if (!Number.isInteger(joint) || !json.nodes?.[joint]) {
+        throw new Error('蒙皮模型引用了不存在的骨骼节点');
+      }
+      const owner = jointOwner.get(joint);
+      if (owner !== undefined && owner !== node.skin) {
+        throw new Error('车机兼容 Skin 之间不能共享骨骼节点');
+      }
+      jointOwner.set(joint, node.skin);
+    }
     for (const primitive of json.meshes?.[node.mesh]?.primitives || []) {
       const indices = json.accessors?.[primitive.indices];
       const joints = json.accessors?.[primitive.attributes?.JOINTS_0];
@@ -1272,6 +1712,23 @@ function assertVehicleSkinCompatibility(state) {
         if (!view || Number.isInteger(view.byteStride)) {
           throw new Error('蒙皮网格仍包含车机不兼容的交错顶点数据');
         }
+      }
+      const jointValues = readAccessorData(state, primitive.attributes?.JOINTS_0)?.data;
+      const weightValues = readAttributeAsFloat(state, primitive.attributes?.WEIGHTS_0)?.data;
+      if (!jointValues || !weightValues || jointValues.length !== weightValues.length) {
+        throw new Error('蒙皮网格的骨骼索引与权重数量不匹配');
+      }
+      for (let index = 0; index < jointValues.length; index++) {
+        if (Number(weightValues[index]) > 0 && Number(jointValues[index]) >= skin.joints.length) {
+          throw new Error('蒙皮网格包含超出当前 Skin 的骨骼索引');
+        }
+      }
+    }
+  }
+  for (const animation of json.animations || []) {
+    for (const channel of animation.channels || []) {
+      if (!Number.isInteger(channel.target?.node) || !json.nodes?.[channel.target.node]) {
+        throw new Error('动画轨道引用了不存在的节点');
       }
     }
   }
@@ -1938,17 +2395,18 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
   return output.channels.length ? output : null;
 }
 
-function eventTransitionSet(state, sourceEvent, targetEvent) {
+function eventTransitionSet(state, sourceEvent, targetEvent, phases = EVENT_TRANSITION_PHASES) {
   const durationMs = targetEvent.playback.transitionMs;
   if (!(durationMs > 0)) return null;
-  const phases = EVENT_TRANSITION_PHASES;
-  const targetPose = animationPoseAt(state, targetEvent.active, 0);
+  const targetPose = targetEvent.transitionPoses?.[0] || animationPoseAt(state, targetEvent.active, 0);
   const animations = [];
   for (let index = 0; index < phases.length; index++) {
+    const cachedIndex = EVENT_TRANSITION_PHASES.indexOf(phases[index]);
+    const sourcePose = cachedIndex >= 0 ? sourceEvent.transitionPoses?.[cachedIndex] : null;
     const name = `BYD_TR_${sourceEvent.slot.id}_${targetEvent.slot.id}_P${index}`;
     const animation = poseTransitionClip(
       state,
-      animationPoseAt(state, sourceEvent.active, phases[index]),
+      sourcePose || animationPoseAt(state, sourceEvent.active, phases[index]),
       targetPose,
       name,
       durationMs,
@@ -1965,8 +2423,14 @@ function eventTransitionSet(state, sourceEvent, targetEvent) {
   };
 }
 
+function transitionPhasesForPairCount(pairCount) {
+  if (pairCount <= 24) return EVENT_TRANSITION_PHASES;
+  if (pairCount <= 72) return [0, 2 / 3];
+  return [0];
+}
+
 /** 为事件的四个代表相位生成“当前动作姿态 -> 模型静态默认姿态”的退出过渡。 */
-function eventResetSet(state, event) {
+function eventResetSet(state, event, transitionPoses = null) {
   const durationMs = event.playback.transitionMs;
   if (!(durationMs > 0)) return null;
   const animations = [];
@@ -1974,7 +2438,7 @@ function eventResetSet(state, event) {
     const name = `BYD_RST_${event.slot.id}_P${index}`;
     const animation = poseTransitionClip(
       state,
-      animationPoseAt(state, event.active, EVENT_TRANSITION_PHASES[index]),
+      transitionPoses?.[index] || animationPoseAt(state, event.active, EVENT_TRANSITION_PHASES[index]),
       new Map(),
       name,
       durationMs,
@@ -2011,7 +2475,8 @@ function eventAnimationSet(state, source, slot, binding) {
   const off = playback.endMode === 'reverse'
     ? reverseAnimationClip(state, active, `${base}_OFF`)
     : null;
-  const reset = eventResetSet(state, { slot, active, playback });
+  const transitionPoses = EVENT_TRANSITION_PHASES.map((phase) => animationPoseAt(state, active, phase));
+  const reset = eventResetSet(state, { slot, active, playback }, transitionPoses);
   const spec = {
     enter: enter?.name || '',
     on: on.name,
@@ -2043,10 +2508,13 @@ function eventAnimationSet(state, source, slot, binding) {
     spec,
     active,
     playback,
+    transitionPoses,
   };
 }
 
-async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions, removeShadow = false) {
+async function normalizeAnimatedOtherGlb(
+  parsed, transform, bindings, deletions, removeShadow = false, onProgress = null,
+) {
   const state = { json: structuredClone(parsed.json), bin: parsed.bin };
   const { json } = state;
   const sceneIndex = Number.isInteger(json.scene) ? json.scene : 0;
@@ -2071,7 +2539,9 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions,
   const outputAnimations = [];
   const eventBindings = {};
   const eventRecords = [];
-  for (const binding of bindings || []) {
+  const requestedBindings = bindings || [];
+  for (let bindingIndex = 0; bindingIndex < requestedBindings.length; bindingIndex++) {
+    const binding = requestedBindings[bindingIndex];
     const slot = SLOT_BY_ID.get(binding.slotId);
     const source = sourceAnimations[binding.sourceAnimationIndex];
     if (!slot || !Number.isInteger(binding.sourceAnimationIndex)) continue;
@@ -2079,18 +2549,32 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions,
     const event = eventAnimationSet(state, source, slot, binding);
     outputAnimations.push(...event.animations);
     eventRecords.push({ slot, binding, ...event });
+    onProgress?.(
+      requestedBindings.length ? ((bindingIndex + 1) / requestedBindings.length) * 0.32 : 0.32,
+      `正在生成绑定动画（${bindingIndex + 1}/${requestedBindings.length}）`,
+    );
+    await yieldToBrowser();
   }
 
   // 为每一对已绑定事件生成切换过渡。过渡时长取目标事件的设置，因此用户
   // 可以单独控制“切入左转”与“恢复前进”的速度。
+  const transitionTotal = eventRecords.length * Math.max(0, eventRecords.length - 1);
+  const transitionPhases = transitionPhasesForPairCount(transitionTotal);
+  let transitionBuilt = 0;
   for (const target of eventRecords) {
     const transitions = {};
     for (const source of eventRecords) {
       if (source.slot.id === target.slot.id) continue;
-      const transition = eventTransitionSet(state, source, target);
+      const transition = eventTransitionSet(state, source, target, transitionPhases);
       if (!transition) continue;
       outputAnimations.push(...transition.animations);
       transitions[source.slot.id] = transition.spec;
+      transitionBuilt++;
+      onProgress?.(
+        0.32 + (transitionTotal ? transitionBuilt / transitionTotal : 1) * 0.46,
+        `正在生成动作切换过渡（${transitionBuilt}/${transitionTotal}）`,
+      );
+      await yieldToBrowser();
     }
     const spec = target.spec;
     const { playback, ...eventSpec } = spec;
@@ -2103,8 +2587,13 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions,
       } : {}),
     };
   }
+  if (transitionPhases.length < EVENT_TRANSITION_PHASES.length) {
+    onProgress?.(0.8, `动作较多，切换过渡已自动精简为 ${transitionPhases.length} 相位`);
+  }
   json.animations = outputAnimations.length ? outputAnimations : undefined;
 
+  onProgress?.(0.82, '正在生成阴影和车机材质');
+  await yieldToBrowser();
   const shadowIndex = removeShadow
     ? null
     : await addAutomaticShadow(state, boundsOfOutputGeometry(state, sourceRoots, [], bake));
@@ -2127,6 +2616,8 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions,
   dedupeMaterials(state);
   await bakeDirectionalGradient(state, bake, new Set());
   normalizeSkinnedMeshesForVehicle(state);
+  splitSkinJointsForVehicle(state);
+  isolateSharedSkinSkeletons(state);
   dedupeAnimationInputs(state);
   markMeshBufferTargets(state);
   assertVehicleSkinCompatibility(state);
@@ -2134,7 +2625,10 @@ async function normalizeAnimatedOtherGlb(parsed, transform, bindings, deletions,
   pruneUnusedMeshes(state);
   pruneUnusedTextures(state);
   pruneUnusedAccessors(state);
+  onProgress?.(0.96, '正在整理模型数据');
+  await yieldToBrowser();
   repackBin(state);
+  onProgress?.(1, '绑定动画已生成');
   return { state, eventBindings };
 }
 
@@ -2240,7 +2734,11 @@ function consumeBindingRegions(state, bindings, sourceRoots, bake) {
   }
 }
 
-/** 丢弃孤儿数据：把所有被引用的 bufferView 紧凑复制进新 BIN。 */
+/**
+ * 丢弃孤儿数据并合并动画 bufferView。导出器会为每条轨道创建一个 accessor，
+ * 若每个 accessor 继续独占一个 bufferView，JSON 描述会比关键帧本身大很多。
+ * 图片和带特殊布局的 view 保持独立，避免改变车机读取语义。
+ */
 function repackBin(state) {
   const { json } = state;
   if (!Array.isArray(json.bufferViews)) return;
@@ -2253,32 +2751,80 @@ function repackBin(state) {
   for (const image of json.images || []) {
     if (Number.isInteger(image.bufferView)) referenced.add(image.bufferView);
   }
+  const imageViews = new Set((json.images || [])
+    .map((image) => image.bufferView)
+    .filter((index) => Number.isInteger(index)));
+  const sparseViews = new Set();
+  for (const accessor of json.accessors || []) {
+    if (Number.isInteger(accessor.sparse?.indices?.bufferView)) sparseViews.add(accessor.sparse.indices.bufferView);
+    if (Number.isInteger(accessor.sparse?.values?.bufferView)) sparseViews.add(accessor.sparse.values.bufferView);
+  }
   const remap = new Map();
-  const kept = [];
-  let total = 0;
+  const groups = new Map();
+  const standalone = [];
   for (let i = 0; i < json.bufferViews.length; i++) {
     if (!referenced.has(i)) continue;
     const view = json.bufferViews[i];
+    if (imageViews.has(i) || sparseViews.has(i) || Number.isInteger(view.byteStride)) {
+      standalone.push({ index: i, view, from: view.byteOffset || 0, length: view.byteLength });
+      continue;
+    }
+    const key = String(view.target || 0);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ index: i, view, from: view.byteOffset || 0, length: view.byteLength });
+  }
+  let total = 0;
+  const outputViews = [];
+  const copies = [];
+  const appendGroup = (items, target) => {
     total = (total + 3) & ~3;
-    const copy = { ...view, byteOffset: total };
-    remap.set(i, kept.length);
-    kept.push({ view: copy, from: (view.byteOffset || 0), length: view.byteLength });
-    total += view.byteLength;
+    const groupOffset = total;
+    let groupLength = 0;
+    for (const item of items) {
+      groupLength = (groupLength + 3) & ~3;
+      remap.set(item.index, { view: outputViews.length, offset: groupLength });
+      groupLength += item.length;
+      copies.push({ from: item.from, length: item.length, to: groupOffset + groupLength - item.length });
+    }
+    outputViews.push({ buffer: 0, byteOffset: groupOffset, byteLength: groupLength, ...(target ? { target } : {}) });
+    total = groupOffset + groupLength;
+  };
+  for (const [key, items] of groups) appendGroup(items, Number(key) || undefined);
+  for (const item of standalone) {
+    total = (total + 3) & ~3;
+    const viewIndex = outputViews.length;
+    remap.set(item.index, { view: viewIndex, offset: 0 });
+    outputViews.push({ ...item.view, buffer: 0, byteOffset: total });
+    copies.push({ from: item.from, length: item.length, to: total });
+    total += item.length;
   }
   const merged = new Uint8Array(total);
-  for (const item of kept) {
-    merged.set(state.bin.subarray(item.from, item.from + item.length), item.view.byteOffset);
+  for (const copy of copies) {
+    merged.set(state.bin.subarray(copy.from, copy.from + copy.length), copy.to);
   }
-  json.bufferViews = kept.map((item) => item.view);
+  json.bufferViews = outputViews;
   for (const accessor of json.accessors || []) {
-    if (Number.isInteger(accessor.bufferView)) accessor.bufferView = remap.get(accessor.bufferView);
-    if (Number.isInteger(accessor.sparse?.indices?.bufferView)) accessor.sparse.indices.bufferView = remap.get(accessor.sparse.indices.bufferView);
-    if (Number.isInteger(accessor.sparse?.values?.bufferView)) accessor.sparse.values.bufferView = remap.get(accessor.sparse.values.bufferView);
+    if (Number.isInteger(accessor.bufferView)) {
+      const mapped = remap.get(accessor.bufferView);
+      accessor.byteOffset = (accessor.byteOffset || 0) + (mapped?.offset || 0);
+      accessor.bufferView = mapped?.view;
+    }
+    if (Number.isInteger(accessor.sparse?.indices?.bufferView)) {
+      const mapped = remap.get(accessor.sparse.indices.bufferView);
+      accessor.sparse.indices.bufferView = mapped?.view;
+      accessor.sparse.indices.byteOffset = (accessor.sparse.indices.byteOffset || 0) + (mapped?.offset || 0);
+    }
+    if (Number.isInteger(accessor.sparse?.values?.bufferView)) {
+      const mapped = remap.get(accessor.sparse.values.bufferView);
+      accessor.sparse.values.bufferView = mapped?.view;
+      accessor.sparse.values.byteOffset = (accessor.sparse.values.byteOffset || 0) + (mapped?.offset || 0);
+    }
   }
   for (const image of json.images || []) {
-    if (Number.isInteger(image.bufferView)) image.bufferView = remap.get(image.bufferView);
+    if (Number.isInteger(image.bufferView)) image.bufferView = remap.get(image.bufferView)?.view;
   }
   state.bin = merged;
+  delete state[BIN_STORAGE];
   if (json.buffers?.[0]) json.buffers[0].byteLength = merged.byteLength;
 }
 
@@ -2652,6 +3198,27 @@ function pruneUnusedMeshes(state) {
   json.meshes = kept;
   for (const node of json.nodes || []) {
     if (Number.isInteger(node.mesh)) node.mesh = remap.get(node.mesh);
+  }
+}
+
+/** 删除没有节点引用的骨架，并重映射节点上的 skin 下标。 */
+function pruneUnusedSkins(state) {
+  const { json } = state;
+  if (!Array.isArray(json.skins)) return;
+  const used = new Set();
+  for (const node of json.nodes || []) {
+    if (Number.isInteger(node.skin)) used.add(node.skin);
+  }
+  const remap = new Map();
+  const kept = [];
+  json.skins.forEach((skin, index) => {
+    if (!used.has(index)) return;
+    remap.set(index, kept.length);
+    kept.push(skin);
+  });
+  json.skins = kept;
+  for (const node of json.nodes || []) {
+    if (Number.isInteger(node.skin)) node.skin = remap.get(node.skin);
   }
 }
 
@@ -3303,21 +3870,43 @@ export async function makeVehiclePreviewGlb(
   quality,
   modelType = 'vehicle',
   removeShadow = false,
+  onProgress = null,
 ) {
+  const report = createProgressReporter(onProgress);
   const exportQuality = normalizeExportQuality(quality);
+  report(0.02, '正在解析模型');
+  await yieldToBrowser();
   const parsed = parseGlb(sourceBytes);
+  report(0.12, '正在烘焙材质');
+  await yieldToBrowser();
   const baked = await bakeMaterialsForVehicle(parsed);
+  report(0.22, '正在生成预览动画');
   const normalized = modelType === 'other'
-    ? (await normalizeAnimatedOtherGlb(baked, transform, bindings, deletions, removeShadow)).state
+    ? (await normalizeAnimatedOtherGlb(
+      baked,
+      transform,
+      bindings,
+      deletions,
+      removeShadow,
+      (progress, label) => report(0.22 + progress * 0.4, label),
+    )).state
     : await normalizeParsedGlb(baked, transform, bindings, [], deletions, removeShadow);
+  report(0.66, '正在处理预览贴图');
   await resizeEmbeddedImages(normalized, exportQuality.textureMaxSize);
-  const simplified = await simplifyMeshToTarget(normalized, exportQuality.triangleTarget);
-  if (modelType === 'other' && simplified > 0) {
+  report(0.74, '正在优化预览网格');
+  await simplifyMeshToTarget(normalized, exportQuality.triangleTarget);
+  if (modelType === 'other') {
     normalizeSkinnedMeshesForVehicle(normalized);
+    report(0.8, '正在压缩预览骨架');
+    splitSkinJointsForVehicle(normalized);
+    isolateSharedSkinSkeletons(normalized);
     markMeshBufferTargets(normalized);
     pruneUnusedAccessors(normalized);
     repackBin(normalized);
     assertVehicleSkinCompatibility(normalized);
   }
+  report(0.9, '正在完成预览');
+  await yieldToBrowser();
+  report(1, '车机质感预览已完成');
   return buildGlb(normalized.json, normalized.bin);
 }

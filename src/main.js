@@ -235,7 +235,7 @@ app.innerHTML = `
               </div>
               <div class="field-grid two-cols">
                 <div class="field"><label for="target-length" id="target-length-label">车身最长边（米）</label><input id="target-length" type="number" min="0.5" max="10" step="0.1" value="5.2" disabled /></div>
-                <div class="field"><label for="height-offset">离地高度（米）</label><input id="height-offset" type="number" min="0" max="3" step="0.05" value="0" disabled /></div>
+                <div class="field"><label for="height-offset">离地高度（米）</label><input id="height-offset" type="number" max="3" step="0.05" value="0" disabled /></div>
               </div>
               <label class="setting-switch" for="remove-shadow">
                 <span>去掉模型阴影</span>
@@ -767,7 +767,8 @@ ui['target-length'].addEventListener('input', () => {
 wireContinuousHistory(ui['target-length'], { scope: 'model-input', field: 'target-length' });
 ui['height-offset'].addEventListener('input', () => {
   renormalizeAndMigrate(() => {
-    preview.heightOffset = Math.min(3, Math.max(0, Number(ui['height-offset'].value) || 0));
+    const value = Number(ui['height-offset'].value);
+    preview.heightOffset = Number.isFinite(value) ? Math.min(3, value) : 0;
     preview.normalize();
   });
 });
@@ -860,6 +861,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
     if (device && (!deviceGlbCache || deviceGlbCacheKey !== cacheKey)) {
       ui['mode-device'].textContent = '烘焙中…';
       ui['mode-device-mobile'].textContent = '处理中…';
+      updateImportProgress({ progress: 0, label: '正在准备车机质感预览' });
       const nextDeviceGlb = await makeVehiclePreviewGlb(
         current.bytes,
         transform,
@@ -868,6 +870,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
         quality,
         modelType,
         removeShadow,
+        updateImportProgress,
       );
       if (requestId !== previewModeRequestId) return false;
       deviceGlbCache = nextDeviceGlb;
@@ -908,6 +911,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
     return false;
   } finally {
     if (requestId === previewModeRequestId) {
+      finishImportProgress();
       for (const id of ['mode-web', 'mode-device', 'mode-web-mobile', 'mode-device-mobile']) ui[id].disabled = false;
     }
   }
@@ -2502,7 +2506,7 @@ function otherBindingEditor(slot, binding) {
          <div class="other-playback-grid">
            ${slot.id === 'CS_Idle' ? `<div class="field">
              <label for="bind-trigger-delay">停车后触发</label>
-             <div class="input-suffix"><input id="bind-trigger-delay" type="number" min="1" max="600" step="1" value="${idleDelay}" /><span>秒</span></div>
+             <div class="input-suffix"><input id="bind-trigger-delay" type="number" min="0" max="600" step="1" value="${idleDelay}" /><span>秒</span></div>
            </div>` : ''}
             <div class="field">
               <label for="bind-playback-mode">打开时播放方式</label>
@@ -3449,6 +3453,7 @@ async function generatePackage() {
   ui['mobile-generate'].innerHTML = '<span class="spinner"></span>生成中…';
   const quality = exportQuality();
   setStatuses([['warn', '…', `正在按“${quality.label}”质量生成车模包`]]);
+  updateImportProgress({ progress: 0, label: '正在准备导出' });
   try {
     const result = await makeBydCar({
       sourceBytes: current.bytes,
@@ -3460,6 +3465,7 @@ async function generatePackage() {
       deletions: deletions.map((item) => item.region),
       quality,
       removeShadow,
+      onProgress: updateImportProgress,
     });
     const blob = new Blob([result.bytes], { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
@@ -3482,6 +3488,7 @@ async function generatePackage() {
     setStatuses([['bad', '×', `生成失败：${error.message || '未知错误'}`]]);
     showMessage(`生成失败：${error.message || '未知错误'}`, 'error');
   } finally {
+    finishImportProgress();
     buttons.forEach((button, index) => {
       if (!button) return;
       button.disabled = false;

@@ -119,8 +119,9 @@ export function playbackDurationOf(sourceDuration, playback, { cycle = true } = 
 }
 
 export function normalizeIdleDelaySeconds(value) {
+  if (value === '' || (typeof value === 'string' && value.trim() === '')) return 5;
   const seconds = Number(value);
-  return Number.isFinite(seconds) ? Math.min(600, Math.max(1, Math.round(seconds))) : 5;
+  return Number.isFinite(seconds) ? Math.min(600, Math.max(0, Math.round(seconds))) : 5;
 }
 
 const OTHER_ACTION_OPTIONS = {
