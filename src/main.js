@@ -237,6 +237,11 @@ app.innerHTML = `
                 <div class="field"><label for="target-length" id="target-length-label">车身最长边（米）</label><input id="target-length" type="number" min="0.5" max="10" step="0.1" value="5.2" disabled /></div>
                 <div class="field"><label for="height-offset">离地高度（米）</label><input id="height-offset" type="number" max="3" step="0.05" value="0" disabled /></div>
               </div>
+              <label class="range-field model-brightness-field" for="model-brightness">
+                模型自身亮度
+                <output id="model-brightness-output" for="model-brightness">100%</output>
+                <input id="model-brightness" type="range" min="50" max="300" step="5" value="100" disabled />
+              </label>
               <label class="setting-switch" for="remove-shadow">
                 <span>去掉模型阴影</span>
                 <input id="remove-shadow" type="checkbox" role="switch" disabled />
@@ -358,7 +363,8 @@ const ui = Object.fromEntries([
   'model-type-home', 'editor-shell', 'home-open-project', 'home-open-project-mobile', 'model-type-switch',
   'model-type-icon', 'model-type-label', 'editor-brand-title', 'empty-state-title', 'model-file', 'project-file', 'drop-zone', 'file-name', 'save-status', 'analysis-state', 'empty-state',
   'source-format-label',
-  'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'target-length-label', 'height-offset', 'remove-shadow', 'orientation-mode-hint', 'status-list',
+  'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'target-length-label', 'height-offset',
+  'model-brightness', 'model-brightness-output', 'remove-shadow', 'orientation-mode-hint', 'status-list',
   'generate', 'mobile-generate', 'mobile-generate-shortcut', 'save-project', 'mobile-save-project',
   'open-project', 'inspector-open-project', 'reset-rotation', 'mobile-reset', 'mode-web', 'mode-device',
   'mode-web-mobile', 'mode-device-mobile',
@@ -381,6 +387,7 @@ let dirty = false;
 let projectSaved = false;
 let activePanel = 'model';
 let removeShadow = false;
+let modelBrightness = 1;
 const QUALITY_PRESETS = {
   smooth: { label: '流畅', triangleTarget: 80000, textureMaxSize: 1024 },
   balanced: { label: '均衡', triangleTarget: 160000, textureMaxSize: 2048 },
@@ -398,6 +405,18 @@ const MODEL_TYPES = {
 
 function normalizeModelType(value) {
   return value === 'other' ? 'other' : 'vehicle';
+}
+
+function normalizeModelBrightness(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(3, Math.max(0.5, number)) : 1;
+}
+
+function renderModelBrightness() {
+  const percent = Math.round(modelBrightness * 100);
+  ui['model-brightness'].value = percent;
+  ui['model-brightness-output'].value = `${percent}%`;
+  ui['model-brightness-output'].textContent = `${percent}%`;
 }
 
 function activeSlot(slotOrId) {
@@ -447,6 +466,7 @@ function resetWorkspaceForTypeSelection() {
   projectSaved = false;
   selectedQuality = 'original';
   removeShadow = false;
+  modelBrightness = 1;
   customQuality.triangleTarget = 300000;
   customQuality.textureMaxSize = 4096;
   deletions = [];
@@ -474,9 +494,11 @@ function resetWorkspaceForTypeSelection() {
   ui['rotation-z'].value = 0;
   ui['target-length'].value = 5.2;
   ui['height-offset'].value = 0;
+  renderModelBrightness();
   ui['remove-shadow'].checked = false;
   preview.targetLength = 5.2;
   preview.heightOffset = 0;
+  preview.setBrightness(1);
   preview.setRemoveShadow(false);
   undoStack.length = 0;
   redoStack.length = 0;
@@ -773,6 +795,16 @@ ui['height-offset'].addEventListener('input', () => {
   });
 });
 wireContinuousHistory(ui['height-offset'], { scope: 'model-input', field: 'height-offset' });
+ui['model-brightness'].addEventListener('input', () => {
+  if (!current) return;
+  modelBrightness = normalizeModelBrightness(Number(ui['model-brightness'].value) / 100);
+  renderModelBrightness();
+  preview.setBrightness(modelBrightness);
+  markDevicePreviewStale();
+  setDirty();
+  refreshDevicePreviewForQuality();
+});
+wireContinuousHistory(ui['model-brightness'], { scope: 'model-input', field: 'model-brightness' });
 ui['remove-shadow'].addEventListener('change', () => {
   if (!current) return;
   snapshot({ scope: 'shadow' });
@@ -857,7 +889,10 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
     const previewBindings = bindingsForOutput();
     const previewDeletions = deletions.map((item) => item.region);
     const quality = exportQuality();
-    const cacheKey = JSON.stringify({ modelType, transform, bindings: previewBindings, deletions: previewDeletions, quality, removeShadow });
+    const cacheKey = JSON.stringify({
+      modelType, transform, bindings: previewBindings, deletions: previewDeletions,
+      quality, removeShadow, modelBrightness,
+    });
     if (device && (!deviceGlbCache || deviceGlbCacheKey !== cacheKey)) {
       ui['mode-device'].textContent = '烘焙中…';
       ui['mode-device-mobile'].textContent = '处理中…';
@@ -870,6 +905,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
         quality,
         modelType,
         removeShadow,
+        modelBrightness,
         updateImportProgress,
       );
       if (requestId !== previewModeRequestId) return false;
@@ -1017,6 +1053,9 @@ async function activatePreparedModel(prepared, {
 }) {
   const activeModelType = normalizeModelType(modelType || prepared.modelType);
   modelType = activeModelType;
+  modelBrightness = normalizeModelBrightness(editorState?.modelBrightness ?? 1);
+  renderModelBrightness();
+  preview.setBrightness(modelBrightness);
   removeShadow = editorState?.removeShadow === true;
   ui['remove-shadow'].checked = removeShadow;
   preview.setRemoveShadow(removeShadow);
@@ -1213,6 +1252,7 @@ function normalizeProjectState(raw) {
     rotation: validNumberArray(raw.rotation, 3) ? raw.rotation.map(Number) : [0, 0, 0],
     targetLength: finiteNumber(raw.targetLength, 5.2),
     heightOffset: finiteNumber(raw.heightOffset, 0),
+    modelBrightness: normalizeModelBrightness(raw.modelBrightness),
     removeShadow: raw.removeShadow === true,
     transform: structuredClone(transform),
     activePanel: activePanelValue,
@@ -1314,7 +1354,10 @@ function setStatuses(items) {
 }
 
 function setControls(enabled) {
-  for (const id of ['rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'height-offset', 'remove-shadow']) ui[id].disabled = !enabled;
+  for (const id of [
+    'rotation-x', 'rotation-y', 'rotation-z', 'target-length', 'height-offset',
+    'model-brightness', 'remove-shadow',
+  ]) ui[id].disabled = !enabled;
   ui.generate.disabled = !enabled;
   ui['mobile-generate'].disabled = !enabled;
   document.getElementById('mobile-generate-shortcut').disabled = !enabled;
@@ -1359,7 +1402,12 @@ function reset() {
   preview.targetLength = 5.2;
   ui['height-offset'].value = 0;
   preview.heightOffset = 0;
+  modelBrightness = 1;
+  renderModelBrightness();
+  preview.setBrightness(modelBrightness);
   updateRotation();
+  markDevicePreviewStale();
+  refreshDevicePreviewForQuality();
   preview.view('perspective');
 }
 
@@ -1618,6 +1666,7 @@ function captureSnapshot() {
     rotation: ['x', 'y', 'z'].map((axis) => Number(ui[`rotation-${axis}`].value) || 0),
     targetLength: Number(ui['target-length'].value) || 5.2,
     heightOffset: Number(ui['height-offset'].value) || 0,
+    modelBrightness,
     removeShadow,
     transform: preview.getExportTransform(),
     activePanel,
@@ -1718,6 +1767,9 @@ function restoreSnapshot(snap, { markDirty = true } = {}) {
   preview.targetLength = snap.targetLength;
   ui['height-offset'].value = snap.heightOffset;
   preview.heightOffset = snap.heightOffset;
+  modelBrightness = normalizeModelBrightness(snap.modelBrightness);
+  renderModelBrightness();
+  preview.setBrightness(modelBrightness);
   removeShadow = snap.removeShadow === true;
   ui['remove-shadow'].checked = removeShadow;
   preview.setRemoveShadow(removeShadow);
@@ -3465,6 +3517,7 @@ async function generatePackage() {
       deletions: deletions.map((item) => item.region),
       quality,
       removeShadow,
+      brightness: modelBrightness,
       onProgress: updateImportProgress,
     });
     const blob = new Blob([result.bytes], { type: 'application/octet-stream' });
@@ -3478,6 +3531,7 @@ async function generatePackage() {
     setStatuses([
       ['good', '✓', `车模包已生成：${formatBytes(result.bytes.byteLength)}`],
       ['good', '✓', `导出质量：${quality.label}`],
+      ['good', '✓', `模型亮度：${Math.round(modelBrightness * 100)}%`],
       ['good', '✓', `几何：${current.stats.triangles.toLocaleString()} → ${result.manifest.model.outputStats.triangles.toLocaleString()} 三角形${current.stats.triangles === result.manifest.model.outputStats.triangles ? '（未减面）' : ''}`],
       ['good', '✓', 'CarSelf.dat 和 GLB 均已写入 SHA-256 校验值'],
       ['warn', '!', '导入地图后需要重启地图进程才能生效'],

@@ -54,7 +54,10 @@ function isShadowNode(json, node) {
 
 export async function makeBydCar(options) {
   if (options?.modelType === 'other') return makeAnimatedOtherBydCar(options);
-  const { sourceBytes, sourceName, transform, stats, bindings, deletions, quality, removeShadow = false, onProgress } = options;
+  const {
+    sourceBytes, sourceName, transform, stats, bindings, deletions, quality,
+    removeShadow = false, brightness = 1, onProgress,
+  } = options;
   const report = createProgressReporter(onProgress);
   const exportQuality = normalizeExportQuality(quality);
   report(0.02, '正在解析模型');
@@ -62,7 +65,7 @@ export async function makeBydCar(options) {
   const parsed = parseGlb(sourceBytes);
   report(0.12, '正在烘焙材质');
   await yieldToBrowser();
-  const baked = await bakeMaterialsForVehicle(parsed);
+  const baked = await bakeMaterialsForVehicle(parsed, brightness);
   const lamps = [];
   report(0.32, '正在生成车模联动');
   const normalizedState = await normalizeParsedGlb(baked, transform, bindings, lamps, deletions, removeShadow);
@@ -98,6 +101,7 @@ export async function makeBydCar(options) {
       stats,
       outputStats,
       quality: exportQuality,
+      brightness: normalizeModelBrightness(brightness),
     },
   };
 
@@ -145,7 +149,8 @@ export async function makeBydCar(options) {
 }
 
 async function makeAnimatedOtherBydCar({
-  sourceBytes, sourceName, transform, stats, bindings, deletions, quality, removeShadow = false, onProgress,
+  sourceBytes, sourceName, transform, stats, bindings, deletions, quality,
+  removeShadow = false, brightness = 1, onProgress,
 }) {
   const report = createProgressReporter(onProgress);
   const exportQuality = normalizeExportQuality(quality);
@@ -157,7 +162,7 @@ async function makeAnimatedOtherBydCar({
   }
   report(0.12, '正在烘焙材质');
   await yieldToBrowser();
-  const baked = await bakeMaterialsForVehicle(parsed);
+  const baked = await bakeMaterialsForVehicle(parsed, brightness);
   report(0.22, '正在生成绑定动画');
   const { state, eventBindings } = await normalizeAnimatedOtherGlb(
     baked, transform, bindings, deletions, removeShadow, (progress, label) => report(0.22 + progress * 0.36, label),
@@ -204,6 +209,7 @@ async function makeAnimatedOtherBydCar({
       stats,
       outputStats,
       quality: exportQuality,
+      brightness: normalizeModelBrightness(brightness),
     },
   };
   if (bindings?.length) {
@@ -277,6 +283,8 @@ async function makeLampTexture(color) {
 const METAL_DARKEN = 0.45;
 const ENV_REFLECT = 0.08; // 带贴图材质的均匀环境补偿（轻量，避免整体发白）
 const GLOSS_REFLECT = 0.35; // 非金属但高光泽（清漆/玻璃）按光泽度折算的反射比例
+const MIN_MODEL_BRIGHTNESS = 0.5;
+const MAX_MODEL_BRIGHTNESS = 3;
 
 /**
  * 无贴图的高反射纯色材质（典型：车漆）走“方向渐变”烘焙，照抄官方黑车的做法：
@@ -295,12 +303,29 @@ function reflectStrength(metal, roughness) {
   return metal + (1 - metal) * gloss * GLOSS_REFLECT;
 }
 
-async function bakeMaterialsForVehicle(parsed) {
+function normalizeModelBrightness(value) {
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? Math.min(MAX_MODEL_BRIGHTNESS, Math.max(MIN_MODEL_BRIGHTNESS, number))
+    : 1;
+}
+
+async function bakeMaterialsForVehicle(parsed, brightness = 1) {
   const json = structuredClone(parsed.json);
   const state = { json, bin: parsed.bin };
+  const normalizedBrightness = normalizeModelBrightness(brightness);
+  const shadowMaterialIndices = new Set();
+  for (const node of json.nodes || []) {
+    if (!isShadowNode(json, node)) continue;
+    for (const primitive of json.meshes?.[node.mesh]?.primitives || []) {
+      if (Number.isInteger(primitive.material)) shadowMaterialIndices.add(primitive.material);
+    }
+  }
 
   const bakedCache = new Map();
-  for (const material of json.materials || []) {
+  for (const [materialIndex, material] of (json.materials || []).entries()) {
+    const materialBrightness = shadowMaterialIndices.has(materialIndex) || isShadowMaterialName(material.name)
+      ? 1 : normalizedBrightness;
     const pbr = material.pbrMetallicRoughness || (material.pbrMetallicRoughness = {});
 
     const sheen = material.extensions?.KHR_materials_sheen;
@@ -333,14 +358,14 @@ async function bakeMaterialsForVehicle(parsed) {
       : Number.isInteger(emisImage);
     if (needsPixelBake) {
       const cacheKey = [baseImage, mrImage, aoImage, emisImage, metallicFactor, roughnessFactor,
-        occlusionStrength, factor.join(','), emissiveFactor.join(',')].join('|');
+        occlusionStrength, factor.join(','), emissiveFactor.join(','), materialBrightness].join('|');
       let bakedTexture = bakedCache.get(cacheKey);
       if (bakedTexture === undefined) {
         bakedTexture = null;
         try {
           const png = await bakeAlbedoPng(state, {
             baseImage, factor, mrImage, metallicFactor, roughnessFactor,
-            aoImage, occlusionStrength, emisImage, emissiveFactor,
+            aoImage, occlusionStrength, emisImage, emissiveFactor, brightness: materialBrightness,
           });
           const bufferView = appendImageToBin(state, png);
           if (!Array.isArray(json.images)) json.images = [];
@@ -377,8 +402,12 @@ async function bakeMaterialsForVehicle(parsed) {
         ...(material.extras || {}),
         [GRAD_MARK]: {
           // 极暗车漆补少量环境底光，避免地图简单光照再次压成纯黑剪影。
-          base: [factor[0] * darken + ambient, factor[1] * darken + ambient, factor[2] * darken + ambient],
-          reflect,
+          base: [
+            (factor[0] * darken + ambient) * materialBrightness,
+            (factor[1] * darken + ambient) * materialBrightness,
+            (factor[2] * darken + ambient) * materialBrightness,
+          ],
+          reflect: reflect * materialBrightness,
           alpha: factor[3] ?? 1,
         },
       };
@@ -466,7 +495,7 @@ async function decodeToImageData(state, imageIndex, width, height) {
 async function bakeAlbedoPng(state, options) {
   const {
     baseImage, factor, mrImage, metallicFactor, roughnessFactor,
-    aoImage, occlusionStrength, emisImage, emissiveFactor,
+    aoImage, occlusionStrength, emisImage, emissiveFactor, brightness = 1,
   } = options;
   const probe = Number.isInteger(baseImage) ? baseImage : emisImage;
   const probeRaw = imageBytesOf(state, probe);
@@ -507,9 +536,9 @@ async function bakeAlbedoPng(state, options) {
       g += (emissive.data[i + 1] / 255) * emissiveFactor[1];
       b += (emissive.data[i + 2] / 255) * emissiveFactor[2];
     }
-    dst[i] = Math.min(255, Math.round(r * 255));
-    dst[i + 1] = Math.min(255, Math.round(g * 255));
-    dst[i + 2] = Math.min(255, Math.round(b * 255));
+    dst[i] = Math.min(255, Math.round(r * brightness * 255));
+    dst[i + 1] = Math.min(255, Math.round(g * brightness * 255));
+    dst[i + 2] = Math.min(255, Math.round(b * brightness * 255));
     dst[i + 3] = alpha;
   }
   const canvas = makeCanvas(width, height);
@@ -3870,6 +3899,7 @@ export async function makeVehiclePreviewGlb(
   quality,
   modelType = 'vehicle',
   removeShadow = false,
+  brightness = 1,
   onProgress = null,
 ) {
   const report = createProgressReporter(onProgress);
@@ -3879,7 +3909,7 @@ export async function makeVehiclePreviewGlb(
   const parsed = parseGlb(sourceBytes);
   report(0.12, '正在烘焙材质');
   await yieldToBrowser();
-  const baked = await bakeMaterialsForVehicle(parsed);
+  const baked = await bakeMaterialsForVehicle(parsed, brightness);
   report(0.22, '正在生成预览动画');
   const normalized = modelType === 'other'
     ? (await normalizeAnimatedOtherGlb(

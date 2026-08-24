@@ -205,6 +205,7 @@ export class ModelPreview {
     this.targetLength = TARGET.x;
     this.heightOffset = 0;
     this.removeShadow = false;
+    this.modelBrightness = 1;
     this.nodeObjects = [];
     this.loadedAnimations = [];
     this.mixer = null;
@@ -309,6 +310,34 @@ export class ModelPreview {
       return;
     }
     this.updateAutomaticShadow(new THREE.Box3().setFromObject(this.model));
+  }
+
+  setBrightness(value) {
+    const number = Number(value);
+    this.modelBrightness = Number.isFinite(number) ? Math.min(3, Math.max(0.5, number)) : 1;
+    if (!this.deviceMode) this.applyModelBrightness();
+  }
+
+  applyModelBrightness() {
+    if (!this.model) return;
+    const brightness = this.modelBrightness;
+    this.model.traverse((object) => {
+      if (!object.isMesh || !object.material || isShadowObject(object)) return;
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of materials) {
+        if (!material) continue;
+        material.userData ||= {};
+        if (!material.userData.modelBrightnessBase) {
+          material.userData.modelBrightnessBase = {
+            color: material.color?.clone() || null,
+            emissive: material.emissive?.clone() || null,
+          };
+        }
+        const base = material.userData.modelBrightnessBase;
+        if (base.color && material.color) material.color.copy(base.color).multiplyScalar(brightness);
+        if (base.emissive && material.emissive) material.emissive.copy(base.emissive).multiplyScalar(brightness);
+      }
+    });
   }
 
   syncModelShadowVisibility() {
@@ -461,6 +490,7 @@ export class ModelPreview {
     this.loadedAnimations = gltf.animations || [];
     this.model.name = 'CS_Car';
     this.scene.add(this.model);
+    this.applyModelBrightness();
     this.syncModelShadowVisibility();
     const isVehicle = modelType !== 'other';
     report(0.72, isVehicle ? '正在分析模型朝向' : '正在保留模型原始朝向');
@@ -1952,6 +1982,7 @@ export class ModelPreview {
         if (child.material.length === 1) child.material = child.material[0];
       });
     }
+    if (!enabled) this.applyModelBrightness();
     this.scene.add(this.model);
     this.deviceMode = enabled;
     this.syncModelShadowVisibility();
