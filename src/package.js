@@ -1171,8 +1171,8 @@ function readSkinInfluences(state, primitive, skin, vertexCount) {
   if (!Array.isArray(skin.joints) || skin.joints.length === 0) {
     throw new Error('蒙皮网格引用了空骨架');
   }
-  if (skin.joints.length > 256) {
-    throw new Error(`车机最多支持 256 个骨骼关节，当前模型包含 ${skin.joints.length} 个`);
+  if (skin.joints.length > 65536) {
+    throw new Error(`模型骨架超过 glTF 关节索引上限：${skin.joints.length} 根`);
   }
   const sets = [];
   for (let setIndex = 0; ; setIndex++) {
@@ -1192,7 +1192,10 @@ function readSkinInfluences(state, primitive, skin, vertexCount) {
   }
   if (sets.length === 0) throw new Error('蒙皮网格缺少 JOINTS_0/WEIGHTS_0');
 
-  const joints = new Uint8Array(vertexCount * 4);
+  // 大骨架必须先保留完整的 UINT16 槽位，不能在按 64 根拆分前写入 UINT8，
+  // 否则第 256 根之后的索引会截断并导致头发、衣物等蒙皮错乱。
+  const JointArray = skin.joints.length > 256 ? Uint16Array : Uint8Array;
+  const joints = new JointArray(vertexCount * 4);
   const weights = new Float32Array(vertexCount * 4);
   for (let vertex = 0; vertex < vertexCount; vertex++) {
     const influences = [];
@@ -1217,7 +1220,7 @@ function readSkinInfluences(state, primitive, skin, vertexCount) {
       weights[vertex * 4 + component] = selected[component].weight / normalizedTotal;
     }
   }
-  return { joints, weights };
+  return { joints, weights, jointComponentType: joints instanceof Uint16Array ? 5123 : 5121 };
 }
 
 function vehicleSkinPrimitiveData(state, primitive, skin) {
@@ -1242,7 +1245,10 @@ function vehicleSkinPrimitiveData(state, primitive, skin) {
     });
   }
   const influences = readSkinInfluences(state, primitive, skin, vertexCount);
-  attributes.push({ name: 'JOINTS_0', data: influences.joints, components: 4, type: 'VEC4', componentType: 5121 });
+  attributes.push({
+    name: 'JOINTS_0', data: influences.joints, components: 4, type: 'VEC4',
+    componentType: influences.jointComponentType,
+  });
   attributes.push({ name: 'WEIGHTS_0', data: influences.weights, components: 4, type: 'VEC4' });
 
   let indices;
