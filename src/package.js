@@ -4,7 +4,9 @@ import {
   SLOT_BY_ID,
   animationNamesOf,
   buildKeyframes,
+  eventVariantsOf,
   isLampSlot,
+  normalizeEventPriority,
   normalizeIdleDelaySeconds,
   normalizeLampBeam,
   normalizeLampGlow,
@@ -229,12 +231,19 @@ async function makeAnimatedOtherBydCar({
     },
   };
   if (bindings?.length) {
-    manifest.bindings = bindings.map((binding) => ({
-      slot: binding.slotId,
-      source: binding.sourceName || '',
-      sourceAnimation: binding.sourceAnimationName || `#${binding.sourceAnimationIndex}`,
-      playback: normalizeOtherPlayback(SLOT_BY_ID.get(binding.slotId), binding.playback),
-    }));
+    manifest.bindings = bindings.map((binding) => {
+      const variants = eventVariantsOf(binding);
+      return {
+        slot: binding.slotId,
+        source: binding.sourceName || '',
+        sourceAnimation: binding.sourceAnimationName || `#${binding.sourceAnimationIndex}`,
+        playback: normalizeOtherPlayback(SLOT_BY_ID.get(binding.slotId), binding.playback),
+        priority: normalizeEventPriority(binding.slotId, binding.priority),
+        ...(variants.length > 1 ? {
+          animations: variants.map((variant) => ({ name: variant.name, weight: variant.weight })),
+        } : {}),
+      };
+    });
   }
   const files = [
     { path: 'payload/Texture/CarSelf_Main.png', bytes: mainTexture.bytes },
@@ -261,7 +270,26 @@ async function makeAnimatedOtherBydCar({
     ({ percent }) => report(0.94 + (percent / 100) * 0.06, '正在打包车模文件'),
   );
   report(1, '车模包已生成');
-  return { bytes, manifest, dat, glb: normalized };
+  return { bytes, manifest, dat, glb: normalized, sizeWarning: carSelfSizeWarning(dat.byteLength) };
+}
+
+/**
+ * 车机导入时要同时驻留 dat 字节、GLB 的 JSON 文本和解析出来的对象树，
+ * 而地图进程的堆上限只有 512MB。实测 66MB 的包直接 OutOfMemoryError 卡死在导入，
+ * 55MB 能过但已经贴着天花板，所以这里按 40MB 提前示警。
+ */
+const CARSELF_SIZE_WARN = 40 * 1024 * 1024;
+const CARSELF_SIZE_LIMIT = 55 * 1024 * 1024;
+
+function carSelfSizeWarning(size) {
+  if (size >= CARSELF_SIZE_LIMIT) {
+    return `模型数据 ${(size / 1048576).toFixed(0)}MB，很可能导致车机导入时内存不足而卡死，`
+      + '请减少绑定的动作数量，或给事件少挂几个随机动画。';
+  }
+  if (size >= CARSELF_SIZE_WARN) {
+    return `模型数据 ${(size / 1048576).toFixed(0)}MB，已经接近车机导入的内存上限，建议少绑几个动作。`;
+  }
+  return null;
 }
 
 function normalizeExportQuality(quality) {
@@ -2387,6 +2415,24 @@ function animationPoseAt(state, animation, ratio) {
 }
 
 /**
+ * 过渡的起止姿态是否近似相等。
+ *
+ * 旋转按四元数点积判（±q 表示同一朝向，故取绝对值），0.99999 约合 0.5°；
+ * 位移和缩放按分量差判，1e-4 对车模尺度来说是看不见的。
+ */
+function poseValuesClose(path, start, end) {
+  if (path === 'rotation') {
+    let dot = 0;
+    for (let index = 0; index < 4; index++) dot += start[index] * end[index];
+    return Math.abs(dot) >= 0.99999;
+  }
+  for (let index = 0; index < start.length; index++) {
+    if (Math.abs(start[index] - end[index]) > 1e-4) return false;
+  }
+  return true;
+}
+
+/**
  * 生成“来源事件当前姿态 -> 目标事件首帧”的动画。来源与目标的轨道不必完全
  * 相同：缺失的一侧自动使用节点静态姿态，避免切换时某些骨骼突然复位。
  */
@@ -2417,6 +2463,9 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
     }
     const normalizedStart = path === 'rotation' ? quatNormalize(start) : start;
     const normalizedEnd = path === 'rotation' ? quatNormalize(end) : end;
+    // 起止姿态一样的骨骼在过渡期间根本不动，写进去只是白白多一条通道和一个 accessor。
+    // 角色骨架里手指、面部这类末端骨骼大多如此，砍掉能让包体积和车机解析内存都降一大截。
+    if (poseValuesClose(path, normalizedStart, normalizedEnd)) continue;
     const samples = new Float32Array(frameCount * components);
     for (let frame = 0; frame < frameCount; frame++) {
       const progress = frame / (frameCount - 1);
@@ -2471,16 +2520,18 @@ function transitionPhasesForPairCount(pairCount) {
   return [0];
 }
 
-/** 为事件的四个代表相位生成“当前动作姿态 -> 模型静态默认姿态”的退出过渡。 */
-function eventResetSet(state, event, transitionPoses = null) {
+/** 为事件的各代表相位生成“当前动作姿态 -> 模型静态默认姿态”的退出过渡。 */
+function eventResetSet(state, event, transitionPoses = null, suffix = '', phases = EVENT_TRANSITION_PHASES) {
   const durationMs = event.playback.transitionMs;
   if (!(durationMs > 0)) return null;
   const animations = [];
-  for (let index = 0; index < EVENT_TRANSITION_PHASES.length; index++) {
-    const name = `BYD_RST_${event.slot.id}_P${index}`;
+  for (let index = 0; index < phases.length; index++) {
+    const cachedIndex = EVENT_TRANSITION_PHASES.indexOf(phases[index]);
+    const name = `BYD_RST_${event.slot.id}${suffix}_P${index}`;
     const animation = poseTransitionClip(
       state,
-      transitionPoses?.[index] || animationPoseAt(state, event.active, EVENT_TRANSITION_PHASES[index]),
+      (cachedIndex >= 0 ? transitionPoses?.[cachedIndex] : null)
+        || animationPoseAt(state, event.active, phases[index]),
       new Map(),
       name,
       durationMs,
@@ -2497,9 +2548,16 @@ function eventResetSet(state, event, transitionPoses = null) {
   };
 }
 
-function eventAnimationSet(state, source, slot, binding) {
+/**
+ * 生成一个事件里某一条动画（变体）的全套 clip。
+ *
+ * 变体 0 不带后缀，动画名与单动画时代完全一致，这样单变体导出的包与旧版逐字节同构；
+ * 其余变体加 `_V{n}`，车机按权重随机挑一条播。
+ */
+function eventAnimationSet(state, source, slot, binding, variantIndex = 0, resetPhases = EVENT_TRANSITION_PHASES) {
   const playback = normalizeOtherPlayback(slot, binding?.playback);
-  const base = `BYD_EVT_${slot.id}`;
+  const suffix = variantIndex > 0 ? `_V${variantIndex}` : '';
+  const base = `BYD_EVT_${slot.id}${suffix}`;
   const range = playback.range;
   const trimmed = trimmedAnimationClip(state, source, range.start, range.end, playback.speed, `${base}_SOURCE`);
   let active = playback.direction === 'reverse'
@@ -2518,7 +2576,7 @@ function eventAnimationSet(state, source, slot, binding) {
     ? reverseAnimationClip(state, active, `${base}_OFF`)
     : null;
   const transitionPoses = EVENT_TRANSITION_PHASES.map((phase) => animationPoseAt(state, active, phase));
-  const reset = eventResetSet(state, { slot, active, playback }, transitionPoses);
+  const reset = eventResetSet(state, { slot, active, playback }, transitionPoses, suffix, resetPhases);
   const spec = {
     enter: enter?.name || '',
     on: on.name,
@@ -2554,6 +2612,64 @@ function eventAnimationSet(state, source, slot, binding) {
   };
 }
 
+/** 该动画实际驱动到的节点集合；两个事件的集合不相交就能同时播放。 */
+function animationNodeIndices(animation) {
+  const nodes = new Set();
+  for (const channel of animation?.channels || []) {
+    if (Number.isInteger(channel.target?.node)) nodes.add(channel.target.node);
+  }
+  return nodes;
+}
+
+function setsIntersect(a, b) {
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  for (const value of small) {
+    if (large.has(value)) return true;
+  }
+  return false;
+}
+
+/**
+ * 把事件分配到车机的动画播放槽（CarPartsAnimation.name）。
+ *
+ * 引擎行为（libAutoDice 实测）：同一个槽名只能有一条动画，播新的会先停掉旧的；
+ * 不同槽名完全并行，骨骼求值时后播的动画只覆盖自己驱动到的节点，其余节点沿用前一条的结果。
+ * 槽名只是播放槽的键，和模型里的节点名无关。
+ *
+ * 因此按“驱动节点是否重叠”求连通分量：同一分量内的事件会互相抢节点，放进同一个槽由
+ * 优先级仲裁；不同分量的事件各占一个槽，可以同时播放（例如走路 + 尾灯闪 + 开后备箱）。
+ * 第一个分量沿用历史槽名 CS_Car，保证单动作模型导出结果与旧版完全一致。
+ */
+function assignEventPartSlots(eventRecords) {
+  const nodeSets = eventRecords.map((record) => animationNodeIndices(record.active));
+  const parent = eventRecords.map((_, index) => index);
+  const find = (index) => {
+    let cursor = index;
+    while (parent[cursor] !== cursor) {
+      parent[cursor] = parent[parent[cursor]];
+      cursor = parent[cursor];
+    }
+    return cursor;
+  };
+  for (let a = 0; a < eventRecords.length; a++) {
+    for (let b = a + 1; b < eventRecords.length; b++) {
+      if (!setsIntersect(nodeSets[a], nodeSets[b])) continue;
+      const rootA = find(a);
+      const rootB = find(b);
+      if (rootA !== rootB) parent[rootA] = rootB;
+    }
+  }
+  const partNames = new Map();
+  for (let index = 0; index < eventRecords.length; index++) {
+    const root = find(index);
+    if (!partNames.has(root)) {
+      partNames.set(root, partNames.size === 0 ? 'CS_Car' : `BYD_SLOT_${partNames.size}`);
+    }
+    eventRecords[index].part = partNames.get(root);
+  }
+  return partNames.size;
+}
+
 async function normalizeAnimatedOtherGlb(
   parsed, transform, bindings, deletions, removeShadow = false, onProgress = null,
 ) {
@@ -2582,31 +2698,54 @@ async function normalizeAnimatedOtherGlb(
   const eventBindings = {};
   const eventRecords = [];
   const requestedBindings = bindings || [];
+  // 退出过渡在分槽之前就要生成，这里按"全部事件同槽"的上界估算相位数：
+  // 事件一多，退出过渡的段数也得跟着精简，否则光元数据就能把包撑爆。
+  const resetPhases = transitionPhasesForPairCount(
+    requestedBindings.length * Math.max(0, requestedBindings.length - 1),
+  );
   for (let bindingIndex = 0; bindingIndex < requestedBindings.length; bindingIndex++) {
     const binding = requestedBindings[bindingIndex];
     const slot = SLOT_BY_ID.get(binding.slotId);
-    const source = sourceAnimations[binding.sourceAnimationIndex];
-    if (!slot || !Number.isInteger(binding.sourceAnimationIndex)) continue;
-    validateAnimatedOtherClip(state, source, slot);
-    const event = eventAnimationSet(state, source, slot, binding);
-    outputAnimations.push(...event.animations);
-    eventRecords.push({ slot, binding, ...event });
-    onProgress?.(
-      requestedBindings.length ? ((bindingIndex + 1) / requestedBindings.length) * 0.32 : 0.32,
-      `正在生成绑定动画（${bindingIndex + 1}/${requestedBindings.length}）`,
-    );
-    await yieldToBrowser();
+    if (!slot) continue;
+    const variants = eventVariantsOf(binding);
+    if (!variants.length) continue;
+    // 一个事件下的每条动画都要有完整的一套 clip，车机才能随机挑着播
+    const built = [];
+    for (let variantIndex = 0; variantIndex < variants.length; variantIndex++) {
+      const variant = variants[variantIndex];
+      const source = sourceAnimations[variant.index];
+      validateAnimatedOtherClip(state, source, slot);
+      const event = eventAnimationSet(state, source, slot, binding, variantIndex, resetPhases);
+      outputAnimations.push(...event.animations);
+      built.push({ ...event, weight: variant.weight });
+      onProgress?.(
+        requestedBindings.length
+          ? ((bindingIndex + (variantIndex + 1) / variants.length) / requestedBindings.length) * 0.32
+          : 0.32,
+        variants.length > 1
+          ? `正在生成绑定动画（${bindingIndex + 1}/${requestedBindings.length} · 动作 ${variantIndex + 1}/${variants.length}）`
+          : `正在生成绑定动画（${bindingIndex + 1}/${requestedBindings.length}）`,
+      );
+      await yieldToBrowser();
+    }
+    // 事件间过渡只按第 0 条动画（代表变体）预烘：按变体两两生成会组合爆炸，
+    // 而同一角色各动作的起手姿态本来就接近，切到其它变体最多一点点跳变。
+    eventRecords.push({ slot, binding, variants: built, ...built[0] });
   }
 
-  // 为每一对已绑定事件生成切换过渡。过渡时长取目标事件的设置，因此用户
+  // 互不抢节点的事件分到不同播放槽后可以同时播放，只有同槽事件才需要互相切换。
+  const partCount = assignEventPartSlots(eventRecords);
+  const sameSlotPairs = (target) => eventRecords
+    .filter((source) => source.slot.id !== target.slot.id && source.part === target.part);
+
+  // 为每一对同槽事件生成切换过渡。过渡时长取目标事件的设置，因此用户
   // 可以单独控制“切入左转”与“恢复前进”的速度。
-  const transitionTotal = eventRecords.length * Math.max(0, eventRecords.length - 1);
+  const transitionTotal = eventRecords.reduce((total, target) => total + sameSlotPairs(target).length, 0);
   const transitionPhases = transitionPhasesForPairCount(transitionTotal);
   let transitionBuilt = 0;
   for (const target of eventRecords) {
     const transitions = {};
-    for (const source of eventRecords) {
-      if (source.slot.id === target.slot.id) continue;
+    for (const source of sameSlotPairs(target)) {
       const transition = eventTransitionSet(state, source, target, transitionPhases);
       if (!transition) continue;
       outputAnimations.push(...transition.animations);
@@ -2620,9 +2759,28 @@ async function normalizeAnimatedOtherGlb(
     }
     const spec = target.spec;
     const { playback, ...eventSpec } = spec;
+    // 顶层仍然写第 0 条动画的字段：没升级过的车机读不懂 variants，会自动退化成单动作播放。
+    const multi = target.variants.length > 1;
     eventBindings[target.slot.id] = {
-      part: 'CS_Car',
+      part: target.part,
+      priority: normalizeEventPriority(target.slot, target.binding.priority),
       ...eventSpec,
+      ...(multi ? {
+        variants: target.variants.map(({ weight, spec: variantSpec }) => ({
+          weight,
+          enter: variantSpec.enter,
+          on: variantSpec.on,
+          off: variantSpec.off,
+          hold: variantSpec.hold,
+          onDurationMs: variantSpec.onDurationMs,
+          enterDurationMs: variantSpec.enterDurationMs,
+          offDurationMs: variantSpec.offDurationMs,
+          cycleDurationMs: variantSpec.cycleDurationMs,
+          ...(variantSpec.reset ? { reset: variantSpec.reset } : {}),
+        })),
+        // 循环类动作每播完一轮重新抽一次，站着不会一直重复同一个动作
+        ...(spec.onMode === 'loop' ? { reroll: true } : {}),
+      } : {}),
       ...(Object.keys(transitions).length ? { transitions } : {}),
       ...(target.slot.id === 'CS_Idle' ? {
         triggerDelayMs: normalizeIdleDelaySeconds(target.binding.triggerDelaySeconds) * 1000,
@@ -2631,6 +2789,8 @@ async function normalizeAnimatedOtherGlb(
   }
   if (transitionPhases.length < EVENT_TRANSITION_PHASES.length) {
     onProgress?.(0.8, `动作较多，切换过渡已自动精简为 ${transitionPhases.length} 相位`);
+  } else if (partCount > 1) {
+    onProgress?.(0.8, `动作互不冲突，已分成 ${partCount} 组可同时播放`);
   }
   json.animations = outputAnimations.length ? outputAnimations : undefined;
 

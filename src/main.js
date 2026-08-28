@@ -7,12 +7,19 @@ import {
   animationNamesOf,
   BEAM_LOBE_MODES,
   BEAM_SHAPES,
+  EVENT_PRIORITY_LEVELS,
   LAMP_BEAM_LIMITS,
   LAMP_GLOW_LIMITS,
+  MAX_EVENT_VARIANTS,
   SLOT_BY_ID,
   defaultParams,
+  eventVariantsOf,
   isLampSlot,
+  isSustainedEvent,
+  normalizeEventPriority,
   normalizeIdleDelaySeconds,
+  normalizeVariantWeight,
+  variantChances,
   normalizeLampBeam,
   normalizeLampGlow,
   normalizeOtherPlayback,
@@ -1465,6 +1472,77 @@ function refreshBindingPreviewAfterExportChange(phase = 'on') {
   void setPreviewMode(true, { bindingPhase: phase });
 }
 
+/** 把变体列表写回绑定，同时把第 0 条同步到 sourceAnimation*，预览和旧车机都按它走。 */
+function commitVariants(slot, variants) {
+  const binding = bindings.get(slot.id);
+  if (!binding || !variants.length) return;
+  const head = variants[0];
+  const animation = sourceAnimationByIndex(head.index);
+  binding.variants = variants.map((item) => ({ ...item }));
+  binding.sourceAnimationIndex = head.index;
+  binding.sourceAnimationName = head.name;
+  binding.sourceName = `模型动画：${head.name}`;
+  if (animation) binding.nodeIndices = [...animation.nodeIndices];
+  setDirty();
+  markDevicePreviewStale();
+  renderBindings();
+  refreshBindingPreviewAfterExportChange();
+}
+
+function addVariantAnimation(slot, value) {
+  const animation = sourceAnimationByIndex(value);
+  const binding = bindings.get(slot.id);
+  if (!animation || !binding) return;
+  const variants = eventVariantsOf(binding);
+  if (variants.some((item) => item.index === animation.index)) {
+    showMessage('这个动画已经在列表里了', 'warning', { duration: 3000 });
+    return;
+  }
+  if (variants.length >= MAX_EVENT_VARIANTS) {
+    showMessage(`一个事件最多挂 ${MAX_EVENT_VARIANTS} 个动画`, 'warning', { duration: 3500 });
+    return;
+  }
+  snapshot();
+  // 新加的动画默认与现有的等概率
+  const total = variants.reduce((sum, item) => sum + item.weight, 0);
+  const weight = normalizeVariantWeight(Math.round(total / variants.length));
+  commitVariants(slot, [...variants, { index: animation.index, name: animation.name, weight }]);
+}
+
+function removeVariantAnimation(slot, index) {
+  const binding = bindings.get(slot.id);
+  if (!binding) return;
+  const variants = eventVariantsOf(binding).filter((item) => item.index !== index);
+  snapshot();
+  if (!variants.length) {
+    bindings.delete(slot.id);
+    preview.stopBindingPreview();
+    setDirty();
+    markDevicePreviewStale();
+    renderBindings();
+    refreshBindingPreviewAfterExportChange();
+    return;
+  }
+  commitVariants(slot, variants);
+}
+
+function updateVariantWeights(slot) {
+  const binding = bindings.get(slot.id);
+  if (!binding) return;
+  const variants = eventVariantsOf(binding);
+  let changed = false;
+  const next = variants.map((item) => {
+    const input = document.getElementById(`variant-weight-${item.index}`);
+    if (!input) return item;
+    const weight = normalizeVariantWeight(input.value);
+    if (weight !== item.weight) changed = true;
+    return { ...item, weight };
+  });
+  if (!changed) return;
+  snapshot({ scope: 'variant-weight', slotId: slot.id });
+  commitVariants(slot, next);
+}
+
 function setSourceAnimationBinding(slot, value) {
   const animation = sourceAnimationByIndex(value);
   const existing = bindings.get(slot.id);
@@ -1486,7 +1564,9 @@ function setSourceAnimationBinding(slot, value) {
     sourceAnimationName: animation.name,
     sourceName: `模型动画：${animation.name}`,
     nodeIndices: [...animation.nodeIndices],
+    variants: [{ index: animation.index, name: animation.name, weight: 10 }],
     playback: normalizeOtherPlayback(slot, existing?.playback),
+    priority: normalizeEventPriority(slot, existing?.priority),
     ...(slot.id === 'CS_Idle' ? {
       triggerDelaySeconds: normalizeIdleDelaySeconds(existing?.triggerDelaySeconds),
     } : {}),
@@ -2527,6 +2607,21 @@ function playbackEndLabel(endMode) {
   }[endMode] || '关闭时立即复位';
 }
 
+// 灯光/刹车/转向这类事件只要信号还亮着就一直激活，保持尾帧会一直占住播放槽，
+// 导致待机和行驶动作再也轮不上（这一点调优先级救不回来），所以单独提示。
+function playbackOccupyNotice(slot, playback) {
+  if (!isSustainedEvent(slot)) return '';
+  const holdsForever = playback.mode === 'hold' || ['hold', 'finish'].includes(playback.endMode);
+  if (!holdsForever) return '';
+  return `<div class="playback-behavior warning" role="status">
+    <div class="playback-behavior-copy">
+      <strong>这个事件会一直占住动作</strong>
+      <span>${escapeHtml(slot.label)}只要还亮着就持续激活，保持尾帧会让车模一直定格，待机和行驶动作都播不了。建议改成“播放一次后复位”。</span>
+    </div>
+    <button class="btn small" id="bind-playback-use-once" type="button"><i data-lucide="corner-down-right"></i>改为播放一次后复位</button>
+  </div>`;
+}
+
 function playbackBehaviorNotice(playback) {
   const opening = playbackModeLabel(playback.mode);
   const closing = playbackEndLabel(playback.endMode);
@@ -2543,12 +2638,59 @@ function playbackBehaviorNotice(playback) {
   </div>`;
 }
 
+// 动画列表里当前点开预览的那一条；null 表示跟随代表动作
+let selectedVariantIndex = null;
+
+/** 单独预览某一条动画，方便挨个看完再决定删哪个。 */
+function playVariant(slot, variantIndex) {
+  const binding = bindings.get(slot.id);
+  if (!binding || !Number.isInteger(variantIndex)) return;
+  selectedVariantIndex = variantIndex;
+  ui['binding-editor-host'].querySelectorAll('[data-variant-play]').forEach((row) => {
+    row.classList.toggle('active', Number(row.dataset.variantPlay) === variantIndex);
+  });
+  const animation = sourceAnimationByIndex(variantIndex);
+  preview.previewBinding(slot, {
+    ...binding,
+    sourceAnimationIndex: variantIndex,
+    sourceAnimationName: animation?.name || binding.sourceAnimationName,
+    nodeIndices: animation ? [...animation.nodeIndices] : binding.nodeIndices,
+  }, 'on');
+}
+
+/** 事件下挂的动画列表：多于一条时按概率随机播，单条时保持原来的极简样子。 */
+function variantListHtml(slot, binding) {
+  const variants = eventVariantsOf(binding);
+  if (variants.length <= 1) {
+    return `<div class="source-animation-bound"><span>已绑定动画</span><strong>${escapeHtml(variants[0]?.name || '')}</strong></div>`;
+  }
+  const chances = variantChances(variants);
+  const active = variants.some((item) => item.index === selectedVariantIndex)
+    ? selectedVariantIndex
+    : variants[0].index;
+  const rows = variants.map((variant, index) => `
+    <div class="variant-row${variant.index === active ? ' active' : ''}" data-variant-play="${variant.index}" role="button" tabindex="0" title="点击播放这个动作">
+      <div class="variant-name">
+        <span>${escapeHtml(variant.name)}</span>
+        ${index === 0 ? '<em class="variant-lead" title="代表动作：事件之间的切换过渡按它预烘">代表</em>' : ''}
+      </div>
+      <div class="variant-chance"><input id="variant-weight-${variant.index}" type="number" min="1" max="100" step="1" value="${variant.weight}" aria-label="${escapeHtml(variant.name)} 的权重" /><span>${chances[index]}%</span></div>
+      <button class="btn small variant-remove" type="button" data-variant-remove="${variant.index}" aria-label="移除 ${escapeHtml(variant.name)}"><i data-lucide="x"></i></button>
+    </div>`).join('');
+  return `<section class="variant-list" aria-label="事件动画列表">
+    <div class="variant-title"><i data-lucide="shuffle"></i><strong>随机动作（${variants.length}）</strong><small>点击可单独预览</small></div>
+    ${rows}
+  </section>`;
+}
+
 function otherBindingEditor(slot, binding) {
   const selected = sourceAnimationBindingValid(binding) ? binding.sourceAnimationIndex : '';
   const playback = normalizeOtherPlayback(slot, binding?.playback);
   const sourceAnimation = sourceAnimationByIndex(selected);
   const effectiveDuration = playbackDurationOf(sourceAnimation?.duration, playback);
   const idleDelay = normalizeIdleDelaySeconds(binding?.triggerDelaySeconds);
+  const priority = normalizeEventPriority(slot, binding?.priority);
+  const bound0 = sourceAnimationBindingValid(binding);
   let animationControl;
   if (bindableAnimations.length === 0) {
     animationControl = `
@@ -2562,15 +2704,15 @@ function otherBindingEditor(slot, binding) {
       <div class="field source-animation-field">
         <label for="bind-source-animation">模型自带动画</label>
         <select id="bind-source-animation">
-          <option value="">选择一个动画</option>
+          <option value="">${bound0 ? '再挂一个动画（随机播放）' : '选择一个动画'}</option>
           ${bindableAnimations.map((animation) => `
-            <option value="${animation.index}"${animation.index === selected ? ' selected' : ''}>${escapeHtml(animation.name)}${animation.duration ? ` · ${animation.duration.toFixed(2)} 秒` : ''}</option>`).join('')}
+            <option value="${animation.index}"${!bound0 && animation.index === selected ? ' selected' : ''}>${escapeHtml(animation.name)}${animation.duration ? ` · ${animation.duration.toFixed(2)} 秒` : ''}</option>`).join('')}
         </select>
-        <small>选择后立即绑定并在网页质感中预览。</small>
+        <small>${bound0 ? '同一个事件可以挂多个动画，车机每次触发按概率随机挑一个。' : '选择后立即绑定并在网页质感中预览。'}</small>
       </div>`;
   }
   const bound = sourceAnimationBindingValid(binding)
-    ? `<div class="source-animation-bound"><span>已绑定动画</span><strong>${escapeHtml(binding.sourceAnimationName)}</strong></div>
+    ? `${variantListHtml(slot, binding)}
        <section class="other-playback-config" aria-label="播放设置">
          <div class="other-playback-title"><i data-lucide="settings-2"></i><strong>播放设置</strong></div>
          <div class="other-playback-grid">
@@ -2604,10 +2746,17 @@ function otherBindingEditor(slot, binding) {
               </select>
             </div>
           </div>
-          <div id="playback-behavior-host">${playbackBehaviorNotice(playback)}</div>
+          <div id="playback-behavior-host">${playbackOccupyNotice(slot, playback)}${playbackBehaviorNotice(playback)}</div>
           <details class="playback-advanced" open>
             <summary><span>高级设置</span><small id="playback-duration">实际时长 ${effectiveDuration.toFixed(2)} 秒</small></summary>
             <div class="playback-advanced-grid">
+              <div class="field">
+                <label for="bind-event-priority">同时触发优先级</label>
+                <select id="bind-event-priority">
+                  ${EVENT_PRIORITY_LEVELS.map((level) => `
+                    <option value="${level.value}"${level.value === priority ? ' selected' : ''}>${level.label}</option>`).join('')}
+                </select>
+              </div>
               <div class="field">
                 <label for="bind-playback-speed">播放速度</label>
                 <input id="bind-playback-speed" type="number" min="0.1" max="4" step="0.05" value="${playback.speed}" />
@@ -2625,6 +2774,7 @@ function otherBindingEditor(slot, binding) {
                <div class="input-suffix"><input id="bind-playback-end-range" type="number" min="1" max="100" step="1" value="${Math.round(playback.range.end * 100)}" /><span>%</span></div>
              </div>
            </div>
+           <small class="playback-priority-hint">多个事件同时触发时，动作没用到同一根骨骼就会同时播放；抢同一根骨骼时由优先级高的接管，同级则后触发的接管。</small>
          </details>
        </section>
        <div class="quick-row other-preview-actions">
@@ -3030,6 +3180,16 @@ function wirePlaybackHoldFix(slot) {
     renderBindings();
     showMessage('已改为打开后播放一次并保持尾帧', 'success', { duration: 3500 });
   });
+  document.getElementById('bind-playback-use-once')?.addEventListener('click', () => {
+    const mode = document.getElementById('bind-playback-mode');
+    const end = document.getElementById('bind-playback-end');
+    if (!mode) return;
+    mode.value = 'once';
+    if (end) end.value = 'reset';
+    updateOtherPlaybackBinding(slot);
+    renderBindings();
+    showMessage('已改为播放一次后复位，不再占住动作', 'success', { duration: 3500 });
+  });
 }
 
 function wireBindingEditor() {
@@ -3043,12 +3203,43 @@ function wireBindingEditor() {
   const slot = activeSlot(openSlot);
   if (modelType === 'other') {
     document.getElementById('bind-source-animation')?.addEventListener('change', (event) => {
-      setSourceAnimationBinding(slot, event.target.value);
+      const value = event.target.value;
+      // 已经绑过就是往列表里再加一个随机动作，没绑过才是首次绑定
+      if (value && sourceAnimationBindingValid(bindings.get(slot.id))) {
+        addVariantAnimation(slot, value);
+        return;
+      }
+      setSourceAnimationBinding(slot, value);
     });
+    ui['binding-editor-host'].querySelectorAll('[data-variant-remove]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        removeVariantAnimation(slot, Number(button.dataset.variantRemove));
+      });
+    });
+    ui['binding-editor-host'].querySelectorAll('[data-variant-play]').forEach((row) => {
+      const play = (event) => {
+        // 改概率和点删除都在行内，别顺手把预览也触发了
+        if (event.target.closest('input, button')) return;
+        playVariant(slot, Number(row.dataset.variantPlay));
+      };
+      row.addEventListener('click', play);
+      row.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        play(event);
+      });
+    });
+    for (const variant of eventVariantsOf(bindings.get(slot.id))) {
+      const input = document.getElementById(`variant-weight-${variant.index}`);
+      if (!input) continue;
+      wireContinuousHistory(input, { scope: 'variant-weight', slotId: slot.id });
+      input.addEventListener('change', () => updateVariantWeights(slot));
+    }
     for (const id of [
       'bind-playback-mode', 'bind-playback-direction', 'bind-playback-end',
       'bind-playback-speed', 'bind-transition-duration', 'bind-playback-start',
-      'bind-playback-end-range', 'bind-trigger-delay',
+      'bind-playback-end-range', 'bind-trigger-delay', 'bind-event-priority',
     ]) {
       document.getElementById(id)?.addEventListener('change', () => updateOtherPlaybackBinding(slot));
     }
@@ -3152,6 +3343,8 @@ function setDemoButton(running) {
 function toggleSlot(slotId) {
   stopDemo();
   cancelDeleteDraft(false);
+  // 换事件了，动画列表的预览选中跟着回到代表动作
+  if (openSlot !== slotId) selectedVariantIndex = null;
   const closing = openSlot === slotId;
   const previousBinding = openSlot ? bindings.get(openSlot) : null;
   const nextBinding = closing ? null : bindings.get(slotId);
@@ -3647,6 +3840,7 @@ function updateOtherPlaybackBinding(slot) {
       end: (Number(document.getElementById('bind-playback-end-range')?.value) || 100) / 100,
     },
   });
+  binding.priority = normalizeEventPriority(slot, document.getElementById('bind-event-priority')?.value);
   const delayInput = document.getElementById('bind-trigger-delay');
   if (delayInput) {
     binding.triggerDelaySeconds = normalizeIdleDelaySeconds(delayInput.value);
@@ -3664,7 +3858,8 @@ function updateOtherPlaybackBinding(slot) {
   if (durationLabel) durationLabel.textContent = `实际时长 ${duration.toFixed(2)} 秒`;
   const behaviorHost = document.getElementById('playback-behavior-host');
   if (behaviorHost) {
-    behaviorHost.innerHTML = playbackBehaviorNotice(binding.playback);
+    behaviorHost.innerHTML = playbackOccupyNotice(slot, binding.playback)
+      + playbackBehaviorNotice(binding.playback);
     renderIcons();
     wirePlaybackHoldFix(slot);
   }
@@ -3724,9 +3919,14 @@ async function generatePackage() {
       ['good', '✓', `模型亮度：${Math.round(modelBrightness * 100)}%`],
       ['good', '✓', `几何：${current.stats.triangles.toLocaleString()} → ${result.manifest.model.outputStats.triangles.toLocaleString()} 三角形${current.stats.triangles === result.manifest.model.outputStats.triangles ? '（未减面）' : ''}`],
       ['good', '✓', 'CarSelf.dat 和 GLB 均已写入 SHA-256 校验值'],
+      ...(result.sizeWarning ? [['bad', '!', result.sizeWarning]] : []),
       ['warn', '!', '导入地图后需要重启地图进程才能生效'],
     ]);
-    showMessage(`车模包已生成：${formatBytes(result.bytes.byteLength)}`, 'success');
+    if (result.sizeWarning) {
+      showMessage(result.sizeWarning, 'warning', { duration: 9000 });
+    } else {
+      showMessage(`车模包已生成：${formatBytes(result.bytes.byteLength)}`, 'success');
+    }
   } catch (error) {
     console.error(error);
     setStatuses([['bad', '×', `生成失败：${error.message || '未知错误'}`]]);

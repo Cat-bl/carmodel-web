@@ -79,13 +79,56 @@ export function slotForMode(slotOrId, modelType = 'vehicle') {
 }
 
 /**
- * 其他模型的事件动画播放策略。未保存过配置的旧项目继续沿用原默认值：
- * 开合/灯光单次播放并在事件结束时反向恢复，循环类事件结束时直接停止。
+ * 「其他模型」每个事件的出厂默认播放方式与仲裁优先级。
+ *
+ * 定这张表的底线是：**信号亮着就一直激活的事件（灯光、刹车、转向）绝不能用 hold**。
+ * 车机对 `activeEnd=hold` 的处理是播完尾帧后继续占着播放槽不放（见 CarModelEventBindings
+ * 的 ACTION_HOLD 分支），只要灯还亮着就永远不让位——夜里开着近光，车模就会一直定格，
+ * 待机和行驶动作再也轮不上，而且这一点光靠调优先级救不回来（优先级只决定谁抢到槽，
+ * 不能让占着的人主动松手）。所以这类事件默认一律「播放一次后复位」，做完动作立刻让位。
+ *
+ * hold 只留给开合类：门 / 引擎盖 / 后备箱开着的时候定格，本来就是对的。
+ */
+const OTHER_EVENT_DEFAULTS = {
+  // 背景状态：谁来都让位
+  CS_Idle: { mode: 'loop', endMode: 'reset', priority: 0 },
+  CS_WF: { mode: 'loop', endMode: 'reset', priority: 50 },
+  CS_WB: { mode: 'loop', endMode: 'reset', priority: 50 },
+
+  // 持续点亮的信号：做一个动作就让位，绝不占槽
+  CS_Lower: { mode: 'once', endMode: 'reset', priority: 100 },
+  CS_High: { mode: 'once', endMode: 'reset', priority: 100 },
+  CS_Clearance: { mode: 'once', endMode: 'reset', priority: 100 },
+  CS_Daytime: { mode: 'once', endMode: 'reset', priority: 100 },
+  CS_Fog: { mode: 'once', endMode: 'reset', priority: 100 },
+  CS_Backup: { mode: 'once', endMode: 'reset', priority: 100 },
+  CS_LDirection: { mode: 'once', endMode: 'reset', priority: 100 },
+  CS_RDirection: { mode: 'once', endMode: 'reset', priority: 100 },
+  // 刹车比灯光更值得演，但同样播完就放手，否则停车等灯时会一直定格
+  CS_Stop: { mode: 'once', endMode: 'reset', priority: 150 },
+
+  // 开合类：开着的时候保持尾帧才符合直觉，关闭时反向收回
+  CS_LF: { mode: 'hold', endMode: 'reverse', priority: 150 },
+  CS_RF: { mode: 'hold', endMode: 'reverse', priority: 150 },
+  CS_LB: { mode: 'hold', endMode: 'reverse', priority: 150 },
+  CS_RB: { mode: 'hold', endMode: 'reverse', priority: 150 },
+  CS_Bonnet: { mode: 'hold', endMode: 'reverse', priority: 150 },
+  CS_Trunk: { mode: 'hold', endMode: 'reverse', priority: 150 },
+
+  // 双闪是异常状态，就该压住一切并持续演
+  CS_Emergency: { mode: 'loop', endMode: 'reset', priority: 200 },
+};
+
+// 上表已覆盖全部槽位，这里只兜底 slot 缺失的调用（如只为算时长的 playbackDurationOf）
+const FALLBACK_PLAYBACK = { mode: 'loop', endMode: 'reset' };
+
+/**
+ * 其他模型的事件动画播放策略。未保存过配置的旧项目继续沿用它自己存下来的值，
+ * 只有新绑定才吃上面这张表的默认值。
  */
 export function normalizeOtherPlayback(slot, value = {}) {
-  const defaults = slot?.kind === 'hinge' || slot?.kind === 'lamp'
-    ? { mode: 'hold', direction: 'forward', endMode: 'reverse' }
-    : { mode: 'loop', direction: 'forward', endMode: 'reset' };
+  const preset = OTHER_EVENT_DEFAULTS[slot?.id] || FALLBACK_PLAYBACK;
+  const defaults = { direction: 'forward', mode: preset.mode, endMode: preset.endMode };
   const stored = value && typeof value === 'object' ? value : {};
   const legacy = Object.keys(stored).length > 0 && ![2, 3].includes(Number(stored.version));
   const requestedMode = legacy && stored.mode === 'once' ? 'hold' : stored.mode;
@@ -119,9 +162,99 @@ export function playbackDurationOf(sourceDuration, playback, { cycle = true } = 
 }
 
 export function normalizeIdleDelaySeconds(value) {
-  if (value === '' || (typeof value === 'string' && value.trim() === '')) return 5;
+  if (value === '' || (typeof value === 'string' && value.trim() === '')) return 0;
   const seconds = Number(value);
-  return Number.isFinite(seconds) ? Math.min(600, Math.max(0, Math.round(seconds))) : 5;
+  return Number.isFinite(seconds) ? Math.min(600, Math.max(0, Math.round(seconds))) : 0;
+}
+
+/**
+ * 同一播放槽内多个事件同时激活时的仲裁优先级：数值大者接管，同值时最后触发者接管。
+ *
+ * 导出时会把“动画驱动节点互不重叠”的事件分到不同播放槽并行播放，
+ * 因此优先级只在动作真的会互相抢节点时才起作用。
+ */
+export const EVENT_PRIORITY_LEVELS = [
+  { value: 0, label: '最低' },
+  { value: 50, label: '较低' },
+  { value: 100, label: '普通' },
+  { value: 150, label: '较高' },
+  { value: 200, label: '最高' },
+];
+
+export function defaultEventPriority(slotOrId) {
+  const id = typeof slotOrId === 'string' ? slotOrId : slotOrId?.id;
+  return OTHER_EVENT_DEFAULTS[id]?.priority ?? 100;
+}
+
+/**
+ * 是不是「信号亮着就一直激活」的事件（灯光、刹车、转向）。
+ * 这类事件一旦配成保持尾帧，就会永久占住播放槽，所以默认播完即让位（mode=once）。
+ */
+export function isSustainedEvent(slotOrId) {
+  const id = typeof slotOrId === 'string' ? slotOrId : slotOrId?.id;
+  return OTHER_EVENT_DEFAULTS[id]?.mode === 'once';
+}
+
+/** 一个事件最多能挂几个动画；再多导出体积和过渡数量都会失控。 */
+export const MAX_EVENT_VARIANTS = 6;
+
+export function normalizeVariantWeight(value) {
+  const weight = Math.round(Number(value));
+  return Number.isFinite(weight) ? Math.min(100, Math.max(1, weight)) : 10;
+}
+
+/**
+ * 事件下挂的动画列表（变体）。车机每次触发按权重随机挑一个播，动作就不会永远一个样。
+ *
+ * 老项目只存了单个 sourceAnimationIndex，这里统一折算成单元素列表；
+ * 反过来第 0 个变体始终同步回 sourceAnimationIndex，好让预览、校验和旧车机继续按单动画走。
+ */
+export function eventVariantsOf(binding) {
+  const raw = Array.isArray(binding?.variants) ? binding.variants : [];
+  const seen = new Set();
+  const list = [];
+  for (const item of raw) {
+    if (!Number.isInteger(item?.index) || seen.has(item.index)) continue;
+    seen.add(item.index);
+    list.push({
+      index: item.index,
+      name: item.name || `#${item.index}`,
+      weight: normalizeVariantWeight(item.weight),
+    });
+    if (list.length >= MAX_EVENT_VARIANTS) break;
+  }
+  if (list.length) return list;
+  if (Number.isInteger(binding?.sourceAnimationIndex)) {
+    return [{
+      index: binding.sourceAnimationIndex,
+      name: binding.sourceAnimationName || `#${binding.sourceAnimationIndex}`,
+      weight: 10,
+    }];
+  }
+  return [];
+}
+
+/** 把权重换算成展示用的百分比，四舍五入后补齐到 100。 */
+export function variantChances(variants) {
+  const total = variants.reduce((sum, item) => sum + item.weight, 0);
+  if (!total) return variants.map(() => 0);
+  const raw = variants.map((item) => (item.weight / total) * 100);
+  const rounded = raw.map((value) => Math.round(value));
+  const drift = 100 - rounded.reduce((sum, value) => sum + value, 0);
+  if (drift !== 0 && rounded.length) {
+    let pick = 0;
+    for (let i = 1; i < raw.length; i++) {
+      if (Math.abs(raw[i] - rounded[i]) > Math.abs(raw[pick] - rounded[pick])) pick = i;
+    }
+    rounded[pick] += drift;
+  }
+  return rounded;
+}
+
+export function normalizeEventPriority(slotOrId, value) {
+  const priority = Math.round(Number(value));
+  if (!Number.isFinite(priority)) return defaultEventPriority(slotOrId);
+  return Math.min(999, Math.max(0, priority));
 }
 
 const OTHER_ACTION_OPTIONS = {

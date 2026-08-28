@@ -282,6 +282,25 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .playback-advanced summary small { color: #75858d; font-size: 9px; font-variant-numeric: tabular-nums; }
 .playback-advanced-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; padding: 2px 0 9px 15px; }
 .playback-advanced-grid input { width: 100%; min-height: 35px; color: var(--ink); border: 1px solid #3a464d; background: #171e22; border-radius: 5px; }
+.playback-priority-hint { display: block; padding: 0 0 9px 15px; color: var(--ink-3); font-size: 10px; line-height: 1.6; }
+.variant-list { margin: 10px 0 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: #151b1f; }
+.variant-title { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--ink-2); font-size: 11px; }
+.variant-title strong { color: var(--ink); font-size: 11px; }
+.variant-title small { margin-left: auto; color: var(--ink-3); font-size: 10px; }
+.variant-title i { width: 13px; height: 13px; color: var(--brand); }
+.variant-row { display: flex; align-items: center; gap: 7px; padding: 4px 6px; border-top: 1px solid #222b30; border-radius: 5px; cursor: pointer; }
+.variant-row:first-of-type { border-top: 0; }
+.variant-row:hover { background: #1b2328; }
+.variant-row.active { background: #1d2b31; box-shadow: inset 2px 0 0 var(--brand); }
+.variant-row:focus-visible { outline: 1px solid var(--brand); outline-offset: -1px; }
+.variant-name { display: flex; align-items: center; gap: 5px; min-width: 0; flex: 1 1 auto; }
+.variant-name span { overflow: hidden; color: var(--ink); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.variant-lead { flex: none; padding: 1px 4px; color: var(--brand); border: 1px solid currentColor; border-radius: 3px; font-size: 9px; font-style: normal; line-height: 1.3; opacity: .75; }
+.variant-chance { display: flex; align-items: center; gap: 5px; flex: none; }
+.variant-chance input { width: 52px; min-height: 30px; padding: 0 6px; color: var(--ink); border: 1px solid #3a464d; border-radius: 5px; background: #171e22; font-size: 11px; }
+.variant-chance span { width: 34px; color: var(--ink-2); font-size: 10px; font-variant-numeric: tabular-nums; text-align: right; }
+.variant-remove { flex: none; padding: 0 7px; min-height: 30px; }
+.variant-remove i { width: 12px; height: 12px; }
 .input-suffix { position: relative; }
 .input-suffix input { padding-right: 25px; }
 .input-suffix span { position: absolute; top: 50%; right: 9px; color: var(--ink-3); font-size: 10px; transform: translateY(-50%); pointer-events: none; }
