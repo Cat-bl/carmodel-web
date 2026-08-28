@@ -283,6 +283,110 @@ export function buildKeyframes(slot, params, animationName) {
   return { path: 'rotation', times, values };
 }
 
+/* ---------- 灯光质感：叠加层发光 + 路面光束 ---------- */
+
+export function isLampSlot(slot) {
+  return slot?.kind === 'lamp' || slot?.kind === 'blink';
+}
+
+/**
+ * 路面光束的槽位默认值。长度/宽度按车长/车宽的倍数存储，任意尺寸的车型都能自适应。
+ * 数值对齐官方 HcModel：近光路面 quad 约 2.2 倍车长、1.75 倍车宽，远光更长更亮。
+ * 尾部灯光（刹车/倒车）默认关闭，需要时可手动打开在车尾投射红/白光晕。
+ */
+const BEAM_SLOT_DEFAULTS = {
+  CS_Lower: { direction: 'front', enabled: true, length: 2.2, width: 1.75, intensity: 0.6, spread: 0.45 },
+  CS_High: { direction: 'front', enabled: true, length: 2.8, width: 1.9, intensity: 0.75, spread: 0.6 },
+  CS_Fog: { direction: 'front', enabled: true, length: 1.2, width: 1.9, intensity: 0.4, spread: 0.85 },
+  CS_Stop: { direction: 'rear', enabled: false, length: 0.7, width: 1.4, intensity: 0.45, spread: 0.7 },
+  CS_Backup: { direction: 'rear', enabled: false, length: 1.0, width: 1.3, intensity: 0.5, spread: 0.6 },
+};
+
+export const LAMP_GLOW_LIMITS = Object.freeze({
+  intensity: [0.3, 1.5],
+  core: [0, 1],
+  detail: [0, 1],
+  softness: [0, 1],
+});
+
+export const LAMP_BEAM_LIMITS = Object.freeze({
+  length: [0.3, 5],
+  width: [0.4, 3.5],
+  intensity: [0.05, 1],
+  spread: [0, 1],
+  offset: [-0.3, 0.8], // 起点相对保险杠的前后偏移（×车长）
+  side: [-0.5, 0.5], // 左右偏移（×车宽）
+  height: [0, 0.1], // 离地高度（米）
+  lobeSpacing: [0.1, 1.2], // 双光斑间距（×车宽）
+  lobeWidth: [0, 1],
+  falloff: [0, 1],
+  haze: [0, 1],
+});
+
+export const BEAM_SHAPES = Object.freeze([
+  { value: 'cone', label: '锥形光束' },
+  { value: 'pool', label: '圆形光斑' },
+  { value: 'bar', label: '平行光带' },
+]);
+
+export const BEAM_LOBE_MODES = Object.freeze([
+  { value: 'auto', label: '按灯罩自动' },
+  { value: 'single', label: '单光斑' },
+  { value: 'double', label: '双光斑' },
+]);
+
+function normalizeHexColor(value) {
+  return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : null;
+}
+
+function clampNumber(value, [min, max], fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
+}
+
+export function beamDirectionOf(slotOrId) {
+  const id = typeof slotOrId === 'string' ? slotOrId : slotOrId?.id;
+  return BEAM_SLOT_DEFAULTS[id]?.direction || null;
+}
+
+/** 发光质感：亮度、热白中心、保留原贴图纹理的程度、边缘柔化 */
+export function normalizeLampGlow(value) {
+  const stored = value && typeof value === 'object' ? value : {};
+  return {
+    intensity: clampNumber(stored.intensity, LAMP_GLOW_LIMITS.intensity, 1),
+    core: clampNumber(stored.core, LAMP_GLOW_LIMITS.core, 0.45),
+    detail: clampNumber(stored.detail, LAMP_GLOW_LIMITS.detail, 0.6),
+    softness: clampNumber(stored.softness, LAMP_GLOW_LIMITS.softness, 0.3),
+  };
+}
+
+/** 路面光束；不支持光束的槽位返回 null */
+export function normalizeLampBeam(slotOrId, value) {
+  const id = typeof slotOrId === 'string' ? slotOrId : slotOrId?.id;
+  const defaults = BEAM_SLOT_DEFAULTS[id];
+  if (!defaults) return null;
+  const stored = value && typeof value === 'object' ? value : {};
+  return {
+    direction: defaults.direction,
+    enabled: typeof stored.enabled === 'boolean' ? stored.enabled : defaults.enabled,
+    shape: BEAM_SHAPES.some((item) => item.value === stored.shape) ? stored.shape : 'cone',
+    lobeMode: BEAM_LOBE_MODES.some((item) => item.value === stored.lobeMode) ? stored.lobeMode : 'auto',
+    lobeSpacing: clampNumber(stored.lobeSpacing, LAMP_BEAM_LIMITS.lobeSpacing, 0.6),
+    lobeWidth: clampNumber(stored.lobeWidth, LAMP_BEAM_LIMITS.lobeWidth, 0.4),
+    length: clampNumber(stored.length, LAMP_BEAM_LIMITS.length, defaults.length),
+    width: clampNumber(stored.width, LAMP_BEAM_LIMITS.width, defaults.width),
+    offset: clampNumber(stored.offset, LAMP_BEAM_LIMITS.offset, 0.06),
+    side: clampNumber(stored.side, LAMP_BEAM_LIMITS.side, 0),
+    height: clampNumber(stored.height, LAMP_BEAM_LIMITS.height, 0.02),
+    intensity: clampNumber(stored.intensity, LAMP_BEAM_LIMITS.intensity, defaults.intensity),
+    spread: clampNumber(stored.spread, LAMP_BEAM_LIMITS.spread, defaults.spread),
+    falloff: clampNumber(stored.falloff, LAMP_BEAM_LIMITS.falloff, 0.45),
+    haze: clampNumber(stored.haze, LAMP_BEAM_LIMITS.haze, 0.35),
+    // null = 跟随点亮颜色
+    color: normalizeHexColor(stored.color),
+  };
+}
+
 /** #rrggbb → [r, g, b] 0~255 */
 export function parseColor(hex) {
   const value = String(hex || '#ffffff').replace('#', '');

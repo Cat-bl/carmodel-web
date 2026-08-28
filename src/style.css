@@ -311,6 +311,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .selection-mode button, .selection-operation button { flex: 1; }
 .tool-icon { display: inline-block; margin-right: 3px; font-size: 14px; }
 .range-fields { display: grid; gap: 9px; margin-top: 12px; }
+.lamp-section { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.lamp-section .range-fields { margin-top: 4px; }
+.lamp-section .range-fields[hidden], .lamp-section .range-field[hidden], .lamp-section .field[hidden] { display: none; }
 .range-field output { float: right; color: var(--brand-deep); font-variant-numeric: tabular-nums; }
 .range-field input { display: block; width: 100%; margin-top: 6px; accent-color: var(--brand); }
 .model-brightness-field { margin: 6px 0 3px; padding-top: 10px; border-top: 1px solid var(--line); }

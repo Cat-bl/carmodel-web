@@ -7,10 +7,20 @@ import {
   actionKindOf,
   animationNamesOf,
   buildKeyframes,
+  isLampSlot,
+  normalizeLampBeam,
+  normalizeLampGlow,
   normalizeOtherPlayback,
 } from './bindings.js';
 import { createCarShadowCanvas, shadowFootprint } from './shadow.js';
 import { inferModelFront } from './orientation.js';
+import {
+  beamLobes,
+  beamQuadGeometry,
+  buildLampArtwork,
+  lampOverlayOffset,
+  synthesizePlanarUv,
+} from './lamp.js';
 import {
   applyTriangleOperation,
   buildTriangleTopology,
@@ -210,6 +220,9 @@ export class ModelPreview {
     this.loadedAnimations = [];
     this.mixer = null;
     this.bindingPreview = null;
+    // 车机质感：导出管线生成的各灯位点亮图集；网页质感：源贴图像素缓存（生成点亮贴图用）
+    this.deviceLampTextures = new Map();
+    this.lampImageCache = new Map();
     this.highlight = null;
     this.selectionOverlay = null;
     this.selectionMeshes = new Map();
@@ -1258,48 +1271,52 @@ export class ModelPreview {
     group.position.copy(pivot);
     this.model.updateMatrixWorld(true);
 
-    const lit = slot.kind === 'lamp' || slot.kind === 'blink';
-    const litMaterial = lit ? makeLitMaterial(params.color || slot.color) : null;
-
-    const staticGroup = params.region || params.selection ? new THREE.Group() : null;
-    const hidden = [];
-    for (const object of targets) {
-      const makeClone = (geometry, material) => {
-        const clone = new THREE.Mesh(geometry || object.geometry, material || object.material);
-        clone.matrix.copy(object.matrixWorld);
-        clone.matrix.decompose(clone.position, clone.quaternion, clone.scale);
-        return clone;
-      };
-      if (params.region || params.selection) {
-        // 精细选面与旧框选都真正切成两半，预览与导出使用同一 triangle ordinal。
-        const meta = this.selectionMeshes.get(object);
-        const selected = params.selection && meta
-          ? selectedTriangles(params.selection, meta.nodeIndex, meta.primitiveIndex)
-          : null;
-        if (params.selection && !selected?.size) continue;
-        const split = selected
-          ? splitGeometryBySelection(object, selected)
-          : splitGeometryByRegion(object, params.region);
-        if (!split.inside) continue; // 完全在框外：原件原样保留
-        const moving = makeClone(split.inside, litMaterial);
-        moving.position.sub(pivot);
-        group.add(moving);
-        if (split.outside) staticGroup.add(makeClone(split.outside, null));
-      } else {
-        const clone = makeClone(null, litMaterial);
-        clone.position.sub(pivot);
-        group.add(clone);
+    if (isLampSlot(slot)) {
+      // 灯光是叠加层：原灯罩保持可见，副本外推贴在表面并换成点亮图集，与导出结构一致
+      if (!this.buildLampPreviewGroup(slot, params, targets, pivot, group)) return;
+      this.scene.add(group);
+      this.bindingPreview = { group, staticGroup: null, hidden: [] };
+    } else {
+      const staticGroup = params.region || params.selection ? new THREE.Group() : null;
+      const hidden = [];
+      for (const object of targets) {
+        const makeClone = (geometry, material) => {
+          const clone = new THREE.Mesh(geometry || object.geometry, material || object.material);
+          clone.matrix.copy(object.matrixWorld);
+          clone.matrix.decompose(clone.position, clone.quaternion, clone.scale);
+          return clone;
+        };
+        if (params.region || params.selection) {
+          // 精细选面与旧框选都真正切成两半，预览与导出使用同一 triangle ordinal。
+          const meta = this.selectionMeshes.get(object);
+          const selected = params.selection && meta
+            ? selectedTriangles(params.selection, meta.nodeIndex, meta.primitiveIndex)
+            : null;
+          if (params.selection && !selected?.size) continue;
+          const split = selected
+            ? splitGeometryBySelection(object, selected)
+            : splitGeometryByRegion(object, params.region);
+          if (!split.inside) continue; // 完全在框外：原件原样保留
+          const moving = makeClone(split.inside, null);
+          moving.position.sub(pivot);
+          group.add(moving);
+          if (split.outside) staticGroup.add(makeClone(split.outside, null));
+        } else {
+          const clone = makeClone(null, null);
+          clone.position.sub(pivot);
+          group.add(clone);
+        }
+        object.visible = false;
+        hidden.push(object);
       }
-      object.visible = false;
-      hidden.push(object);
+      if (group.children.length === 0) {
+        for (const object of hidden) object.visible = true;
+        return;
+      }
+      this.scene.add(group);
+      if (staticGroup) this.scene.add(staticGroup);
+      this.bindingPreview = { group, staticGroup, hidden };
     }
-    if (group.children.length === 0) {
-      for (const object of hidden) object.visible = true;
-      return;
-    }
-    this.scene.add(group);
-    if (staticGroup) this.scene.add(staticGroup);
-    this.bindingPreview = { group, staticGroup, hidden };
 
     const names = animationNamesOf(slot);
     if (names.length === 0 || group.children.length === 0) return;
@@ -1401,19 +1418,35 @@ export class ModelPreview {
     const clip = animationName
       ? this.loadedAnimations.find((animation) => animation.name === animationName)
       : null;
-    // 车机质感只能播放最终导出的动画。缓存异常时保留上一动作，不能拿
-    // 原模型的动画下标去误播导出 GLB 中的另一段动画。
-    if (!clip) return true;
-
     const materialRestores = [];
-    if (!isSourceAnimation && (slot.kind === 'lamp' || slot.kind === 'blink')) {
+    if (!isSourceAnimation && isLampSlot(slot)) {
+      // 导出 GLB 里的灯位已经是叠加层（内嵌透明图），点亮 = 换成随预览生成的点亮图集，与车机行为一致
+      const lampTexture = this.deviceLampTextures.get(slot.id) || null;
       for (const mesh of meshes) {
         const original = mesh.material;
         const originals = Array.isArray(original) ? original : [original];
-        const replacements = originals.map(() => makeLitMaterial(params.color || slot.color));
+        const replacements = originals.map(() => (lampTexture
+          ? makeLampPreviewMaterial(lampTexture, true)
+          : makeLitMaterial(params.color || slot.color)));
         mesh.material = Array.isArray(original) ? replacements : replacements[0];
         materialRestores.push({ mesh, original, replacements });
       }
+    }
+    // 车机质感只能播放最终导出的动画。缓存异常时保留上一动作，不能拿
+    // 原模型的动画下标去误播导出 GLB 中的另一段动画。
+    if (!clip) {
+      if (materialRestores.length === 0) return true;
+      // 近光/刹车这类只换贴图、没有动画的灯位：点亮即完成
+      this.bindingPreview = {
+        sourceEvent: false,
+        eventId: null,
+        currentAction: null,
+        currentClip: null,
+        materialRestores,
+        mixerFinishedHandlers: [],
+        transitionTimers: new Set(),
+      };
+      return true;
     }
 
     const nextPreview = {
@@ -1567,7 +1600,9 @@ export class ModelPreview {
           if (object.geometry?.userData?.temporary) object.geometry.dispose();
           const materials = Array.isArray(object.material) ? object.material : [object.material];
           for (const material of materials) {
-            if (material?.userData?.temporary) material.dispose();
+            if (!material?.userData?.temporary) continue;
+            if (material.userData.ownsMap) material.map?.dispose();
+            material.dispose();
           }
         });
         container.removeFromParent();
@@ -1953,7 +1988,7 @@ export class ModelPreview {
   }
 
   /** 车机质感：加载烘焙后的 GLB 并换成无反射的简单光照材质，所见即车机所得。 */
-  async setDeviceMode(enabled, bakedBytes, exportTransform) {
+  async setDeviceMode(enabled, bakedBytes, exportTransform, lamps = []) {
     if (!this.original) return;
     const source = enabled ? bakedBytes : this.original;
     const buffer = source instanceof Uint8Array
@@ -1977,10 +2012,12 @@ export class ModelPreview {
           flatShading: material.flatShading || !child.geometry?.attributes?.normal,
           transparent: material.transparent || false,
           opacity: material.opacity ?? 1,
+          depthWrite: material.depthWrite !== false,
           side: material.side,
         }));
         if (child.material.length === 1) child.material = child.material[0];
       });
+      await this.loadDeviceLampTextures(lamps);
     }
     if (!enabled) this.applyModelBrightness();
     this.scene.add(this.model);
@@ -2122,6 +2159,163 @@ export class ModelPreview {
     this.frame = requestAnimationFrame(this.animate);
   }
 
+  /** 车机质感：把导出管线生成的各灯位点亮图集解码成贴图（flipY=false，与 glTF UV 方向一致） */
+  async loadDeviceLampTextures(lamps) {
+    this.disposeDeviceLampTextures();
+    for (const lamp of lamps || []) {
+      if (!lamp?.slotId || !lamp.png) continue;
+      const url = URL.createObjectURL(new Blob([lamp.png], { type: 'image/png' }));
+      try {
+        const image = new Image();
+        image.src = url;
+        await image.decode();
+        const texture = new THREE.Texture(image);
+        texture.flipY = false;
+        texture.colorSpace = THREE.SRGBColorSpace;
+        texture.wrapS = THREE.ClampToEdgeWrapping;
+        texture.wrapT = THREE.ClampToEdgeWrapping;
+        texture.needsUpdate = true;
+        this.deviceLampTextures.set(lamp.slotId, texture);
+      } catch (error) {
+        console.warn(`灯位 ${lamp.slotId} 点亮贴图解码失败`, error);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+  }
+
+  disposeDeviceLampTextures() {
+    for (const texture of this.deviceLampTextures.values()) texture.dispose();
+    this.deviceLampTextures.clear();
+  }
+
+  /** 网页质感：读取源材质贴图像素（缓存），供点亮贴图保留灯罩纹理 */
+  lampSourceImageOf(material) {
+    const texture = material?.map;
+    const image = texture?.image;
+    if (!image || !(image.width > 0) || !(image.height > 0)) return null;
+    const key = texture.uuid;
+    if (this.lampImageCache.has(key)) return this.lampImageCache.get(key);
+    let data = null;
+    try {
+      // 采样用的是归一化 UV，超大贴图缩到 2048 内即可，避免占用过多内存
+      const scale = Math.min(1, 2048 / Math.max(image.width, image.height));
+      const width = Math.max(1, Math.round(image.width * scale));
+      const height = Math.max(1, Math.round(image.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext('2d');
+      context.drawImage(image, 0, 0, width, height);
+      data = context.getImageData(0, 0, width, height);
+      // GLTFLoader 的贴图 flipY=false，像素行序与 glTF UV 一致；其它来源若翻转则翻回来
+      if (texture.flipY) {
+        const row = width * 4;
+        const flipped = new Uint8ClampedArray(data.data.length);
+        for (let y = 0; y < height; y++) flipped.set(data.data.subarray(y * row, (y + 1) * row), (height - 1 - y) * row);
+        data = new ImageData(flipped, width, height);
+      }
+    } catch (error) {
+      console.warn('读取灯罩贴图像素失败，改用材质底色', error);
+      data = null;
+    }
+    this.lampImageCache.set(key, data);
+    return data;
+  }
+
+  /**
+   * 网页质感的灯光预览：按导出同样的规则把选区副本做成叠加层，
+   * 生成点亮图集（含路面光束）后贴上去。返回 false 表示没有可预览的几何。
+   */
+  buildLampPreviewGroup(slot, params, targets, pivot, group) {
+    const bounds = this.wholeBounds();
+    if (!bounds) return false;
+    const carLength = bounds.max[0] - bounds.min[0];
+    const carWidth = bounds.max[2] - bounds.min[2];
+    const offset = lampOverlayOffset(carLength);
+    const pieces = [];
+    const geometries = [];
+    const zValues = [];
+    for (const object of targets) {
+      let source = object.geometry;
+      if (params.region || params.selection) {
+        const meta = this.selectionMeshes.get(object);
+        const selected = params.selection && meta
+          ? selectedTriangles(params.selection, meta.nodeIndex, meta.primitiveIndex)
+          : null;
+        if (params.selection && !selected?.size) continue;
+        const split = selected
+          ? splitGeometryBySelection(object, selected)
+          : splitGeometryByRegion(object, params.region);
+        split.outside?.dispose();
+        if (!split.inside) continue;
+        source = split.inside;
+      }
+      const geometry = compactLampGeometry(source, object.matrixWorld, offset);
+      if (source !== object.geometry) source.dispose();
+      if (!geometry) continue;
+      const material = Array.isArray(object.material) ? object.material[0] : object.material;
+      const position = geometry.attributes.position;
+      const uvAttribute = geometry.attributes.uv;
+      pieces.push({
+        uv: uvAttribute ? Float32Array.from(uvAttribute.array) : synthesizePlanarUv(position.array, position.count),
+        indices: geometry.index.array,
+        vertexCount: position.count,
+        image: uvAttribute ? this.lampSourceImageOf(material) : null,
+        baseColor: material?.color ? material.color.toArray() : [1, 1, 1],
+      });
+      for (let i = 0; i < position.count; i++) zValues.push(position.getZ(i));
+      geometries.push(geometry);
+    }
+    if (geometries.length === 0) return false;
+
+    const beam = normalizeLampBeam(slot, params.beam);
+    let quad = null;
+    let beamSpec = null;
+    if (beam?.enabled) {
+      quad = beamQuadGeometry({ direction: beam.direction, bounds, beam });
+      beamSpec = {
+        ...beam,
+        lobes: beamLobes(zValues, { centerZ: quad.centerZ, halfWidth: quad.halfWidth, carWidth }, beam),
+      };
+    }
+    const art = buildLampArtwork({
+      pieces,
+      beam: beamSpec,
+      color: params.color || slot.color,
+      glow: normalizeLampGlow(params.glow),
+    });
+    const texture = new THREE.CanvasTexture(art.canvas);
+    texture.flipY = false;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.wrapS = THREE.ClampToEdgeWrapping;
+    texture.wrapT = THREE.ClampToEdgeWrapping;
+    texture.needsUpdate = true;
+    const material = makeLampPreviewMaterial(texture, this.deviceMode, { ownsMap: true });
+    geometries.forEach((geometry, index) => {
+      geometry.setAttribute('uv', new THREE.BufferAttribute(art.pieceUvs[index], 2));
+      const mesh = new THREE.Mesh(geometry, material);
+      // 几何已是世界坐标，预览组挂在枢轴上，网格反向平移回去
+      mesh.position.set(-pivot.x, -pivot.y, -pivot.z);
+      mesh.renderOrder = 2;
+      group.add(mesh);
+    });
+    if (quad && art.beamUv) {
+      const { u0, v0, u1, v1 } = art.beamUv;
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(quad.positions), 3));
+      geometry.setAttribute('normal', new THREE.BufferAttribute(Float32Array.from(quad.normals), 3));
+      geometry.setAttribute('uv', new THREE.BufferAttribute(Float32Array.from([u0, v1, u1, v1, u1, v0, u0, v0]), 2));
+      geometry.setIndex(new THREE.BufferAttribute(Uint16Array.from(quad.indices), 1));
+      geometry.userData.temporary = true;
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(-pivot.x, -pivot.y, -pivot.z);
+      mesh.renderOrder = 1;
+      group.add(mesh);
+    }
+    return true;
+  }
+
   disposeModel() {
     this.stopBindingPreview();
     this.clearHighlight();
@@ -2129,6 +2323,8 @@ export class ModelPreview {
     this.hideRegionBox();
     this.hidePivotMarker();
     this.setPickMode(false, null);
+    this.disposeDeviceLampTextures();
+    this.lampImageCache.clear();
     this.nodeObjects = [];
     this.nodeObjectSet = null;
     this.selectionMeshes = new Map();
@@ -2227,7 +2423,7 @@ function withIndices(source, indices) {
   return geometry;
 }
 
-/** 灯光/闪烁的“点亮”材质：车机端点亮就是换成纯色贴图，预览用无光照纯色等价呈现 */
+/** 点亮图集缺失时的兜底：无光照纯色 */
 function makeLitMaterial(color) {
   const material = new THREE.MeshBasicMaterial({
     color: new THREE.Color(color || '#ffffff'),
@@ -2235,6 +2431,90 @@ function makeLitMaterial(color) {
   });
   material.userData.temporary = true;
   return material;
+}
+
+/**
+ * 灯光叠加层的“点亮”材质。车机质感用 Lambert（与其余车身一致、如实反映车机简单光照），
+ * 网页质感用无光照 Basic 便于编辑时看清贴图本身。BLEND 叠加层不写深度，避免遮住车窗等透明件。
+ */
+function makeLampPreviewMaterial(texture, device, { ownsMap = false } = {}) {
+  const options = { map: texture, transparent: true, depthWrite: false, side: THREE.DoubleSide };
+  const material = device
+    ? new THREE.MeshLambertMaterial(options)
+    : new THREE.MeshBasicMaterial({ ...options, toneMapped: false });
+  material.userData.temporary = true;
+  material.userData.ownsMap = ownsMap;
+  return material;
+}
+
+/**
+ * 把（切分后的）几何压成只含用到的顶点的世界坐标副本，并沿法线外推成叠加层。
+ * 与导出端 collectPrimitives + buildLampOverlay 的处理一致：镜像矩阵时翻转环绕方向。
+ */
+function compactLampGeometry(source, matrixWorld, offset) {
+  const position = source?.attributes?.position;
+  if (!position) return null;
+  const index = source.index;
+  const count = index ? index.count : position.count;
+  if (count < 3) return null;
+  const remap = new Map();
+  const indices = new Uint32Array(count);
+  for (let i = 0; i < count; i++) {
+    const old = index ? index.getX(i) : i;
+    let next = remap.get(old);
+    if (next === undefined) {
+      next = remap.size;
+      remap.set(old, next);
+    }
+    indices[i] = next;
+  }
+  if (matrixWorld.determinant() < 0) {
+    for (let t = 0; t + 2 < indices.length; t += 3) {
+      const swap = indices[t + 1];
+      indices[t + 1] = indices[t + 2];
+      indices[t + 2] = swap;
+    }
+  }
+  const vertexCount = remap.size;
+  const positions = new Float32Array(vertexCount * 3);
+  const sourceNormal = source.attributes.normal;
+  const normals = sourceNormal ? new Float32Array(vertexCount * 3) : null;
+  const sourceUv = source.attributes.uv;
+  const uv = sourceUv ? new Float32Array(vertexCount * 2) : null;
+  const normalMatrix = new THREE.Matrix3().getNormalMatrix(matrixWorld);
+  const point = new THREE.Vector3();
+  const normal = new THREE.Vector3();
+  for (const [old, next] of remap) {
+    point.fromBufferAttribute(position, old).applyMatrix4(matrixWorld);
+    positions[next * 3] = point.x;
+    positions[next * 3 + 1] = point.y;
+    positions[next * 3 + 2] = point.z;
+    if (normals) {
+      normal.fromBufferAttribute(sourceNormal, old).applyMatrix3(normalMatrix).normalize();
+      normals[next * 3] = normal.x;
+      normals[next * 3 + 1] = normal.y;
+      normals[next * 3 + 2] = normal.z;
+    }
+    if (uv) {
+      uv[next * 2] = sourceUv.getX(old);
+      uv[next * 2 + 1] = sourceUv.getY(old);
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  if (normals) geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  if (uv) geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  if (!normals) geometry.computeVertexNormals();
+  const finalNormal = geometry.attributes.normal;
+  for (let i = 0; i < vertexCount; i++) {
+    positions[i * 3] += finalNormal.getX(i) * offset;
+    positions[i * 3 + 1] += finalNormal.getY(i) * offset;
+    positions[i * 3 + 2] += finalNormal.getZ(i) * offset;
+  }
+  geometry.attributes.position.needsUpdate = true;
+  geometry.userData.temporary = true;
+  return geometry;
 }
 
 function collectStats(gltf, bytes) {

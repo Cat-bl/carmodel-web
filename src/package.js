@@ -4,12 +4,22 @@ import {
   SLOT_BY_ID,
   animationNamesOf,
   buildKeyframes,
+  isLampSlot,
   normalizeIdleDelaySeconds,
+  normalizeLampBeam,
+  normalizeLampGlow,
   normalizeOtherPlayback,
-  parseColor,
 } from './bindings.js';
 import { createCarShadowCanvas, createTransparentShadowCanvas, shadowFootprint } from './shadow.js';
 import { selectedTriangles } from './selection.js';
+import {
+  beamLobes,
+  beamQuadGeometry,
+  buildLampArtwork,
+  createTransparentLampCanvas,
+  lampOverlayOffset,
+  synthesizePlanarUv,
+} from './lamp.js';
 
 const CARSELF_HEADER_URL = './templates/hcmodel-header.bin';
 const TAIL = new Uint8Array([0x0b, 0x00, 0x00, 0x00]);
@@ -114,9 +124,10 @@ export async function makeBydCar(options) {
         : extractNamedTexture(normalizedState, 'CS_Shadow').bytes,
     },
   ];
-  // 每个灯位随包附带一张纯色贴图，车机点亮时按 CS_XXX.png 取用
+  // 每个灯位随包附带一张“点亮图集”（灯罩发光 + 路面光束），车机点亮时按 CS_XXX.png 取用；
+  // 灭灯时回退到 GLB 内嵌的全透明贴图，叠加层隐形。
   for (const lamp of lamps) {
-    files.push({ path: `payload/Texture/${lamp.slotId}.png`, bytes: await makeLampTexture(lamp.color) });
+    files.push({ path: `payload/Texture/${lamp.slotId}.png`, bytes: lamp.png });
   }
   manifest.resources = [];
   for (const file of files) {
@@ -129,6 +140,11 @@ export async function makeBydCar(options) {
       slot: binding.slotId, source: binding.sourceName || '', region: Boolean(binding.region),
       ...(Number.isInteger(binding.sourceAnimationIndex) ? {
         sourceAnimation: binding.sourceAnimationName || `#${binding.sourceAnimationIndex}`,
+      } : {}),
+      ...(isLampSlot(SLOT_BY_ID.get(binding.slotId)) && !Number.isInteger(binding.sourceAnimationIndex) ? {
+        color: binding.color || SLOT_BY_ID.get(binding.slotId).color,
+        glow: normalizeLampGlow(binding.glow),
+        beam: normalizeLampBeam(binding.slotId, binding.beam),
       } : {}),
     }));
   }
@@ -264,15 +280,6 @@ function normalizeExportQuality(quality) {
 }
 
 /** 灯位贴图：整图纯色。官方是共享 UV 图集，自定义模型没有那套 UV 约定，纯色才通用。 */
-async function makeLampTexture(color) {
-  const [r, g, b] = parseColor(color);
-  const canvas = makeCanvas(64, 64);
-  const context = canvas.getContext('2d');
-  context.fillStyle = `rgb(${r},${g},${b})`;
-  context.fillRect(0, 0, 64, 64);
-  return encodeCanvasPng(canvas);
-}
-
 /**
  * 车机渲染器只支持底色贴图 + 简单光照（无环境反射、无自发光/法线/AO、
  * 不认 sheen/clearcoat/transmission 扩展）。
@@ -2668,7 +2675,9 @@ async function normalizeAnimatedOtherGlb(
 }
 
 function preservesSourceGeometry(binding) {
-  return binding.preserveSource === true || binding.slotId === 'CS_Emergency';
+  if (binding.preserveSource === true || binding.slotId === 'CS_Emergency') return true;
+  // 灯光是叠加层：车身保留原灯罩，灭灯时看起来与原模型完全一致，闪烁缩小时也不会露空
+  return isLampSlot(SLOT_BY_ID.get(binding.slotId)) && !Number.isInteger(binding.sourceAnimationIndex);
 }
 
 /**
@@ -2942,7 +2951,7 @@ async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletio
   const bake = mat4FromNode(transform);
   // 必须先按原始 triangle ordinal 复制联动部件，再删除用户框选区域。
   // 否则删除会重写索引，使精细选面保存的三角形编号失效。
-  const parts = applyBindings(state, bindings, sourceRoots, bake);
+  const parts = await applyBindings(state, bindings, sourceRoots, bake);
   applyDeletions(state, deletions, sourceRoots, bake, parts.nodeIndices);
   // applyBindings 需要先读取 skin 标记来拒绝车机无法安全播放的骨骼动画。
   // 完成源动画判定后再沿用原管线移除蒙皮信息。
@@ -3015,6 +3024,8 @@ function boundsOfOutputGeometry(state, sourceRoots, partNodes, bake) {
     let world = worldMatrixOf(json, nodeIndex, parents);
     if (applyBake) world = mat4Multiply(bake, world);
     for (const primitive of mesh?.primitives || []) {
+      // 路面光束伸到车前十几米，不能算进车身尺寸（阴影会被撑大）
+      if (primitive[BEAM_PRIMITIVE]) continue;
       const position = readAttributeAsFloat(state, primitive.attributes?.POSITION);
       if (!position) continue;
       entries.push({ position: position.data, world });
@@ -3545,61 +3556,177 @@ function pruneUnusedAccessors(state) {
   }
 }
 
-function primitiveTriangleCount(json, primitive) {
-  const accessorIndex = Number.isInteger(primitive.indices)
-    ? primitive.indices
-    : primitive.attributes?.POSITION;
-  const count = json.accessors?.[accessorIndex]?.count || 0;
-  return Math.floor(count / 3);
+/* ---------- 灯光叠加层 ---------- */
+
+// 路面光束 primitive 的标记。Symbol 键不会被 JSON 序列化，也不会进入 structuredClone。
+const BEAM_PRIMITIVE = Symbol('beamPrimitive');
+
+function linearToSrgb01(value) {
+  const c = Math.min(1, Math.max(0, Number(value) || 0));
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055;
+}
+
+async function lampSourceImage(state, materialIndex, context) {
+  const material = state.json.materials?.[materialIndex];
+  const imageIndex = imageIndexOf(state.json, material?.pbrMetallicRoughness?.baseColorTexture);
+  if (!Number.isInteger(imageIndex)) return null;
+  if (!context.images.has(imageIndex)) {
+    let decoded = null;
+    try {
+      decoded = await decodeToImageData(state, imageIndex);
+    } catch (error) {
+      console.warn('灯罩贴图解码失败，改用材质底色', error);
+    }
+    context.images.set(imageIndex, decoded);
+  }
+  return context.images.get(imageIndex);
+}
+
+/** 无贴图材质的底色（sRGB 0~1）：优先取渐变烘焙记录的底色，否则取 baseColorFactor */
+function lampBaseColor(json, materialIndex) {
+  const material = json.materials?.[materialIndex];
+  const mark = material?.extras?.[GRAD_MARK];
+  if (Array.isArray(mark?.base)) return mark.base.slice(0, 3).map(linearToSrgb01);
+  const factor = material?.pbrMetallicRoughness?.baseColorFactor;
+  if (Array.isArray(factor)) return factor.slice(0, 3).map(linearToSrgb01);
+  return [1, 1, 1];
 }
 
 /**
- * 灯光选区可能同时切到灯罩、灯壳和车身等多个原始材质。车机要求一个
- * CS_* 灯节点只绑定一个同名材质，所以从中挑最像灯罩的材质作为灭灯外观：
- * 先看名称语义，再看透明/自发光属性，最后用覆盖三角形数打破平局。
+ * 叠加层材质：与官方一致，BLEND + doubleSided，内嵌一张全透明贴图。
+ * 车机点亮 = 把该材质贴图换成外部 CS_XXX.png；熄灭（textureId=-1）= 回到内嵌透明图。
+ * 每个灯位独立一张内嵌图与 texture 条目，避免运行时换贴图时波及其他灯位。
  */
-function chooseLampMaterial(json, primitives) {
-  const candidates = new Map();
-  for (const primitive of primitives || []) {
-    if (!Number.isInteger(primitive.material) || !json.materials?.[primitive.material]) continue;
-    const triangles = primitiveTriangleCount(json, primitive);
-    candidates.set(primitive.material, (candidates.get(primitive.material) || 0) + triangles);
+async function createLampOverlayMaterial(state, name, context) {
+  const { json } = state;
+  if (!context.transparentPng) context.transparentPng = await encodeCanvasPng(createTransparentLampCanvas());
+  if (!Array.isArray(json.images)) json.images = [];
+  if (!Array.isArray(json.textures)) json.textures = [];
+  if (!Array.isArray(json.samplers)) json.samplers = [];
+  if (!Array.isArray(json.materials)) json.materials = [];
+  if (!Number.isInteger(context.samplerIndex)) {
+    json.samplers.push({ magFilter: 9729, minFilter: 9987, wrapS: 33071, wrapT: 33071 });
+    context.samplerIndex = json.samplers.length - 1;
   }
-
-  let best = null;
-  for (const [materialIndex, triangles] of candidates) {
-    const material = json.materials[materialIndex];
-    const name = String(material.name || '').toLowerCase();
-    const semantic = /light|lamp|glass|lens|led|emiss|red/.test(name) ? 1 : 0;
-    const emissive = Number.isInteger(material.emissiveTexture?.index)
-      || (Array.isArray(material.emissiveFactor) && material.emissiveFactor.some((value) => Number(value) > 0));
-    const appearance = material.alphaMode === 'BLEND' || emissive ? 1 : 0;
-    const score = [semantic, appearance, triangles];
-    if (!best || score.some((value, index) => value !== best.score[index]
-      && value > best.score[index]
-      && score.slice(0, index).every((item, prior) => item === best.score[prior]))) {
-      best = { material, score };
-    }
-  }
-
-  return structuredClone(best?.material || {
+  json.images.push({ name, mimeType: 'image/png', bufferView: appendImageToBin(state, context.transparentPng) });
+  json.textures.push({ source: json.images.length - 1, sampler: context.samplerIndex });
+  json.materials.push({
+    name,
+    alphaMode: 'BLEND',
+    doubleSided: true,
     pbrMetallicRoughness: {
-      baseColorFactor: [1, 1, 1, 1],
+      baseColorTexture: { index: json.textures.length - 1 },
       metallicFactor: 0,
-      roughnessFactor: 1,
+      roughnessFactor: 0.5,
     },
   });
+  return json.materials.length - 1;
+}
+
+/**
+ * 把切出来的灯罩副本改造成叠加层，并生成该灯位的点亮图集：
+ * 1. 顶点沿法线外推 1~4 mm，贴在车身灯罩表面之上；
+ * 2. 原 UV 区域裁剪进图集格子并重映射，多张源贴图也能共用一张 CS_XXX.png；
+ * 3. 有路面光束的槽位追加一块贴地 quad，光斑位置由灯罩几何的横向分布自动决定。
+ */
+async function buildLampOverlay(state, part, slot, binding, context) {
+  const { json } = state;
+  const node = json.nodes[part.nodeIndex];
+  const mesh = json.meshes[node.mesh];
+  const origin = node.translation || [0, 0, 0];
+  const bounds = context.carBounds;
+  const carLength = bounds.max[0] - bounds.min[0];
+  const carWidth = bounds.max[2] - bounds.min[2];
+  const offset = lampOverlayOffset(carLength);
+  const pieces = [];
+  const entries = [];
+  const zValues = [];
+  for (const primitive of mesh.primitives || []) {
+    const position = readAttributeAsFloat(state, primitive.attributes?.POSITION);
+    if (!position) continue;
+    const vertexCount = position.data.length / 3;
+    const positions = new Float32Array(position.data);
+    const normal = readAttributeAsFloat(state, primitive.attributes?.NORMAL);
+    if (normal && normal.data.length === positions.length) {
+      for (let i = 0; i < positions.length; i++) positions[i] += normal.data[i] * offset;
+    }
+    const rawIndices = Number.isInteger(primitive.indices) ? readAccessorData(state, primitive.indices)?.data : null;
+    const indices = rawIndices ? Uint32Array.from(rawIndices) : Uint32Array.from({ length: vertexCount }, (_, i) => i);
+    const uvAttribute = readAttributeAsFloat(state, primitive.attributes?.TEXCOORD_0);
+    const hasUv = Boolean(uvAttribute && uvAttribute.comps === 2 && uvAttribute.data.length === vertexCount * 2);
+    const uv = hasUv ? uvAttribute.data : synthesizePlanarUv(positions, vertexCount);
+    const image = hasUv ? await lampSourceImage(state, primitive.material, context) : null;
+    pieces.push({ uv, indices, vertexCount, image, baseColor: lampBaseColor(json, primitive.material) });
+    entries.push({ primitive, positions });
+    for (let i = 0; i < vertexCount; i++) zValues.push(positions[i * 3 + 2] + origin[2]);
+  }
+
+  const beam = normalizeLampBeam(slot, binding.beam);
+  let quad = null;
+  let beamSpec = null;
+  if (beam?.enabled) {
+    quad = beamQuadGeometry({ direction: beam.direction, bounds, beam });
+    beamSpec = {
+      ...beam,
+      lobes: beamLobes(zValues, { centerZ: quad.centerZ, halfWidth: quad.halfWidth, carWidth }, beam),
+    };
+  }
+  const art = buildLampArtwork({
+    pieces,
+    beam: beamSpec,
+    color: binding.color || slot.color,
+    glow: normalizeLampGlow(binding.glow),
+  });
+
+  const materialIndex = await createLampOverlayMaterial(state, slot.id, context);
+  entries.forEach(({ primitive, positions }, index) => {
+    primitive.attributes.POSITION = writeAccessor(state, positions, 5126, 'VEC3', positionBounds(positions));
+    primitive.attributes.TEXCOORD_0 = writeAccessor(state, art.pieceUvs[index], 5126, 'VEC2');
+    // 顶点色会把点亮贴图压暗，叠加层不需要
+    delete primitive.attributes.COLOR_0;
+    primitive.material = materialIndex;
+  });
+  mesh.primitives = entries.map((entry) => entry.primitive);
+
+  if (quad && art.beamUv) {
+    const positions = new Float32Array(quad.positions);
+    for (let i = 0; i < positions.length; i += 3) {
+      positions[i] -= origin[0];
+      positions[i + 1] -= origin[1];
+      positions[i + 2] -= origin[2];
+    }
+    const { u0, v0, u1, v1 } = art.beamUv;
+    const primitive = {
+      attributes: {
+        POSITION: writeAccessor(state, positions, 5126, 'VEC3', positionBounds(positions)),
+        NORMAL: writeAccessor(state, Float32Array.from(quad.normals), 5126, 'VEC3'),
+        TEXCOORD_0: writeAccessor(state, Float32Array.from([u0, v1, u1, v1, u1, v0, u0, v0]), 5126, 'VEC2'),
+      },
+      indices: writeAccessor(state, Uint32Array.from(quad.indices), 5125, 'SCALAR'),
+      material: materialIndex,
+    };
+    primitive[BEAM_PRIMITIVE] = true;
+    mesh.primitives.push(primitive);
+  }
+
+  return {
+    slotId: slot.id,
+    png: await encodeCanvasPng(art.canvas),
+    atlas: { width: art.width, height: art.height },
+    beam: beamSpec,
+  };
 }
 
 /**
  * 按用户配置切出部件、命名材质、生成动画。
  * bindings: [{ slotId, nodeIndex, region, pivot, axis, angle, color }]
  */
-function applyBindings(state, bindings, sourceRoots, bake) {
+async function applyBindings(state, bindings, sourceRoots, bake) {
   const result = { nodeIndices: [], animations: [], lamps: [] };
   if (!Array.isArray(bindings) || bindings.length === 0) return result;
   const { json } = state;
-  const lampMaterialBySlot = new Map();
+  // 灯位共用：车身尺寸（光束 quad 按比例生成）、解码过的源贴图、内嵌透明图
+  const lampContext = { carBounds: null, images: new Map(), transparentPng: null, samplerIndex: null };
   const effectiveBindings = [];
 
   // 第一阶段只复制：每个绑定都面对同一份未被其他绑定切过的源几何，
@@ -3631,18 +3758,11 @@ function applyBindings(state, bindings, sourceRoots, bake) {
     const partMesh = json.meshes[json.nodes[part.nodeIndex].mesh];
     // 其他模型模式下，转向灯等事件是直接播放原动画，不能再套用车辆灯光的
     // 材质切换逻辑，否则事件会把无关模型部分染成同一种颜色。
-    const isLamp = !sourceAnimation && (slot.kind === 'lamp' || slot.kind === 'blink');
+    const isLamp = !sourceAnimation && isLampSlot(slot);
     if (isLamp) {
-      let materialIndex = lampMaterialBySlot.get(slot.id);
-      if (materialIndex === undefined) {
-        const material = chooseLampMaterial(json, partMesh.primitives);
-        material.name = slot.id;
-        if (!Array.isArray(json.materials)) json.materials = [];
-        json.materials.push(material);
-        materialIndex = json.materials.length - 1;
-        lampMaterialBySlot.set(slot.id, materialIndex);
-      }
-      for (const primitive of partMesh.primitives) primitive.material = materialIndex;
+      // 灯光做成官方式叠加层：车身保留原灯罩，副本外推贴在表面，亮时换点亮图集、灭时透明
+      if (!lampContext.carBounds) lampContext.carBounds = boundsOfOutputGeometry(state, sourceRoots, [], bake);
+      result.lamps.push(await buildLampOverlay(state, part, slot, effectiveBinding, lampContext));
     } else {
       // 轮胎、车门等机械部件保留各自原始材质，只把副本命名为对应槽位。
       const materialMap = new Map(); // 原材质索引 → 新材质索引
@@ -3682,9 +3802,6 @@ function applyBindings(state, bindings, sourceRoots, bake) {
 
     result.nodeIndices.push(part.nodeIndex);
     effectiveBindings.push(effectiveBinding);
-    if (isLamp) {
-      result.lamps.push({ slotId: slot.id, color: effectiveBinding.color || slot.color });
-    }
   }
 
   // 第二阶段统一消费静态源几何。区域绑定按并集扣除；整节点绑定只摘一次。
@@ -3727,9 +3844,15 @@ function parseGlb(bytes) {
 }
 
 async function extractMainTexture({ json, bin }) {
-  const mainMaterialIndex = json.meshes?.flatMap((mesh) => mesh.primitives || [])
-    .map((primitive) => primitive.material)
-    .find(Number.isInteger);
+  // 主贴图必须来自车身材质：灯位叠加层与阴影材质内嵌的是透明图/阴影图，不能被当成 CarSelf_Main
+  const isOverlayMaterial = (material) => LAMP_SLOT_IDS.has(material?.name) || isShadowMaterialName(material?.name);
+  const hasTexture = (material) => Number.isInteger(material?.pbrMetallicRoughness?.baseColorTexture?.index);
+  let mainMaterialIndex = (json.materials || []).findIndex((material) => material?.name === 'CS_Car' && hasTexture(material));
+  if (mainMaterialIndex < 0) {
+    mainMaterialIndex = json.meshes?.flatMap((mesh) => mesh.primitives || [])
+      .map((primitive) => primitive.material)
+      .find((index) => Number.isInteger(index) && !isOverlayMaterial(json.materials?.[index]));
+  }
   const textureIndex = json.materials?.[mainMaterialIndex]?.pbrMetallicRoughness?.baseColorTexture?.index;
   const imageIndex = json.textures?.[textureIndex]?.source;
   const image = json.images?.[imageIndex];
@@ -3917,6 +4040,7 @@ export async function makeVehiclePreviewGlb(
   await yieldToBrowser();
   const baked = await bakeMaterialsForVehicle(parsed, brightness);
   report(0.22, '正在生成预览动画');
+  const lamps = [];
   const normalized = modelType === 'other'
     ? (await normalizeAnimatedOtherGlb(
       baked,
@@ -3926,7 +4050,7 @@ export async function makeVehiclePreviewGlb(
       removeShadow,
       (progress, label) => report(0.22 + progress * 0.4, label),
     )).state
-    : await normalizeParsedGlb(baked, transform, bindings, [], deletions, removeShadow);
+    : await normalizeParsedGlb(baked, transform, bindings, lamps, deletions, removeShadow);
   report(0.66, '正在处理预览贴图');
   await resizeEmbeddedImages(normalized, exportQuality.textureMaxSize);
   report(0.74, '正在优化预览网格');
@@ -3944,5 +4068,6 @@ export async function makeVehiclePreviewGlb(
   report(0.9, '正在完成预览');
   await yieldToBrowser();
   report(1, '车机质感预览已完成');
-  return buildGlb(normalized.json, normalized.bin);
+  // 灯位点亮图集随预览一起返回，车机质感预览用同一张贴图点亮叠加层
+  return { glb: buildGlb(normalized.json, normalized.bin), lamps };
 }

@@ -5,9 +5,16 @@ import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './impo
 import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
 import {
   animationNamesOf,
+  BEAM_LOBE_MODES,
+  BEAM_SHAPES,
+  LAMP_BEAM_LIMITS,
+  LAMP_GLOW_LIMITS,
   SLOT_BY_ID,
   defaultParams,
+  isLampSlot,
   normalizeIdleDelaySeconds,
+  normalizeLampBeam,
+  normalizeLampGlow,
   normalizeOtherPlayback,
   playbackDurationOf,
   slotForMode,
@@ -915,7 +922,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
       ui['mode-device-mobile'].textContent = '车机质感';
     }
     if (requestId !== previewModeRequestId) return false;
-    await preview.setDeviceMode(device, deviceGlbCache, transform);
+    await preview.setDeviceMode(device, deviceGlbCache?.glb ?? null, transform, deviceGlbCache?.lamps || []);
     if (requestId !== previewModeRequestId) return false;
     for (const id of ['mode-web', 'mode-web-mobile']) ui[id].classList.toggle('active', !device);
     for (const id of ['mode-device', 'mode-device-mobile']) ui[id].classList.toggle('active', device);
@@ -2142,6 +2149,7 @@ function mirrorBindingInto(slot) {
     duration: source.duration ?? 0.8,
     reverse: Boolean(source.reverse),
     color: source.color || slot.color,
+    ...lampParamsOf(source),
   });
   regionMode = 'translate';
   renderBindings();
@@ -2200,6 +2208,7 @@ function mirrorNodeBindingInto(slot, source) {
   binding.duration = source.duration ?? 0.8;
   binding.reverse = Boolean(source.reverse);
   binding.color = source.color || slot.color;
+  Object.assign(binding, lampParamsOf(source));
   if (source.pivotCustom) {
     binding.pivot = [source.pivot[0], source.pivot[1], -source.pivot[2]];
     binding.pivotCustom = true;
@@ -2310,9 +2319,18 @@ function setBindingNodes(slot, nodeIndices, { revealNodeIndex = null } = {}) {
     actionKind: slot.kind,
     scaleAmount: previous?.scaleAmount ?? 0.25,
     scaleTarget: previous?.scaleTarget ?? 0.01,
+    ...lampParamsOf(previous),
   });
   renderBindings();
   playCurrentBinding();
+}
+
+/** 换绑定来源时沿用已调好的灯光质感参数 */
+function lampParamsOf(source) {
+  const params = {};
+  if (source?.glow) params.glow = structuredClone(source.glow);
+  if (source?.beam) params.beam = structuredClone(source.beam);
+  return params;
 }
 
 function partTreeHtml(slot, binding) {
@@ -2787,18 +2805,149 @@ function bindingEditor(slot) {
         ${bindNumber('开合用时 秒', 'bind-duration', binding?.duration ?? 0.8, 0.1)}
       </div>`);
   }
-  if (slot.kind === 'lamp' || slot.kind === 'blink') {
+  if (isLampSlot(slot)) {
     rows.push(`
       <div class="field">
-        <label for="bind-color">${modelType === 'other' ? '事件点亮颜色' : '点亮颜色'}</label>
+        <label for="bind-color">点亮颜色</label>
         <input id="bind-color" type="color" value="${binding?.color || slot.color}" />
       </div>`);
+    if (binding) rows.push(lampEditorHtml(slot, binding));
   }
   rows.push(`
     <div class="quick-row">
       <button class="btn small" id="bind-remove">移除绑定</button>
     </div>`);
   return `<div class="binding-editor">${rows.join('')}</div>`;
+}
+
+function currentCarSize() {
+  const bounds = preview.wholeBounds();
+  if (!bounds) return { length: Number(ui['target-length'].value) || 5.2, width: 1.9 };
+  return { length: bounds.max[0] - bounds.min[0], width: bounds.max[2] - bounds.min[2] };
+}
+
+function currentCarLength() {
+  return currentCarSize().length;
+}
+
+function percentRange(id, label, value, [min, max], step = 5, attrs = '') {
+  const percent = Math.round(value * 100);
+  return `<label class="range-field"${attrs}>${label} <output id="${id}-output">${percent}%</output><input id="${id}" type="range" min="${Math.round(min * 100)}" max="${Math.round(max * 100)}" step="${step}" value="${percent}" /></label>`;
+}
+
+function unitRange(id, label, value, [min, max], step, output, attrs = '') {
+  return `<label class="range-field"${attrs}>${label} <output id="${id}-output">${output}</output><input id="${id}" type="range" min="${min}" max="${max}" step="${step}" value="${value}" /></label>`;
+}
+
+function selectField(id, label, options, value) {
+  return `<div class="field"><label for="${id}">${label}</label><select id="${id}">${options.map((option) => (
+    `<option value="${option.value}"${option.value === value ? ' selected' : ''}>${option.label}</option>`
+  )).join('')}</select></div>`;
+}
+
+const signedMeters = (value) => `${value >= 0 ? '+' : '−'}${Math.abs(value).toFixed(2)} m`;
+
+const BEAM_LABELS = {
+  length: (beam, car) => `${beam.length.toFixed(1)} 倍车长 ≈ ${(beam.length * car.length).toFixed(1)} m`,
+  width: (beam, car) => `${beam.width.toFixed(2)} 倍车宽 ≈ ${(beam.width * car.width).toFixed(2)} m`,
+  offset: (beam, car) => `${signedMeters(beam.offset * car.length)}`,
+  side: (beam, car) => `${beam.side === 0 ? '居中' : `${beam.side > 0 ? '偏左' : '偏右'} ${Math.abs(beam.side * car.width).toFixed(2)} m`}`,
+  height: (beam) => `${(beam.height * 100).toFixed(1)} cm`,
+  spacing: (beam, car) => `${beam.lobeSpacing.toFixed(2)} 倍车宽 ≈ ${(beam.lobeSpacing * car.width).toFixed(2)} m`,
+};
+
+/** 灯光质感：叠加层发光参数 + （近光/远光/雾灯/刹车/倒车）路面光束参数 */
+function lampEditorHtml(slot, binding) {
+  const glow = normalizeLampGlow(binding.glow);
+  const beam = normalizeLampBeam(slot, binding.beam);
+  const rows = [`
+    <div class="lamp-section">
+      <div class="tool-heading"><strong>发光质感</strong><span>叠加在灯罩表面的点亮贴图</span></div>
+      <div class="range-fields">
+        ${percentRange('lamp-glow-intensity', '亮度', glow.intensity, LAMP_GLOW_LIMITS.intensity)}
+        ${percentRange('lamp-glow-core', '热白中心', glow.core, LAMP_GLOW_LIMITS.core)}
+        ${percentRange('lamp-glow-detail', '保留灯罩纹理', glow.detail, LAMP_GLOW_LIMITS.detail)}
+        ${percentRange('lamp-glow-softness', '边缘柔化', glow.softness, LAMP_GLOW_LIMITS.softness)}
+      </div>
+      <p class="hint">灭灯时叠加层完全透明、车身保持原样；亮灯时按原灯罩贴图提亮染色，热白中心越高越像真实点亮的透镜。</p>
+    </div>`];
+  if (beam) {
+    const car = currentCarSize();
+    const L = LAMP_BEAM_LIMITS;
+    rows.push(`
+    <div class="lamp-section">
+      <div class="tool-heading"><strong>路面光束</strong><span>${beam.direction === 'rear' ? '投射在车尾地面' : '投射在车头前方地面'}</span></div>
+      <label class="check-row"><input type="checkbox" id="lamp-beam-enabled"${beam.enabled ? ' checked' : ''} />投射路面光束</label>
+      <div id="lamp-beam-fields"${beam.enabled ? '' : ' hidden'}>
+        <div class="field-grid two-cols" style="margin-top:4px">
+          ${selectField('lamp-beam-shape', '形状', BEAM_SHAPES, beam.shape)}
+          ${selectField('lamp-beam-lobe-mode', '光斑分布', BEAM_LOBE_MODES, beam.lobeMode)}
+        </div>
+        <div class="range-fields">
+          ${unitRange('lamp-beam-spacing', '光斑间距', beam.lobeSpacing, L.lobeSpacing, 0.02, BEAM_LABELS.spacing(beam, car), beam.lobeMode === 'double' ? '' : ' hidden')}
+          ${percentRange('lamp-beam-lobe-width', '光斑宽度', beam.lobeWidth, L.lobeWidth)}
+          ${unitRange('lamp-beam-length', '光束长度', beam.length, L.length, 0.1, BEAM_LABELS.length(beam, car))}
+          ${unitRange('lamp-beam-width', '光束宽度', beam.width, L.width, 0.05, BEAM_LABELS.width(beam, car))}
+          ${unitRange('lamp-beam-offset', '起点前后', beam.offset, L.offset, 0.01, BEAM_LABELS.offset(beam, car))}
+          ${unitRange('lamp-beam-side', '左右偏移', beam.side, L.side, 0.01, BEAM_LABELS.side(beam, car))}
+          ${unitRange('lamp-beam-height', '离地高度', beam.height, L.height, 0.005, BEAM_LABELS.height(beam))}
+          ${percentRange('lamp-beam-intensity', '强度', beam.intensity, L.intensity)}
+          ${percentRange('lamp-beam-spread', '横向扩散', beam.spread, L.spread)}
+          ${percentRange('lamp-beam-falloff', '沿路衰减', beam.falloff, L.falloff)}
+          ${percentRange('lamp-beam-haze', '雾感', beam.haze, L.haze)}
+        </div>
+        <label class="check-row"><input type="checkbox" id="lamp-beam-follow"${beam.color ? '' : ' checked'} />光束颜色跟随点亮颜色</label>
+        <div class="field" id="lamp-beam-color-field"${beam.color ? '' : ' hidden'}>
+          <label for="lamp-beam-color">光束颜色</label>
+          <input id="lamp-beam-color" type="color" value="${beam.color || binding.color || slot.color}" />
+        </div>
+      </div>
+      <p class="hint">“按灯罩自动”会依据绑定灯罩的左右分布生成光斑：左右各一盏就是两道，单盏中置就是一道。长度、宽度、偏移按车身尺寸等比缩放，任何车型都适用；“沿路衰减”越低照得越远，“横向扩散”越高越散。</p>
+    </div>`);
+  }
+  return rows.join('');
+}
+
+const LAMP_INPUT_IDS = [
+  'lamp-glow-intensity', 'lamp-glow-core', 'lamp-glow-detail', 'lamp-glow-softness',
+  'lamp-beam-enabled', 'lamp-beam-shape', 'lamp-beam-lobe-mode', 'lamp-beam-spacing', 'lamp-beam-lobe-width',
+  'lamp-beam-length', 'lamp-beam-width', 'lamp-beam-offset', 'lamp-beam-side', 'lamp-beam-height',
+  'lamp-beam-intensity', 'lamp-beam-spread', 'lamp-beam-falloff', 'lamp-beam-haze',
+  'lamp-beam-follow', 'lamp-beam-color',
+];
+
+function syncLampOutputs(slot, binding) {
+  const glow = normalizeLampGlow(binding.glow);
+  for (const [id, value] of [
+    ['lamp-glow-intensity', glow.intensity], ['lamp-glow-core', glow.core],
+    ['lamp-glow-detail', glow.detail], ['lamp-glow-softness', glow.softness],
+  ]) {
+    const output = document.getElementById(`${id}-output`);
+    if (output) output.textContent = `${Math.round(value * 100)}%`;
+  }
+  const beam = normalizeLampBeam(slot, binding.beam);
+  if (!beam) return;
+  const car = currentCarSize();
+  const fields = document.getElementById('lamp-beam-fields');
+  if (fields) fields.hidden = !beam.enabled;
+  const spacing = document.getElementById('lamp-beam-spacing')?.closest('.range-field');
+  if (spacing) spacing.hidden = beam.lobeMode !== 'double';
+  const colorField = document.getElementById('lamp-beam-color-field');
+  if (colorField) colorField.hidden = !beam.color;
+  const setText = (id, text) => {
+    const output = document.getElementById(id);
+    if (output) output.textContent = text;
+  };
+  setText('lamp-beam-length-output', BEAM_LABELS.length(beam, car));
+  setText('lamp-beam-width-output', BEAM_LABELS.width(beam, car));
+  setText('lamp-beam-offset-output', BEAM_LABELS.offset(beam, car));
+  setText('lamp-beam-side-output', BEAM_LABELS.side(beam, car));
+  setText('lamp-beam-height-output', BEAM_LABELS.height(beam));
+  setText('lamp-beam-spacing-output', BEAM_LABELS.spacing(beam, car));
+  for (const key of ['lobeWidth', 'intensity', 'spread', 'falloff', 'haze']) {
+    const id = key === 'lobeWidth' ? 'lamp-beam-lobe-width' : `lamp-beam-${key}`;
+    setText(`${id}-output`, `${Math.round(beam[key] * 100)}%`);
+  }
 }
 
 function bindNumber(label, id, value, step = 0.05) {
@@ -2929,11 +3078,19 @@ function wireBindingEditor() {
   }
   document.getElementById('part-pick')?.addEventListener('click', () => togglePickMode(slot));
   wirePartTree(slot);
-  for (const id of ['bind-pivot-x', 'bind-pivot-y', 'bind-pivot-z', 'bind-angle', 'bind-axis', 'bind-color', 'bind-duration', 'bind-reverse', 'bind-scale-amount', 'bind-scale-target']) {
+  for (const id of ['bind-pivot-x', 'bind-pivot-y', 'bind-pivot-z', 'bind-angle', 'bind-axis', 'bind-color', 'bind-duration', 'bind-reverse', 'bind-scale-amount', 'bind-scale-target', ...LAMP_INPUT_IDS]) {
     const input = document.getElementById(id);
     if (input) {
       input.addEventListener('input', () => updateBindingFromInputs(slot));
       wireContinuousHistory(input, { scope: 'binding-input', slotId: slot.id, field: id });
+    }
+  }
+  if (isLampSlot(slot)) {
+    // 点亮图集是导出管线烘出来的：车机质感下拖完滑杆再重烘一次，网页质感则即时重画
+    for (const id of ['bind-color', ...LAMP_INPUT_IDS]) {
+      document.getElementById(id)?.addEventListener('change', () => {
+        if (preview.deviceMode) refreshBindingPreviewAfterExportChange('on');
+      });
     }
   }
   const mirror = document.getElementById('bind-mirror');
@@ -3284,6 +3441,7 @@ function createRegionBinding(slot, region) {
     actionKind: slot.kind,
     scaleAmount: previous?.scaleAmount ?? 0.25,
     scaleTarget: previous?.scaleTarget ?? 0.01,
+    ...lampParamsOf(previous),
   });
   regionMode = 'translate';
   renderBindings();
@@ -3419,6 +3577,38 @@ function updateBindingFromInputs(slot) {
   if (scaleAmount) binding.scaleAmount = Math.min(0.9, Math.max(0.05, Number(scaleAmount.value) || 0.25));
   const scaleTarget = document.getElementById('bind-scale-target');
   if (scaleTarget) binding.scaleTarget = Math.min(3, Math.max(0.01, Number(scaleTarget.value) || 0.01));
+  if (isLampSlot(slot)) {
+    const valueOf = (id) => document.getElementById(id)?.value;
+    if (document.getElementById('lamp-glow-intensity')) {
+      binding.glow = normalizeLampGlow({
+        intensity: Number(valueOf('lamp-glow-intensity')) / 100,
+        core: Number(valueOf('lamp-glow-core')) / 100,
+        detail: Number(valueOf('lamp-glow-detail')) / 100,
+        softness: Number(valueOf('lamp-glow-softness')) / 100,
+      });
+    }
+    const beamEnabled = document.getElementById('lamp-beam-enabled');
+    if (beamEnabled) {
+      binding.beam = normalizeLampBeam(slot, {
+        enabled: beamEnabled.checked,
+        shape: valueOf('lamp-beam-shape'),
+        lobeMode: valueOf('lamp-beam-lobe-mode'),
+        lobeSpacing: Number(valueOf('lamp-beam-spacing')),
+        lobeWidth: Number(valueOf('lamp-beam-lobe-width')) / 100,
+        length: Number(valueOf('lamp-beam-length')),
+        width: Number(valueOf('lamp-beam-width')),
+        offset: Number(valueOf('lamp-beam-offset')),
+        side: Number(valueOf('lamp-beam-side')),
+        height: Number(valueOf('lamp-beam-height')),
+        intensity: Number(valueOf('lamp-beam-intensity')) / 100,
+        spread: Number(valueOf('lamp-beam-spread')) / 100,
+        falloff: Number(valueOf('lamp-beam-falloff')) / 100,
+        haze: Number(valueOf('lamp-beam-haze')) / 100,
+        color: document.getElementById('lamp-beam-follow')?.checked ? null : valueOf('lamp-beam-color'),
+      });
+    }
+    syncLampOutputs(slot, binding);
+  }
   setDirty();
   markDevicePreviewStale();
   syncPivotTools(slot, binding);
