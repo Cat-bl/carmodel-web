@@ -1985,9 +1985,7 @@ function sourceAnimationDescriptor(state, binding, bake, slot) {
   const sampler = animation.samplers?.[channel.sampler];
   if (!Number.isInteger(targetNodeIndex)
     || !['translation', 'rotation', 'scale'].includes(path)
-    || !sampler
-    || sampler.interpolation === 'CUBICSPLINE'
-    || Array.isArray(json.nodes?.[targetNodeIndex]?.matrix)) {
+    || !sampler) {
     throw new Error(`${slot.label}：该模型动画不符合车机可绑定要求`);
   }
 
@@ -2079,6 +2077,105 @@ function reverseKeyframes(times, values, components) {
   return { times: reversedTimes, values: reversedValues };
 }
 
+const SPLINE_BAKE_FPS = 30;
+
+/**
+ * 车机只实证过 LINEAR 的 TRS 轨道。导出前把 CUBICSPLINE 按 glTF 的 Hermite 公式
+ * 以固定帧率重采样成 LINEAR，并把动画目标节点上的 matrix 分解成 TRS，
+ * 这样后续所有动画处理和车机都只会见到已验证的轨道结构。
+ */
+function bakeAnimationSources(state) {
+  const { json } = state;
+  const animatedNodes = new Set();
+  for (const animation of json.animations || []) {
+    const samplerPaths = new Map();
+    for (const channel of animation.channels || []) {
+      const path = channel.target?.path;
+      if (['translation', 'rotation', 'scale'].includes(path)) animatedNodes.add(channel.target.node);
+      samplerPaths.set(channel.sampler, path);
+    }
+    (animation.samplers || []).forEach((sampler, index) => {
+      const path = samplerPaths.get(index);
+      if (sampler.interpolation !== 'CUBICSPLINE' || path === 'weights') return;
+      const baked = bakeCubicSpline(state, sampler, path === 'rotation');
+      if (baked) Object.assign(sampler, baked, { interpolation: 'LINEAR' });
+    });
+  }
+  for (const nodeIndex of animatedNodes) {
+    const node = json.nodes?.[nodeIndex];
+    if (Array.isArray(node?.matrix) && node.matrix.length === 16) decomposeNodeMatrix(node);
+  }
+}
+
+function bakeCubicSpline(state, sampler, isRotation) {
+  const input = readAccessorData(state, sampler.input);
+  const output = readAccessorData(state, sampler.output);
+  const frameCount = input?.data.length || 0;
+  const components = output?.comps || 0;
+  // CUBICSPLINE 每个关键帧存 [入切线, 值, 出切线] 三组
+  if (!frameCount || !components || output.data.length !== frameCount * 3 * components) return null;
+  const times = Array.from(input.data, Number);
+  const tangentIn = (frame, component) => Number(output.data[(frame * 3) * components + component]);
+  const valueAt = (frame, component) => Number(output.data[(frame * 3 + 1) * components + component]);
+  const tangentOut = (frame, component) => Number(output.data[(frame * 3 + 2) * components + component]);
+
+  const end = times[frameCount - 1];
+  const grid = [];
+  for (let frame = 0; times[0] + frame / SPLINE_BAKE_FPS < end; frame++) grid.push(times[0] + frame / SPLINE_BAKE_FPS);
+  const sampleTimes = [...grid, ...times].sort((a, b) => a - b)
+    .filter((time, index, list) => index === 0 || time - list[index - 1] > 1e-4);
+
+  const values = new Float32Array(sampleTimes.length * components);
+  let segment = 0;
+  sampleTimes.forEach((time, sampleIndex) => {
+    while (segment + 1 < frameCount - 1 && times[segment + 1] <= time) segment++;
+    const next = Math.min(segment + 1, frameCount - 1);
+    const span = times[next] - times[segment];
+    const t = span > 0 ? Math.min(1, Math.max(0, (time - times[segment]) / span)) : 0;
+    const t2 = t * t, t3 = t2 * t;
+    const value = [];
+    for (let component = 0; component < components; component++) {
+      value.push(
+        (2 * t3 - 3 * t2 + 1) * valueAt(segment, component)
+        + span * (t3 - 2 * t2 + t) * tangentOut(segment, component)
+        + (-2 * t3 + 3 * t2) * valueAt(next, component)
+        + span * (t3 - t2) * tangentIn(next, component),
+      );
+    }
+    values.set(isRotation ? quatNormalize(value) : value, sampleIndex * components);
+  });
+  return {
+    input: writeAccessor(state, Float32Array.from(sampleTimes), 5126, 'SCALAR', { min: [sampleTimes[0]], max: [end] }),
+    output: writeAccessor(state, values, 5126, output.accessor.type),
+  };
+}
+
+function decomposeNodeMatrix(node) {
+  const m = node.matrix;
+  const columns = [0, 4, 8].map((at) => [m[at], m[at + 1], m[at + 2]]);
+  const scale = columns.map((column) => Math.hypot(...column));
+  const unit = columns.map((column, axis) => column.map((value) => value / (scale[axis] || 1)));
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  if ([[0, 1], [1, 2], [0, 2]].some(([a, b]) => Math.abs(dot(unit[a], unit[b])) > 1e-3)) {
+    throw new Error(`节点 ${node.name || ''} 的变换矩阵含剪切，无法转换成动画可用的 TRS`);
+  }
+  const cross = [
+    unit[1][1] * unit[2][2] - unit[1][2] * unit[2][1],
+    unit[1][2] * unit[2][0] - unit[1][0] * unit[2][2],
+    unit[1][0] * unit[2][1] - unit[1][1] * unit[2][0],
+  ];
+  const rotationMatrix = m.slice();
+  if (dot(unit[0], cross) < 0) {
+    // 镜像矩阵：把翻转归到 X 缩放，旋转部分保持右手系
+    scale[0] = -scale[0];
+    for (let index = 0; index < 3; index++) rotationMatrix[index] = -m[index];
+  }
+  node.translation = [m[12], m[13], m[14]];
+  node.rotation = quatFromMat4(rotationMatrix);
+  node.scale = scale;
+  delete node.matrix;
+}
+
 function validateAnimatedOtherClip(state, animation, slot) {
   const { json } = state;
   if (!animation || !Array.isArray(animation.channels) || animation.channels.length === 0) {
@@ -2091,10 +2188,9 @@ function validateAnimatedOtherClip(state, animation, slot) {
     const output = json.accessors?.[sampler?.output];
     if (!Number.isInteger(target.node) || !json.nodes?.[target.node]
       || !['translation', 'rotation', 'scale'].includes(target.path)
-      || !sampler || sampler.interpolation === 'CUBICSPLINE'
+      || !sampler
       || input?.componentType !== 5126 || input?.type !== 'SCALAR'
-      || output?.componentType !== 5126
-      || Array.isArray(json.nodes[target.node].matrix)) {
+      || output?.componentType !== 5126) {
       throw new Error(`${slot.label}：该动画包含车机尚未验证的轨道结构`);
     }
   }
@@ -2104,7 +2200,6 @@ function reverseAnimationClip(state, source, name) {
   const reversed = structuredClone(source);
   reversed.name = name;
   reversed.samplers = (source.samplers || []).map((sampler) => {
-    if (sampler.interpolation === 'CUBICSPLINE') throw new Error(`${name}：暂不支持反转 CUBICSPLINE 动画`);
     const input = readAccessorData(state, sampler.input);
     const output = readAccessorData(state, sampler.output);
     if (!input || !output || input.comps !== 1 || input.data.length < 2
@@ -2640,6 +2735,7 @@ async function normalizeAnimatedOtherGlb(
   parsed, transform, bindings, deletions, removeShadow = false, onProgress = null,
 ) {
   const state = { json: structuredClone(parsed.json), bin: parsed.bin };
+  bakeAnimationSources(state);
   const { json } = state;
   const sceneIndex = Number.isInteger(json.scene) ? json.scene : 0;
   const scene = json.scenes?.[sceneIndex];
@@ -3028,6 +3124,7 @@ function collectGlbStats(json) {
 
 async function normalizeParsedGlb(parsed, transform, bindings, lampsOut, deletions, removeShadow = false) {
   const state = { json: structuredClone(parsed.json), bin: parsed.bin };
+  bakeAnimationSources(state);
   const { json } = state;
   const oldScene = Number.isInteger(json.scene) ? json.scene : 0;
   const scene = json.scenes?.[oldScene];

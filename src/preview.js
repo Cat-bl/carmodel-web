@@ -551,8 +551,9 @@ export class ModelPreview {
 
   /** Lists source clips that can be preserved as normal glTF TRS animations.
    * The built-in R1 model proves that the renderer accepts skinned meshes and
-   * multi-channel clips. Morph targets and CUBICSPLINE remain excluded until
-   * they have equivalent device evidence. */
+   * multi-channel clips. CUBICSPLINE samplers and matrix nodes are baked into
+   * LINEAR TRS on export; morph targets stay excluded because the renderer
+   * has no vertex animation. */
   listBindableAnimations() {
     const json = this.gltfJson;
     if (!json?.animations?.length) return [];
@@ -580,9 +581,7 @@ export class ModelPreview {
         const sampler = animation.samplers?.[channel.sampler];
         if (!Number.isInteger(targetNodeIndex)
           || !['translation', 'rotation', 'scale'].includes(path)
-          || !sampler
-          || sampler.interpolation === 'CUBICSPLINE'
-          || Array.isArray(json.nodes?.[targetNodeIndex]?.matrix)) {
+          || !sampler) {
           valid = false;
           break;
         }

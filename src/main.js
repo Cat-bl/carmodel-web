@@ -2738,7 +2738,7 @@ function otherBindingEditor(slot, binding) {
       <div class="source-animation-empty">
         <i data-lucide="film"></i>
         <strong>没有可绑定的动画</strong>
-        <span>当前模型没有可用的 TRS 动画；Morph 与 CUBICSPLINE 动画暂不开放。</span>
+        <span>当前模型没有可用的 TRS 动画；纯 Morph（形态键）动画车机无法播放。</span>
       </div>`;
   } else {
     animationControl = `
