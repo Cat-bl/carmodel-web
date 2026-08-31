@@ -389,9 +389,14 @@ app.innerHTML = `
         <div class="combo-list" id="combo-existing"></div>
       </div>
       <div class="generate-dialog-actions">
+        <button class="btn" id="combo-dialog-preview" type="button" disabled title="在视口里连续播放当前片段顺序，看完再回来调整"><i data-lucide="play"></i><span>预览</span></button>
         <button class="btn" id="combo-dialog-cancel" type="button">取消</button>
         <button class="btn primary" id="combo-dialog-confirm" type="button" disabled><i data-lucide="film"></i><span>生成组合动画</span></button>
       </div>
+    </div>
+    <div class="combo-preview-bar" id="combo-preview-bar">
+      <span id="combo-preview-label"></span>
+      <button class="btn small primary" id="combo-preview-stop" type="button">停止预览，返回编辑</button>
     </div>
   </div>
 
@@ -445,6 +450,7 @@ const ui = Object.fromEntries([
   'leave-dialog', 'leave-dialog-message', 'leave-dialog-close', 'leave-dialog-cancel', 'leave-dialog-discard', 'leave-dialog-save',
   'combo-dialog', 'combo-dialog-close', 'combo-dialog-cancel', 'combo-dialog-confirm', 'combo-name', 'combo-segments',
   'combo-add', 'combo-add-button', 'combo-blend', 'combo-existing',
+  'combo-dialog-preview', 'combo-preview-bar', 'combo-preview-label', 'combo-preview-stop',
   'generate-confirm', 'generate-quality-summary', 'generate-quality-custom',
   'generate-quality-triangles', 'generate-quality-texture-size', 'generate-quality-metrics',
 ].map((id) => [id, document.getElementById(id)]));
@@ -1600,6 +1606,7 @@ function addVariantAnimation(slot, value) {
   const total = variants.reduce((sum, item) => sum + item.weight, 0);
   const weight = normalizeVariantWeight(Math.round(total / variants.length));
   commitVariants(slot, [...variants, { index: animation.index, name: animation.name, weight }]);
+  playVariant(slot, animation.index);
 }
 
 function removeVariantAnimation(slot, index) {
@@ -2048,8 +2055,24 @@ function openComboDialog() {
 }
 
 function closeComboDialog() {
+  stopComboPreview();
   ui['combo-dialog'].hidden = true;
   comboDraft = null;
+}
+
+function startComboPreview() {
+  if (!comboDraft?.segments.length) return;
+  const blendMs = Math.max(0, Math.round(Number(ui['combo-blend'].value) || 0));
+  ui['combo-preview-label'].textContent = `正在预览：${comboDraft.segments.map(animationLabel).join(' → ')}${blendMs ? `（过渡 ${blendMs} 毫秒）` : ''}`;
+  ui['combo-dialog'].classList.add('previewing');
+  preview.previewAnimationSequence(comboDraft.segments, blendMs);
+}
+
+function stopComboPreview() {
+  if (!ui['combo-dialog'].classList.contains('previewing')) return;
+  ui['combo-dialog'].classList.remove('previewing');
+  preview.stopBindingPreview();
+  playCurrentBinding();
 }
 
 function renderComboDialog() {
@@ -2063,7 +2086,7 @@ function renderComboDialog() {
   ui['combo-segments'].innerHTML = segments.length
     ? segments.map((index, order) => `
       <div class="combo-segment">
-        <span>${order + 1}. ${escapeHtml(animationLabel(index))}</span>
+        <span title="${escapeHtml(animationLabel(index))}">${order + 1}. ${escapeHtml(animationLabel(index))}</span>
         <button class="icon-btn" data-combo-move="${order}:-1" type="button" title="上移"${order === 0 ? ' disabled' : ''}>▲</button>
         <button class="icon-btn" data-combo-move="${order}:1" type="button" title="下移"${order === segments.length - 1 ? ' disabled' : ''}>▼</button>
         <button class="icon-btn" data-combo-remove="${order}" type="button" title="移除">✕</button>
@@ -2075,11 +2098,12 @@ function renderComboDialog() {
   ui['combo-existing'].innerHTML = combos.length
     ? combos.map(({ animation, index }) => `
       <div class="combo-segment">
-        <span>${escapeHtml(animation.name)}<em>${animation.extras.bydCombined.segments.map((segment) => escapeHtml(animationLabel(segment))).join(' → ')}${animation.extras.bydCombined.blendMs ? ` · 过渡 ${animation.extras.bydCombined.blendMs} 毫秒` : ''}</em></span>
+        <span title="${escapeHtml(animation.name)}：${animation.extras.bydCombined.segments.map((segment) => escapeHtml(animationLabel(segment))).join(' → ')}">${escapeHtml(animation.name)}<em>${animation.extras.bydCombined.segments.map((segment) => escapeHtml(animationLabel(segment))).join(' → ')}${animation.extras.bydCombined.blendMs ? ` · 过渡 ${animation.extras.bydCombined.blendMs} 毫秒` : ''}</em></span>
         <button class="icon-btn" data-combo-delete="${index}" type="button" title="删除这段组合动画">✕</button>
       </div>`).join('')
     : '<p class="hint">当前模型还没有组合动画。</p>';
   ui['combo-dialog-confirm'].disabled = segments.length < 2;
+  ui['combo-dialog-preview'].disabled = !segments.length;
   ui['combo-segments'].querySelectorAll('[data-combo-move]').forEach((button) => button.addEventListener('click', () => {
     const [order, delta] = button.dataset.comboMove.split(':').map(Number);
     [segments[order], segments[order + delta]] = [segments[order + delta], segments[order]];
@@ -2103,6 +2127,8 @@ ui['combo-add-button'].addEventListener('click', () => {
 for (const id of ['combo-dialog-close', 'combo-dialog-cancel']) ui[id].addEventListener('click', closeComboDialog);
 ui['combo-dialog'].addEventListener('keydown', (event) => { if (event.key === 'Escape') closeComboDialog(); });
 ui['combo-dialog-confirm'].addEventListener('click', createCombinedAnimation);
+ui['combo-dialog-preview'].addEventListener('click', startComboPreview);
+ui['combo-preview-stop'].addEventListener('click', stopComboPreview);
 
 async function createCombinedAnimation() {
   if (!current || !comboDraft || comboDraft.segments.length < 2) return;
@@ -2950,7 +2976,7 @@ function playVariant(slot, variantIndex) {
 function variantListHtml(slot, binding) {
   const variants = eventVariantsOf(binding);
   if (variants.length <= 1) {
-    return `<div class="source-animation-bound"><span>已绑定动画</span><strong>${escapeHtml(variants[0]?.name || '')}</strong></div>`;
+    return `<div class="source-animation-bound"><span>已绑定动画</span><strong title="${escapeHtml(variants[0]?.name || '')}">${escapeHtml(variants[0]?.name || '')}</strong></div>`;
   }
   const chances = variantChances(variants);
   const active = variants.some((item) => item.index === selectedVariantIndex)
@@ -2959,7 +2985,7 @@ function variantListHtml(slot, binding) {
   const rows = variants.map((variant, index) => `
     <div class="variant-row${variant.index === active ? ' active' : ''}" data-variant-play="${variant.index}" role="button" tabindex="0" title="点击播放这个动作">
       <div class="variant-name">
-        <span>${escapeHtml(variant.name)}</span>
+        <span title="${escapeHtml(variant.name)}">${escapeHtml(variant.name)}</span>
         ${index === 0 ? '<em class="variant-lead" title="代表动作：事件之间的切换过渡按它预烘">代表</em>' : ''}
       </div>
       <div class="variant-chance"><input id="variant-weight-${variant.index}" type="number" min="1" max="100" step="1" value="${variant.weight}" aria-label="${escapeHtml(variant.name)} 的权重" /><span>${chances[index]}%</span></div>

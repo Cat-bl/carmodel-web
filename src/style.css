@@ -197,6 +197,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .field { min-width: 0; margin-bottom: 9px; }
 .field label, .range-field { display: block; margin-bottom: 5px; color: var(--ink-2); font-size: 11px; }
 .field input, .field select, .part-tools input { width: 100%; min-height: 36px; padding: 7px 9px; color: var(--ink); border: 1px solid var(--line-strong); border-radius: 5px; background: #11161a; }
+.field select, .combo-row select { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .field input:disabled { color: var(--ink-3); background: var(--surface-2); }
 .field input[type="color"] { padding: 3px; }
 .setting-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 42px; margin-top: 4px; color: var(--ink-2); font-size: 11px; cursor: pointer; }
@@ -240,6 +241,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .source-tabs { display: flex; gap: 5px; margin: 17px 0 14px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
 .source-tabs .btn { flex: 1; }
 .event-action-card { display: grid; gap: 12px; margin: 0 0 14px; padding: 13px 0 4px 12px; border-left: 2px solid #c88a47; }
+.binding-editor > *, .event-action-card > * { min-width: 0; }
 .event-action-copy { display: grid; gap: 3px; }
 .event-action-copy span { color: #d6a367; font-size: 9px; font-weight: 750; }
 .event-action-copy strong { color: #f0f4f5; font-size: 14px; }
@@ -487,6 +489,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
   .generate-dialog-body { padding: 15px 14px; }
   .generate-dialog-actions { padding-inline: 14px; }
   .generate-dialog-actions .btn { flex: 1; }
+  #combo-dialog.previewing .combo-preview-bar { margin: 0 8px calc(64px + env(safe-area-inset-bottom)); }
   .message-stack { top: calc(58px + env(safe-area-inset-top)); }
   .app-message { min-height: 58px; padding: 12px 9px 12px 13px; }
 }
@@ -526,6 +529,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .combo-segment .icon-btn { width: 28px; height: 28px; min-height: 28px; font-size: 11px; }
 .combo-section-title { margin: 14px 0 6px; color: var(--ink-3); font-size: 10px; font-weight: 800; }
 #bind-combine { margin-top: 8px; }
+#combo-dialog.previewing { pointer-events: none; align-items: end; background: transparent; backdrop-filter: none; }
+#combo-dialog.previewing .generate-dialog-panel { display: none; }
+.combo-preview-bar { display: none; align-items: center; gap: 10px; max-width: min(640px, 100%); margin-bottom: 18px; padding: 8px 8px 8px 14px; color: var(--ink); border: 1px solid #3a474e; border-radius: 7px; background: #171c20; box-shadow: 0 12px 40px rgba(0, 0, 0, .5); font-size: 12px; pointer-events: auto; }
+.combo-preview-bar span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.combo-preview-bar .btn { flex: none; }
+#combo-dialog.previewing .combo-preview-bar { display: flex; }
 .leave-dialog-panel { width: min(440px, 100%); }
 .leave-dialog-body p { margin: 0; color: var(--ink); font-size: 13px; line-height: 1.6; }
 .leave-dialog-hint { margin-top: 10px !important; color: var(--ink-3) !important; font-size: 11px !important; }

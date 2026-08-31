@@ -1220,6 +1220,43 @@ export class ModelPreview {
     return true;
   }
 
+  /** 组合动画弹窗里的试播：按顺序循环播放几段源动画，段间按 blendMs 交叉淡入，随时可停。 */
+  previewAnimationSequence(indices, blendMs = 0) {
+    this.stopBindingPreview();
+    const clips = indices.map((index) => this.loadedAnimations[index]).filter((clip) => clip?.duration > 0);
+    if (!this.model || !clips.length) return;
+    const mixer = new THREE.AnimationMixer(this.model);
+    this.mixer = mixer;
+    const fade = Math.max(0, blendMs) / 1000;
+    const sequence = {
+      sequenceEvent: true,
+      currentAction: null,
+      restValues: captureTrackRestValues(this.model, clips.flatMap((clip) => clip.tracks)),
+      mixerFinishedHandlers: [],
+      transitionTimers: new Set(),
+    };
+    let cursor = 0;
+    const playSegment = (previousAction) => {
+      const action = mixer.clipAction(clips[cursor]);
+      action.reset();
+      action.setLoop(THREE.LoopOnce, 1);
+      action.clampWhenFinished = true;
+      action.play();
+      if (previousAction && fade > 0) previousAction.crossFadeTo(action, fade, false);
+      else previousAction?.stop();
+      sequence.currentAction = action;
+    };
+    const onFinished = (event) => {
+      if (this.mixer !== mixer || this.bindingPreview !== sequence || event.action !== sequence.currentAction) return;
+      cursor = (cursor + 1) % clips.length;
+      playSegment(event.action);
+    };
+    mixer.addEventListener('finished', onFinished);
+    sequence.mixerFinishedHandlers.push(onFinished);
+    this.bindingPreview = sequence;
+    playSegment(null);
+  }
+
   previewBinding(slot, params, phase = 'on') {
     if (!this.model || !slot) return;
     if (this.deviceMode && this.previewExportedBinding(slot, params, phase)) return;
