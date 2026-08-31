@@ -140,6 +140,7 @@ app.innerHTML = `
         </div>
       </div>
       <div class="command-actions">
+        <label class="btn command-import" for="model-file" title="更换当前模型，有未保存的修改时会先提示保存项目"><i data-lucide="upload"></i><span>重新导入模型</span></label>
         <button class="icon-btn project-action" id="open-project" type="button" title="打开项目"><i data-lucide="folder-open"></i></button>
         <button class="icon-btn project-action" id="save-project" type="button" title="保存项目 (Ctrl+S)" disabled><i data-lucide="save"></i></button>
         <button class="btn command-check" data-panel-target="check"><i data-lucide="check-circle-2"></i><span>检查</span></button>
@@ -221,10 +222,7 @@ app.innerHTML = `
         <section class="inspector-panel active" data-panel="model">
           <div class="inspector-title">
             <div><span>模型</span><h2>导入与调整</h2></div>
-            <div class="inspector-title-actions">
-              <button class="icon-btn" id="inspector-open-project" type="button" title="打开项目"><i data-lucide="folder-open"></i></button>
-              <label class="icon-btn" for="model-file" title="导入或更换模型"><i data-lucide="upload"></i></label>
-            </div>
+            <button class="icon-btn" id="inspector-open-project" type="button" title="打开项目"><i data-lucide="folder-open"></i></button>
           </div>
           <div class="inspector-scroll">
             <section class="tool-section">

@@ -166,7 +166,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .inspector-title > div { min-width: 0; }
 .inspector-title span:first-child { display: block; color: var(--brand); font-size: 10px; font-weight: 800; letter-spacing: 0; text-transform: uppercase; }
 .inspector-title h2 { margin: 4px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 18px; letter-spacing: 0; }
-.inspector-title-actions { display: flex; align-items: center; gap: 3px; flex: none; }
 .inspector-back { display: none; flex: none; }
 .inspector-scroll { min-height: 0; overflow: auto; padding: 0 16px 24px; }
 .inspector-placeholder { display: grid; place-items: center; gap: 12px; min-height: 180px; color: var(--ink-3); text-align: center; font-size: 12px; }
@@ -229,6 +228,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .command-actions .btn.primary:hover { background: #b8611d; }
 .command-actions .project-action { color: #b8c3c8; border-color: #344047; background: #151a1e; }
 .command-actions .project-action:hover { color: #fff; border-color: #5eb4c1; background: #202b30; }
+.command-actions .command-import { color: #9fdbe3; border-color: #2f5b63; }
+.editor-shell[data-stage="0"] .command-import { display: none; }
 .segmented { display: inline-flex; align-items: stretch; padding: 2px; border: 1px solid var(--line-strong); border-radius: 5px; background: #11161a; }
 .segmented button { min-height: 31px; padding: 5px 10px; color: var(--ink-2); border: 0; border-radius: 3px; background: transparent; font-size: 11px; cursor: pointer; }
 .segmented button:hover { color: var(--ink); background: #283037; }
@@ -407,8 +408,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
   .command-center { justify-content: flex-end; gap: 4px; }
   .command-center .segmented { display: none; }
   .command-center .command-divider, .command-center #reset-rotation { display: none; }
-  .command-actions .command-check, .command-actions .btn.primary span { display: none; }
-  .command-actions .btn.primary { width: 36px; padding: 0; }
+  .command-actions .command-check, .command-actions .btn.primary span, .command-actions .command-import span { display: none; }
+  .command-actions .btn.primary, .command-actions .command-import { width: 36px; padding: 0; }
   .editor-workspace { position: relative; display: block; height: auto; min-height: 0; overflow: hidden; }
   .task-rail { display: none; }
   .canvas-stage { min-height: 0; height: 100%; }
