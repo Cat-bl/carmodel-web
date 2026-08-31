@@ -4074,6 +4074,97 @@ function dropHiddenSubmeshes(parsed, hiddenMaterials) {
   }
 }
 
+/**
+ * 把几段动画按顺序首尾相接拼成一段新动画：各段时间轴依次平移；某段没有驱动的节点沿用上一段的末帧
+ * （第一段就用节点静止姿态）；过渡为 0 时用 1ms 硬切保证时间轴严格递增。
+ * 合成信息记在 extras.bydCombined，界面据此列出与删除。
+ */
+export function combineAnimations(bytes, { name, segments, blendMs = 0 }) {
+  const state = parseGlb(bytes);
+  const { json } = state;
+  bakeAnimationSources(state);
+  const clips = segments.map((index) => json.animations?.[index]);
+  if (clips.length < 2 || clips.some((clip) => !clip)) throw new Error('组合动画至少需要两段有效动画');
+  const gap = Math.max(0.001, (Number(blendMs) || 0) / 1000);
+  const starts = [];
+  let cursor = 0;
+  clips.forEach((clip, order) => {
+    starts.push(cursor);
+    cursor += animationDurationOf(state, clip) + (order < clips.length - 1 ? gap : 0);
+  });
+  const channelMaps = clips.map((clip) => new Map((clip.channels || [])
+    .filter((channel) => Number.isInteger(channel.target?.node) && ['translation', 'rotation', 'scale'].includes(channel.target.path))
+    .map((channel) => [`${channel.target.node}|${channel.target.path}`, channel])));
+  const output = {
+    name,
+    samplers: [],
+    channels: [],
+    extras: { bydCombined: { segments: [...segments], blendMs: Math.max(0, Math.round(Number(blendMs) || 0)) } },
+  };
+  const shared = new Map();
+  for (const key of new Set(channelMaps.flatMap((map) => [...map.keys()]))) {
+    const [nodeText, path] = key.split('|');
+    const node = Number(nodeText);
+    const components = path === 'rotation' ? 4 : 3;
+    const times = [];
+    const values = [];
+    const signature = [];
+    let previous = null;
+    const push = (time, value) => {
+      if (times.length && time <= times[times.length - 1]) return;
+      times.push(time);
+      values.push(...value);
+    };
+    clips.forEach((clip, order) => {
+      const channel = channelMaps[order].get(key);
+      const start = starts[order];
+      if (!channel) {
+        const held = previous || restAnimationValue(json.nodes[node], path);
+        push(start, held);
+        push(start + animationDurationOf(state, clip), held);
+        previous = held;
+        signature.push(`${order}:hold:${held.join(',')}`);
+        return;
+      }
+      const sampler = clip.samplers[channel.sampler];
+      const input = readAccessorData(state, sampler.input);
+      const source = readAccessorData(state, sampler.output);
+      if (!input || !source || source.comps !== components) throw new Error(`${clip.name || '动画'}：关键帧数据无效`);
+      const valueAt = (frame) => Array.from(source.data.slice(frame * components, (frame + 1) * components), Number);
+      // 首关键帧不在 0 时先保持首帧，免得从上一段末帧慢慢漂过去
+      if (Number(input.data[0]) > 0.0005) push(start, valueAt(0));
+      for (let frame = 0; frame < input.data.length; frame++) push(start + Number(input.data[frame]), valueAt(frame));
+      previous = valueAt(input.data.length - 1);
+      signature.push(`${order}:${channel.sampler}`);
+    });
+    const shareKey = `${path}|${signature.join('|')}`;
+    let samplerIndex = shared.get(shareKey);
+    if (samplerIndex === undefined) {
+      samplerIndex = output.samplers.length;
+      output.samplers.push({
+        input: writeAccessor(state, Float32Array.from(times), 5126, 'SCALAR', { min: [times[0]], max: [times[times.length - 1]] }),
+        output: writeAccessor(state, Float32Array.from(values), 5126, path === 'rotation' ? 'VEC4' : 'VEC3'),
+        interpolation: 'LINEAR',
+      });
+      shared.set(shareKey, samplerIndex);
+    }
+    output.channels.push({ sampler: samplerIndex, target: { node, path } });
+  }
+  json.animations.push(output);
+  return buildGlb(json, state.bin);
+}
+
+/** 删除一段动画（用于撤掉组合动画），并把它独占的关键帧数据从 bin 里清掉。 */
+export function removeAnimation(bytes, index) {
+  const state = parseGlb(bytes);
+  const { json } = state;
+  if (!json.animations?.[index]) throw new Error('找不到要删除的动画');
+  json.animations.splice(index, 1);
+  pruneUnusedAccessors(state);
+  repackBin(state);
+  return buildGlb(json, state.bin);
+}
+
 const VISIBILITY_FPS = 30;
 const HIDDEN_SCALE = 0.001;
 

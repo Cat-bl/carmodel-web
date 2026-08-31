@@ -1,6 +1,6 @@
 import './style.css';
 import { ModelPreview } from './preview.js';
-import { bakeSubmeshVisibility, makeBydCar, makeVehiclePreviewGlb } from './package.js';
+import { bakeSubmeshVisibility, combineAnimations, makeBydCar, makeVehiclePreviewGlb, removeAnimation } from './package.js';
 import { listSubmeshes, recommendedHiddenSubmeshes } from './submeshes.js';
 import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
 import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
@@ -370,6 +370,31 @@ app.innerHTML = `
       </div>
     </div>
   </div>
+  <div class="generate-dialog" id="combo-dialog" role="dialog" aria-modal="true" aria-labelledby="combo-dialog-title" hidden>
+    <div class="generate-dialog-panel combo-dialog-panel">
+      <div class="generate-dialog-header">
+        <div><span>模型动画</span><h2 id="combo-dialog-title">组合动画</h2></div>
+        <button class="icon-btn" id="combo-dialog-close" type="button" title="关闭"><i data-lucide="x"></i></button>
+      </div>
+      <div class="generate-dialog-body">
+        <p class="hint combo-intro">把几段动画按顺序首尾相接合成一段新动画（例如「起手 → 循环」），合成后可像模型自带动画一样绑定到事件。</p>
+        <div class="field"><label for="combo-name">名称</label><input id="combo-name" type="text" placeholder="留空则自动命名" /></div>
+        <div class="field">
+          <label>片段顺序</label>
+          <div class="combo-list" id="combo-segments"></div>
+          <div class="combo-row"><select id="combo-add"></select><button class="btn small" id="combo-add-button" type="button">加入片段</button></div>
+        </div>
+        <div class="field"><label for="combo-blend">段与段之间的过渡（毫秒，0 = 直接相接）</label><input id="combo-blend" type="number" min="0" step="10" value="0" /></div>
+        <div class="combo-section-title">已有的组合动画</div>
+        <div class="combo-list" id="combo-existing"></div>
+      </div>
+      <div class="generate-dialog-actions">
+        <button class="btn" id="combo-dialog-cancel" type="button">取消</button>
+        <button class="btn primary" id="combo-dialog-confirm" type="button" disabled><i data-lucide="film"></i><span>生成组合动画</span></button>
+      </div>
+    </div>
+  </div>
+
   <div class="generate-dialog" id="leave-dialog" role="dialog" aria-modal="true" aria-labelledby="leave-dialog-title" hidden>
     <div class="generate-dialog-panel leave-dialog-panel">
       <div class="generate-dialog-header">
@@ -418,6 +443,8 @@ const ui = Object.fromEntries([
   'binding-back', 'quality-summary', 'quality-custom', 'quality-triangles', 'quality-texture-size',
   'quality-metrics', 'generate-dialog', 'generate-dialog-close', 'generate-dialog-cancel',
   'leave-dialog', 'leave-dialog-message', 'leave-dialog-close', 'leave-dialog-cancel', 'leave-dialog-discard', 'leave-dialog-save',
+  'combo-dialog', 'combo-dialog-close', 'combo-dialog-cancel', 'combo-dialog-confirm', 'combo-name', 'combo-segments',
+  'combo-add', 'combo-add-button', 'combo-blend', 'combo-existing',
   'generate-confirm', 'generate-quality-summary', 'generate-quality-custom',
   'generate-quality-triangles', 'generate-quality-texture-size', 'generate-quality-metrics',
 ].map((id) => [id, document.getElementById(id)]));
@@ -1999,6 +2026,150 @@ document.addEventListener('keydown', (event) => {
   else undo();
 });
 
+/* ---------- 组合动画 ---------- */
+
+let comboDraft = null;
+
+function isCombinedAnimation(index) {
+  return Boolean(preview.gltfJson?.animations?.[index]?.extras?.bydCombined);
+}
+
+function animationLabel(index) {
+  return preview.gltfJson?.animations?.[index]?.name || `动画 ${index + 1}`;
+}
+
+function openComboDialog() {
+  comboDraft = { segments: [] };
+  ui['combo-name'].value = '';
+  ui['combo-blend'].value = '0';
+  renderComboDialog();
+  ui['combo-dialog'].hidden = false;
+  ui['combo-name'].focus();
+}
+
+function closeComboDialog() {
+  ui['combo-dialog'].hidden = true;
+  comboDraft = null;
+}
+
+function renderComboDialog() {
+  const selectedAdd = ui['combo-add'].value;
+  ui['combo-add'].innerHTML = bindableAnimations
+    .filter((animation) => !isCombinedAnimation(animation.index))
+    .map((animation) => `<option value="${animation.index}">${escapeHtml(animation.name)}${animation.duration ? ` · ${animation.duration.toFixed(2)} 秒` : ''}</option>`)
+    .join('');
+  if (selectedAdd) ui['combo-add'].value = selectedAdd;
+  const { segments } = comboDraft;
+  ui['combo-segments'].innerHTML = segments.length
+    ? segments.map((index, order) => `
+      <div class="combo-segment">
+        <span>${order + 1}. ${escapeHtml(animationLabel(index))}</span>
+        <button class="icon-btn" data-combo-move="${order}:-1" type="button" title="上移"${order === 0 ? ' disabled' : ''}>▲</button>
+        <button class="icon-btn" data-combo-move="${order}:1" type="button" title="下移"${order === segments.length - 1 ? ' disabled' : ''}>▼</button>
+        <button class="icon-btn" data-combo-remove="${order}" type="button" title="移除">✕</button>
+      </div>`).join('')
+    : '<p class="hint">还没有片段，从下方选择动画依次加入，播放时按顺序首尾相接。</p>';
+  const combos = (preview.gltfJson?.animations || [])
+    .map((animation, index) => ({ animation, index }))
+    .filter(({ animation }) => animation.extras?.bydCombined);
+  ui['combo-existing'].innerHTML = combos.length
+    ? combos.map(({ animation, index }) => `
+      <div class="combo-segment">
+        <span>${escapeHtml(animation.name)}<em>${animation.extras.bydCombined.segments.map((segment) => escapeHtml(animationLabel(segment))).join(' → ')}${animation.extras.bydCombined.blendMs ? ` · 过渡 ${animation.extras.bydCombined.blendMs} 毫秒` : ''}</em></span>
+        <button class="icon-btn" data-combo-delete="${index}" type="button" title="删除这段组合动画">✕</button>
+      </div>`).join('')
+    : '<p class="hint">当前模型还没有组合动画。</p>';
+  ui['combo-dialog-confirm'].disabled = segments.length < 2;
+  ui['combo-segments'].querySelectorAll('[data-combo-move]').forEach((button) => button.addEventListener('click', () => {
+    const [order, delta] = button.dataset.comboMove.split(':').map(Number);
+    [segments[order], segments[order + delta]] = [segments[order + delta], segments[order]];
+    renderComboDialog();
+  }));
+  ui['combo-segments'].querySelectorAll('[data-combo-remove]').forEach((button) => button.addEventListener('click', () => {
+    segments.splice(Number(button.dataset.comboRemove), 1);
+    renderComboDialog();
+  }));
+  ui['combo-existing'].querySelectorAll('[data-combo-delete]').forEach((button) => {
+    button.addEventListener('click', () => deleteCombinedAnimation(Number(button.dataset.comboDelete)));
+  });
+}
+
+ui['combo-add-button'].addEventListener('click', () => {
+  const index = Number(ui['combo-add'].value);
+  if (!comboDraft || !Number.isInteger(index)) return;
+  comboDraft.segments.push(index);
+  renderComboDialog();
+});
+for (const id of ['combo-dialog-close', 'combo-dialog-cancel']) ui[id].addEventListener('click', closeComboDialog);
+ui['combo-dialog'].addEventListener('keydown', (event) => { if (event.key === 'Escape') closeComboDialog(); });
+ui['combo-dialog-confirm'].addEventListener('click', createCombinedAnimation);
+
+async function createCombinedAnimation() {
+  if (!current || !comboDraft || comboDraft.segments.length < 2) return;
+  const existing = (preview.gltfJson?.animations || []).filter((animation) => animation.extras?.bydCombined).length;
+  const name = ui['combo-name'].value.trim() || `组合动画 ${existing + 1}`;
+  const blendMs = Math.max(0, Math.round(Number(ui['combo-blend'].value) || 0));
+  const segments = [...comboDraft.segments];
+  const slotId = openSlot;
+  const nextIndex = preview.gltfJson.animations.length;
+  closeComboDialog();
+  if (!(await materializeAnimations(() => combineAnimations(current.bytes, { name, segments, blendMs }), '正在生成组合动画'))) return;
+  // 从哪个事件点开的就挂到哪个事件上，和在下拉里选一个动画的行为一致
+  const slot = slotId && activeSlot(slotId);
+  if (slot && sourceAnimationByIndex(nextIndex)) {
+    if (sourceAnimationBindingValid(bindings.get(slot.id))) addVariantAnimation(slot, nextIndex);
+    else setSourceAnimationBinding(slot, nextIndex);
+  }
+  showMessage(`组合动画「${name}」已生成`, 'success');
+}
+
+async function deleteCombinedAnimation(index) {
+  if (!current) return;
+  closeComboDialog();
+  // 后面的动画下标会前移，已绑定的引用要跟着改；引用被删动画的绑定项直接去掉
+  for (const [slotId, binding] of [...bindings.entries()]) {
+    const variants = eventVariantsOf(binding)
+      .filter((item) => item.index !== index)
+      .map((item) => ({ ...item, index: item.index > index ? item.index - 1 : item.index }));
+    if (!variants.length) {
+      bindings.delete(slotId);
+      continue;
+    }
+    binding.variants = variants;
+    binding.sourceAnimationIndex = variants[0].index;
+    binding.sourceAnimationName = variants[0].name;
+  }
+  await materializeAnimations(() => removeAnimation(current.bytes, index), '正在删除组合动画');
+}
+
+/** 动画列表变了（新增/删除组合动画）就把模型重新装载一遍：预览、可绑定列表、导出字节都以新模型为准。 */
+async function materializeAnimations(build, label) {
+  const editorState = captureSnapshot();
+  const displayName = ui['file-name'].textContent;
+  const wasSaved = projectSaved;
+  beginFileLoad(displayName, label);
+  try {
+    const bytes = build();
+    await activatePreparedModel({ ...current, name: current.sourceName || current.file.name, bytes }, {
+      displayName,
+      sourceFile: current.sourceFile,
+      editorState,
+      previewProgressStart: 0.1,
+      previewProgressScale: 0.85,
+    });
+    ui['analysis-state'].textContent = '解析完成';
+    projectSaved = wasSaved;
+    setDirty(true);
+    return true;
+  } catch (error) {
+    console.error(error);
+    handleLoadFailure(error, displayName, '更新动画失败');
+    return false;
+  } finally {
+    endFileLoad();
+  }
+}
+
 /* ---------- 删除多余部分 ---------- */
 
 let deletions = [];
@@ -2823,9 +2994,10 @@ function otherBindingEditor(slot, binding) {
         <select id="bind-source-animation">
           <option value="">${bound0 ? '再挂一个动画（随机播放）' : '选择一个动画'}</option>
           ${bindableAnimations.map((animation) => `
-            <option value="${animation.index}"${!bound0 && animation.index === selected ? ' selected' : ''}>${escapeHtml(animation.name)}${animation.duration ? ` · ${animation.duration.toFixed(2)} 秒` : ''}</option>`).join('')}
+            <option value="${animation.index}"${!bound0 && animation.index === selected ? ' selected' : ''}>${escapeHtml(animation.name)}${isCombinedAnimation(animation.index) ? ' · 组合' : ''}${animation.duration ? ` · ${animation.duration.toFixed(2)} 秒` : ''}</option>`).join('')}
         </select>
         <small>${bound0 ? '同一个事件可以挂多个动画，车机每次触发按概率随机挑一个。' : '选择后立即绑定并在网页质感中预览。'}</small>
+        <button class="btn small" id="bind-combine" type="button" title="把几段动画首尾相接合成一段新动画"><i data-lucide="film"></i>组合动画…</button>
       </div>`;
   }
   const bound = sourceAnimationBindingValid(binding)
@@ -3328,6 +3500,7 @@ function wireBindingEditor() {
       }
       setSourceAnimationBinding(slot, value);
     });
+    document.getElementById('bind-combine')?.addEventListener('click', openComboDialog);
     ui['binding-editor-host'].querySelectorAll('[data-variant-remove]').forEach((button) => {
       button.addEventListener('click', (event) => {
         event.stopPropagation();
