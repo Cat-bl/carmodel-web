@@ -2329,59 +2329,6 @@ function holdAnimationClip(state, source, name) {
   return output;
 }
 
-/**
- * 从模型静态姿态平滑进入事件动画首帧。过渡单独导出，避免循环动画每轮
- * 都重复播放过渡；地图端播放完成后会无缝切到原有 ON/LOOP 动画。
- */
-function enterAnimationClip(state, source, name, durationMs) {
-  const duration = Math.max(0, Number(durationMs) || 0) / 1000;
-  if (!(duration > 0)) return null;
-  const frameCount = 8;
-  const times = new Float32Array(frameCount);
-  for (let frame = 0; frame < frameCount; frame++) {
-    times[frame] = duration * frame / (frameCount - 1);
-  }
-  const output = { name, samplers: [], channels: [] };
-  for (const channel of source.channels || []) {
-    const target = channel.target || {};
-    const path = target.path;
-    const sampler = source.samplers?.[channel.sampler];
-    const values = readAccessorData(state, sampler?.output);
-    const node = state.json.nodes?.[target.node];
-    const components = path === 'rotation' ? 4 : 3;
-    if (!node || !values || values.comps !== components || values.data.length < components) {
-      throw new Error(`${name}：无法生成进入过渡`);
-    }
-    const start = path === 'translation'
-      ? Array.from(node.translation || [0, 0, 0], Number)
-      : path === 'rotation'
-        ? quatNormalize(Array.from(node.rotation || [0, 0, 0, 1], Number))
-        : Array.from(node.scale || [1, 1, 1], Number);
-    const end = Array.from(values.data.slice(0, components), Number);
-    const normalizedEnd = path === 'rotation' ? quatNormalize(end) : end;
-    if (![...start, ...normalizedEnd].every(Number.isFinite)) {
-      throw new Error(`${name}：进入过渡包含无效数值`);
-    }
-    const samples = new Float32Array(frameCount * components);
-    for (let frame = 0; frame < frameCount; frame++) {
-      const progress = frame / (frameCount - 1);
-      const eased = progress * progress * (3 - 2 * progress);
-      const value = path === 'rotation'
-        ? quatSlerp(start, normalizedEnd, eased)
-        : start.map((item, index) => item + (normalizedEnd[index] - item) * eased);
-      samples.set(value, frame * components);
-    }
-    const samplerIndex = output.samplers.length;
-    output.samplers.push({
-      input: writeAccessor(state, times, 5126, 'SCALAR', { min: [0], max: [duration] }),
-      output: writeAccessor(state, samples, 5126, values.accessor.type),
-      interpolation: 'LINEAR',
-    });
-    output.channels.push({ sampler: samplerIndex, target: { node: target.node, path } });
-  }
-  return output.channels.length ? output : null;
-}
-
 // 固定四个来源相位，地图端无需读取原生动画进度也能选择最接近的一段。
 const EVENT_TRANSITION_PHASES = [0, 1 / 3, 2 / 3, 1];
 function restAnimationValue(node, path) {
@@ -2486,66 +2433,14 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
   return output.channels.length ? output : null;
 }
 
-function eventTransitionSet(state, sourceEvent, targetEvent, phases = EVENT_TRANSITION_PHASES) {
-  const durationMs = targetEvent.playback.transitionMs;
-  if (!(durationMs > 0)) return null;
-  const targetPose = targetEvent.transitionPoses?.[0] || animationPoseAt(state, targetEvent.active, 0);
-  const animations = [];
-  for (let index = 0; index < phases.length; index++) {
-    const cachedIndex = EVENT_TRANSITION_PHASES.indexOf(phases[index]);
-    const sourcePose = cachedIndex >= 0 ? sourceEvent.transitionPoses?.[cachedIndex] : null;
-    const name = `BYD_TR_${sourceEvent.slot.id}_${targetEvent.slot.id}_P${index}`;
-    const animation = poseTransitionClip(
-      state,
-      sourcePose || animationPoseAt(state, sourceEvent.active, phases[index]),
-      targetPose,
-      name,
-      durationMs,
-    );
-    if (animation) animations.push(animation);
-  }
-  if (!animations.length) return null;
-  return {
-    animations,
-    spec: {
-      animations: animations.map((animation) => animation.name),
-      durationMs,
-    },
-  };
-}
-
-function transitionPhasesForPairCount(pairCount) {
-  if (pairCount <= 24) return EVENT_TRANSITION_PHASES;
-  if (pairCount <= 72) return [0, 2 / 3];
+/**
+ * OUT 过渡按几个相位采样。段数 = 变体数 × 相位数，变体多了就少采几个相位，
+ * 控制元数据体积（每段过渡的 JSON 描述比它的关键帧数据重得多）。
+ */
+function outPhasesForVariantCount(variantCount) {
+  if (variantCount <= 16) return EVENT_TRANSITION_PHASES;
+  if (variantCount <= 40) return [0, 2 / 3];
   return [0];
-}
-
-/** 为事件的各代表相位生成“当前动作姿态 -> 模型静态默认姿态”的退出过渡。 */
-function eventResetSet(state, event, transitionPoses = null, suffix = '', phases = EVENT_TRANSITION_PHASES) {
-  const durationMs = event.playback.transitionMs;
-  if (!(durationMs > 0)) return null;
-  const animations = [];
-  for (let index = 0; index < phases.length; index++) {
-    const cachedIndex = EVENT_TRANSITION_PHASES.indexOf(phases[index]);
-    const name = `BYD_RST_${event.slot.id}${suffix}_P${index}`;
-    const animation = poseTransitionClip(
-      state,
-      (cachedIndex >= 0 ? transitionPoses?.[cachedIndex] : null)
-        || animationPoseAt(state, event.active, phases[index]),
-      new Map(),
-      name,
-      durationMs,
-    );
-    if (animation) animations.push(animation);
-  }
-  if (!animations.length) return null;
-  return {
-    animations,
-    spec: {
-      animations: animations.map((animation) => animation.name),
-      durationMs,
-    },
-  };
 }
 
 /**
@@ -2567,7 +2462,6 @@ function eventAnimationSet(state, source, slot, binding, variantIndex = 0, reset
   if (mode === 'pingpong') active = pingPongAnimationClip(state, active, `${base}_PINGPONG`);
   const on = structuredClone(active);
   on.name = `${base}_${mode === 'loop' || mode === 'pingpong' ? (mode === 'pingpong' ? 'PINGPONG' : 'LOOP') : 'ON'}`;
-  const enter = enterAnimationClip(state, active, `${base}_ENTER`, playback.transitionMs);
   const oneWay = animationDurationOf(state, trimmed);
   const activeDuration = animationDurationOf(state, active);
   const needHold = playback.mode === 'hold' || ['hold', 'finish'].includes(playback.endMode);
@@ -2576,9 +2470,9 @@ function eventAnimationSet(state, source, slot, binding, variantIndex = 0, reset
     ? reverseAnimationClip(state, active, `${base}_OFF`)
     : null;
   const transitionPoses = EVENT_TRANSITION_PHASES.map((phase) => animationPoseAt(state, active, phase));
-  const reset = eventResetSet(state, { slot, active, playback }, transitionPoses, suffix, resetPhases);
   const spec = {
-    enter: enter?.name || '',
+    // enter / reset / enterDurationMs 由 buildAnchorClips 在锚点确定后回填
+    enter: '',
     on: on.name,
     off: off?.name || '',
     hold: hold?.name || '',
@@ -2587,29 +2481,97 @@ function eventAnimationSet(state, source, slot, binding, variantIndex = 0, reset
     onRepeat: playback.mode === 'once' || playback.mode === 'hold' ? 1 : -1,
     offRepeat: 1,
     onDurationMs: Math.max(1, Math.round(activeDuration * 1000)),
-    enterDurationMs: enter ? playback.transitionMs : 0,
+    enterDurationMs: 0,
     offDurationMs: Math.max(1, Math.round(animationDurationOf(state, off || active) * 1000)),
     cycleDurationMs: Math.max(1, Math.round((playback.mode === 'pingpong' ? activeDuration : oneWay) * 1000)),
     transitionDurationMs: playback.transitionMs,
-    transitionPhases: EVENT_TRANSITION_PHASES.length,
     activeEnd: playback.mode === 'hold' ? 'hold' : playback.mode === 'once' ? 'reset' : 'none',
     endMode: playback.endMode,
-    ...(reset ? { reset: reset.spec } : {}),
     playback,
   };
   return {
     animations: [
-      ...(enter ? [enter] : []),
       on,
       ...(off ? [off] : []),
       ...(hold ? [hold] : []),
-      ...(reset?.animations || []),
     ],
     spec,
     active,
     playback,
     transitionPoses,
+    base,
   };
+}
+
+/**
+ * 所有动作切换共用的锚点姿态：优先取待机的第一条动画首帧，没有待机就用第一个事件的。
+ *
+ * 选一个真实动作的起手姿态（通常是自然站姿），而不是模型的静态默认姿态——
+ * 后者往往是 T-pose，从跑步末帧切过去会非常突兀。
+ */
+/** 起止姿态一致时的占位过渡：挑锚点里任意一条轨道写两帧相同姿态，只为撑起时长。 */
+function staticPoseClip(state, pose, name, durationMs) {
+  const duration = Math.max(1 / 60, Number(durationMs) / 1000);
+  const [descriptor] = pose.values();
+  if (!descriptor) return null;
+  const components = descriptor.path === 'rotation' ? 4 : 3;
+  const samples = new Float32Array(components * 2);
+  samples.set(descriptor.value, 0);
+  samples.set(descriptor.value, components);
+  const timeAccessor = writeAccessor(state, new Float32Array([0, duration]), 5126, 'SCALAR', { min: [0], max: [duration] });
+  return {
+    name,
+    samplers: [{
+      input: timeAccessor,
+      output: writeAccessor(state, samples, 5126, descriptor.type || (components === 4 ? 'VEC4' : 'VEC3')),
+      interpolation: 'LINEAR',
+    }],
+    channels: [{ sampler: 0, target: { node: descriptor.node, path: descriptor.path } }],
+  };
+}
+
+function pickAnchorPose(state, eventRecords) {
+  const idle = eventRecords.find((record) => record.slot.id === 'CS_Idle') || eventRecords[0];
+  return animationPoseAt(state, idle.variants[0].active, 0);
+}
+
+/**
+ * 把每条动画和锚点姿态接起来，任何切换都拆成「当前动作 → 锚点 → 目标动作」两段。
+ *
+ * 直接为「源事件×源变体×源相位 → 目标事件×目标变体」的每种组合预烘过渡会组合爆炸
+ * （这套配置光跨事件就 574 组起步），而经由锚点中转后段数只跟变体数成线性。
+ * 两段各占用户设定过渡时长的一半，切换总时长不变。
+ *
+ * 复用车机既有的 ENTER / RST 两个阶段：ENTER 从锚点进入动作，RST 从动作退回锚点，
+ * 因此 manifest 结构和车机状态机都不用改，只是基准姿态从模型默认姿态换成了锚点。
+ */
+function buildAnchorClips(state, eventRecords, phases) {
+  const anchor = pickAnchorPose(state, eventRecords);
+  const clips = [];
+  for (const record of eventRecords) {
+    const halfMs = Math.round(record.playback.transitionMs / 2);
+    for (const variant of record.variants) {
+      if (!(halfMs > 0)) continue;
+      // 起止姿态一致（典型是锚点自己那条动画）时过渡会被整段省掉，
+      // 这里补一段静态占位，保证车机 ENTER → ON、RST → 下一动作的链路不断
+      const enter = poseTransitionClip(
+        state, anchor, animationPoseAt(state, variant.active, 0), `${variant.base}_IN`, halfMs,
+      ) || staticPoseClip(state, anchor, `${variant.base}_IN`, halfMs);
+      clips.push(enter);
+      variant.spec.enter = enter.name;
+      variant.spec.enterDurationMs = halfMs;
+      const outs = phases.map((phase, index) => {
+        const cached = EVENT_TRANSITION_PHASES.indexOf(phase);
+        const pose = (cached >= 0 ? variant.transitionPoses?.[cached] : null)
+          || animationPoseAt(state, variant.active, phase);
+        const name = `${variant.base}_OUT_P${index}`;
+        return poseTransitionClip(state, pose, anchor, name, halfMs) || staticPoseClip(state, anchor, name, halfMs);
+      });
+      clips.push(...outs);
+      variant.spec.reset = { animations: outs.map((clip) => clip.name), durationMs: halfMs };
+    }
+  }
+  return clips;
 }
 
 /** 该事件所有动画驱动到的节点集合；两个事件的集合不相交就能同时播放。 */
@@ -2702,11 +2664,8 @@ async function normalizeAnimatedOtherGlb(
   const eventBindings = {};
   const eventRecords = [];
   const requestedBindings = bindings || [];
-  // 退出过渡在分槽之前就要生成，这里按"全部事件同槽"的上界估算相位数：
-  // 事件一多，退出过渡的段数也得跟着精简，否则光元数据就能把包撑爆。
-  const resetPhases = transitionPhasesForPairCount(
-    requestedBindings.length * Math.max(0, requestedBindings.length - 1),
-  );
+  const variantTotal = requestedBindings.reduce((total, binding) => total + eventVariantsOf(binding).length, 0);
+  const resetPhases = outPhasesForVariantCount(variantTotal);
   for (let bindingIndex = 0; bindingIndex < requestedBindings.length; bindingIndex++) {
     const binding = requestedBindings[bindingIndex];
     const slot = SLOT_BY_ID.get(binding.slotId);
@@ -2739,40 +2698,12 @@ async function normalizeAnimatedOtherGlb(
   // 互不抢节点的事件分到不同播放槽后可以同时播放，只有同槽事件才需要互相切换。
   const partCount = assignEventPartSlots(eventRecords);
 
-  /**
-   * 预烘过渡的前提是"这个事件的起止姿态是确定的"，所以两端都必须只挂一条动画。
-   *
-   * 挂了多条时每次随机播哪条并不确定，而过渡只能按其中一条（代表动作）烘：
-   * 作为目标时终点对不上实际抽中的那条，作为来源时起点对不上它正在播的那条，
-   * 都会导致切换瞬间突跳（实测同一角色不同动作的首帧平均能差二十几度）。
-   * 这种事件干脆不写 transitions，车机 transitionFor 找不到就会自动改用
-   * 该变体自己的 ENTER 从默认姿态淡入——稍生硬，但姿态一定接得上。
-   */
-  const canPrebakeTransition = (record) => record.variants.length === 1;
-  const sameSlotPairs = (target) => (canPrebakeTransition(target)
-    ? eventRecords.filter((source) => source.slot.id !== target.slot.id
-      && source.part === target.part && canPrebakeTransition(source))
-    : []);
+  // 所有动作都经由锚点姿态互相衔接，段数只跟变体数成线性，不会随事件对数爆炸。
+  onProgress?.(0.4, '正在生成动作衔接过渡');
+  await yieldToBrowser();
+  outputAnimations.push(...buildAnchorClips(state, eventRecords, resetPhases));
 
-  // 为每一对同槽事件生成切换过渡。过渡时长取目标事件的设置，因此用户
-  // 可以单独控制“切入左转”与“恢复前进”的速度。
-  const transitionTotal = eventRecords.reduce((total, target) => total + sameSlotPairs(target).length, 0);
-  const transitionPhases = transitionPhasesForPairCount(transitionTotal);
-  let transitionBuilt = 0;
   for (const target of eventRecords) {
-    const transitions = {};
-    for (const source of sameSlotPairs(target)) {
-      const transition = eventTransitionSet(state, source, target, transitionPhases);
-      if (!transition) continue;
-      outputAnimations.push(...transition.animations);
-      transitions[source.slot.id] = transition.spec;
-      transitionBuilt++;
-      onProgress?.(
-        0.32 + (transitionTotal ? transitionBuilt / transitionTotal : 1) * 0.46,
-        `正在生成动作切换过渡（${transitionBuilt}/${transitionTotal}）`,
-      );
-      await yieldToBrowser();
-    }
     const spec = target.spec;
     const { playback, ...eventSpec } = spec;
     // 顶层仍然写第 0 条动画的字段：没升级过的车机读不懂 variants，会自动退化成单动作播放。
@@ -2797,14 +2728,13 @@ async function normalizeAnimatedOtherGlb(
         // 循环类动作每播完一轮重新抽一次，站着不会一直重复同一个动作
         ...(spec.onMode === 'loop' ? { reroll: true } : {}),
       } : {}),
-      ...(Object.keys(transitions).length ? { transitions } : {}),
       ...(target.slot.id === 'CS_Idle' ? {
         triggerDelayMs: normalizeIdleDelaySeconds(target.binding.triggerDelaySeconds) * 1000,
       } : {}),
     };
   }
-  if (transitionPhases.length < EVENT_TRANSITION_PHASES.length) {
-    onProgress?.(0.8, `动作较多，切换过渡已自动精简为 ${transitionPhases.length} 相位`);
+  if (resetPhases.length < EVENT_TRANSITION_PHASES.length) {
+    onProgress?.(0.8, `动作较多，衔接过渡已自动精简为 ${resetPhases.length} 相位`);
   } else if (partCount > 1) {
     onProgress?.(0.8, `动作互不冲突，已分成 ${partCount} 组可同时播放`);
   }

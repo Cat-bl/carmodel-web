@@ -507,3 +507,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+.leave-dialog-panel { width: min(440px, 100%); }
+.leave-dialog-body p { margin: 0; color: var(--ink); font-size: 13px; line-height: 1.6; }
+.leave-dialog-hint { margin-top: 10px !important; color: var(--ink-3) !important; font-size: 11px !important; }
+.leave-dialog-actions { flex-wrap: wrap; }
+.leave-dialog-actions .btn.primary { min-width: 0; }

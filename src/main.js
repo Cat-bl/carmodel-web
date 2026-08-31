@@ -38,8 +38,11 @@ import {
   BoxSelect,
   CarFront,
   CheckCircle2,
+  CornerDownRight,
+  Dices,
   Download,
   Eye,
+  Film,
   FolderOpen,
   Gauge,
   Info,
@@ -359,6 +362,23 @@ app.innerHTML = `
       </div>
     </div>
   </div>
+  <div class="generate-dialog" id="leave-dialog" role="dialog" aria-modal="true" aria-labelledby="leave-dialog-title" hidden>
+    <div class="generate-dialog-panel leave-dialog-panel">
+      <div class="generate-dialog-header">
+        <div><span>当前项目</span><h2 id="leave-dialog-title">先保存进度吗？</h2></div>
+        <button class="icon-btn" id="leave-dialog-close" type="button" title="关闭"><i data-lucide="x"></i></button>
+      </div>
+      <div class="generate-dialog-body leave-dialog-body">
+        <p id="leave-dialog-message"></p>
+        <p class="leave-dialog-hint">保存为 .bydcarproj 项目文件后，下次直接打开就能还原到现在的进度：模型、朝向、所有联动绑定和动画设置都会原样带回来。</p>
+      </div>
+      <div class="generate-dialog-actions leave-dialog-actions">
+        <button class="btn" id="leave-dialog-cancel" type="button">取消</button>
+        <button class="btn" id="leave-dialog-discard" type="button">不保存，继续</button>
+        <button class="btn primary" id="leave-dialog-save" type="button"><i data-lucide="save"></i><span>保存项目并继续</span></button>
+      </div>
+    </div>
+  </div>
 `;
 
 function stat(label, id) {
@@ -388,6 +408,7 @@ const ui = Object.fromEntries([
   'import-progress', 'import-progress-label', 'import-progress-percent', 'import-progress-bar',
   'binding-back', 'quality-summary', 'quality-custom', 'quality-triangles', 'quality-texture-size',
   'quality-metrics', 'generate-dialog', 'generate-dialog-close', 'generate-dialog-cancel',
+  'leave-dialog', 'leave-dialog-message', 'leave-dialog-close', 'leave-dialog-cancel', 'leave-dialog-discard', 'leave-dialog-save',
   'generate-confirm', 'generate-quality-summary', 'generate-quality-custom',
   'generate-quality-triangles', 'generate-quality-texture-size', 'generate-quality-metrics',
 ].map((id) => [id, document.getElementById(id)]));
@@ -530,13 +551,8 @@ function resetWorkspaceForTypeSelection() {
   updateSteps(0);
 }
 
-function returnToModelTypeHome() {
-  if (current) {
-    const message = dirty
-      ? '当前修改还没有保存为 .bydcarproj 项目文件。返回首页会丢失这些修改，确定继续吗？'
-      : '返回首页会关闭当前项目，确定继续吗？';
-    if (!window.confirm(message)) return;
-  }
+async function returnToModelTypeHome() {
+  if (current && !(await confirmLeaveProject('返回首页'))) return;
   resetWorkspaceForTypeSelection();
   ui['editor-shell'].hidden = true;
   ui['model-type-home'].hidden = false;
@@ -551,9 +567,9 @@ window.addEventListener('beforeunload', (event) => {
 });
 
 const lucideIcons = {
-  AlertCircle, AlertTriangle, ArrowLeft, ArrowLeftRight, Box, BoxSelect, CarFront, CheckCircle2, Download, Eye, FolderOpen,
-  Gauge, Info, Layers3, Maximize2, MousePointer2, Paintbrush, Play, Redo2, RotateCcw, Save, Settings2,
-  Sparkles, Square, Trash2, Undo2, Upload, Wrench, X,
+  AlertCircle, AlertTriangle, ArrowLeft, ArrowLeftRight, Box, BoxSelect, CarFront, CheckCircle2, CornerDownRight,
+  Dices, Download, Eye, Film, FolderOpen, Gauge, Info, Layers3, Maximize2, MousePointer2, Paintbrush, Play,
+  Redo2, RotateCcw, Save, Settings2, Sparkles, Square, Trash2, Undo2, Upload, Wrench, X,
 };
 
 function renderIcons() {
@@ -743,14 +759,14 @@ for (const id of ['home-open-project', 'home-open-project-mobile']) {
 }
 ui['model-type-switch'].addEventListener('click', returnToModelTypeHome);
 
-ui['model-file'].addEventListener('change', (event) => {
+ui['model-file'].addEventListener('change', async (event) => {
   const file = event.target.files?.[0];
-  if (file && confirmReplaceCurrent()) loadFile(file);
+  if (file && await confirmReplaceCurrent()) loadFile(file);
   else event.target.value = '';
 });
-ui['project-file'].addEventListener('change', (event) => {
+ui['project-file'].addEventListener('change', async (event) => {
   const file = event.target.files?.[0];
-  if (file && confirmReplaceCurrent()) loadProject(file);
+  if (file && await confirmReplaceCurrent()) loadProject(file);
   else event.target.value = '';
 });
 for (const id of ['open-project', 'inspector-open-project']) {
@@ -768,9 +784,9 @@ for (const eventName of ['dragleave', 'drop']) {
     ui['drop-zone'].classList.remove('drag');
   });
 }
-ui['drop-zone'].addEventListener('drop', (event) => {
+ui['drop-zone'].addEventListener('drop', async (event) => {
   const file = event.dataTransfer.files?.[0];
-  if (!file || !confirmReplaceCurrent()) return;
+  if (!file || !(await confirmReplaceCurrent())) return;
   if (/\.bydcarproj$/i.test(file.name)) loadProject(file);
   else loadFile(file);
 });
@@ -1165,16 +1181,41 @@ function handleLoadFailure(error, previousName, prefix) {
   showMessage(`${prefix}：${error.message || '文件结构无效'}`, 'error');
 }
 
+/**
+ * 离开当前项目前的确认：给用户一个顺手保存的机会，而不是只警告"会丢失"。
+ * 没有未保存修改时不打扰，直接放行。
+ */
+function confirmLeaveProject(action) {
+  if (!current || !dirty) return Promise.resolve(true);
+  ui['leave-dialog-message'].textContent = `${action}会关闭当前项目，而这里的修改还没有保存。`;
+  ui['leave-dialog'].hidden = false;
+  renderIcons();
+  ui['leave-dialog-save'].focus();
+  return new Promise((resolve) => {
+    const finish = (result) => {
+      ui['leave-dialog'].hidden = true;
+      for (const [id, handler] of handlers) ui[id].removeEventListener('click', handler);
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    };
+    const onKey = (event) => { if (event.key === 'Escape') finish(false); };
+    const handlers = [
+      ['leave-dialog-close', () => finish(false)],
+      ['leave-dialog-cancel', () => finish(false)],
+      ['leave-dialog-discard', () => finish(true)],
+      ['leave-dialog-save', async () => finish(await saveProject())],
+    ];
+    for (const [id, handler] of handlers) ui[id].addEventListener('click', handler);
+    document.addEventListener('keydown', onKey);
+  });
+}
+
 function confirmReplaceCurrent() {
-  if (!current) return true;
-  const message = dirty
-    ? '当前修改还没有保存为 .bydcarproj 项目文件。打开其他文件会丢失这些修改，确定继续吗？'
-    : '打开其他文件会关闭当前项目，确定继续吗？';
-  return window.confirm(message);
+  return confirmLeaveProject('打开其他文件');
 }
 
 async function saveProject() {
-  if (!current || !preview.model) return;
+  if (!current || !preview.model) return false;
   const buttons = [ui['save-project'], ui['mobile-save-project']];
   const labels = buttons.map((button) => button.innerHTML);
   let lastPercent = -1;
@@ -1210,12 +1251,14 @@ async function saveProject() {
     projectSaved = true;
     setDirty(false);
     showMessage(`项目已保存：${formatBytes(result.bytes.byteLength)}`, 'success');
+    return true;
   } catch (error) {
     console.error(error);
     ui['save-status'].classList.remove('saving');
     ui['save-status'].classList.add('error');
     ui['save-status'].textContent = '项目保存失败';
     showMessage(`项目保存失败：${error.message || '未知错误'}`, 'error');
+    return false;
   } finally {
     buttons.forEach((button, index) => {
       button.disabled = !current;
@@ -2678,7 +2721,7 @@ function variantListHtml(slot, binding) {
       <button class="btn small variant-remove" type="button" data-variant-remove="${variant.index}" aria-label="移除 ${escapeHtml(variant.name)}"><i data-lucide="x"></i></button>
     </div>`).join('');
   return `<section class="variant-list" aria-label="事件动画列表">
-    <div class="variant-title"><i data-lucide="shuffle"></i><strong>随机动作（${variants.length}）</strong><small>点击可单独预览</small></div>
+    <div class="variant-title"><i data-lucide="dices"></i><strong>随机动作（${variants.length}）</strong><small>点击可单独预览</small></div>
     ${rows}
   </section>`;
 }
