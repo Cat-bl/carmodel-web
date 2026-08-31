@@ -21,6 +21,7 @@ import {
   normalizeRerollCycles,
   normalizeYawDegrees,
   normalizeIdleDelaySeconds,
+  PARKED_DELAY_MIN_SECONDS,
   normalizeVariantWeight,
   variantChances,
   normalizeLampBeam,
@@ -1349,6 +1350,16 @@ function normalizeProjectState(raw) {
     const forward = front || (rear && ['CS_WF', { ...rear[1], slotId: 'CS_WF' }]);
     bindingsState = bindingsState.filter(([id]) => id !== 'CS_WF' && id !== 'CS_WB');
     if (forward) bindingsState.push(forward);
+    // 旧项目的「待机 + 停车后 n 秒触发」就是现在的久停：延迟大于 0 的整条搬到久停，行为和以前一致；
+    // CS_Idle 从此叫「停车」、停车立即触发，留给用户重新绑一个站立动作
+    const idle = bindingsState.find(([id]) => id === 'CS_Idle');
+    if (idle && Number(idle[1].triggerDelaySeconds) > 0 && !bindingsState.some(([id]) => id === 'CS_Parked')) {
+      bindingsState = bindingsState.filter(([id]) => id !== 'CS_Idle');
+      // 旧待机的默认优先级 0 会和现在的停车同级，搬过去时换成久停的默认值；用户自己调过的保留
+      const priority = Number(idle[1].priority) === 0 ? undefined : idle[1].priority;
+      bindingsState.push(['CS_Parked', { ...idle[1], slotId: 'CS_Parked', priority: normalizeEventPriority('CS_Parked', priority) }]);
+      if (raw.openSlot === 'CS_Idle') raw = { ...raw, openSlot: 'CS_Parked' };
+    }
   }
   const knownSlots = new Set(bindingsState.map(([id]) => id));
   const requestedPanel = ['model', 'binding', 'check'].includes(raw.activePanel) ? raw.activePanel : 'model';
@@ -1699,7 +1710,7 @@ function setSourceAnimationBinding(slot, value) {
     variants: [{ index: animation.index, name: animation.name, weight: 10 }],
     playback: normalizeOtherPlayback(slot, existing?.playback),
     priority: normalizeEventPriority(slot, existing?.priority),
-    ...(slot.id === 'CS_Idle' ? {
+    ...(slot.id === 'CS_Parked' ? {
       triggerDelaySeconds: normalizeIdleDelaySeconds(existing?.triggerDelaySeconds),
     } : {}),
   });
@@ -3058,7 +3069,7 @@ function playbackOccupyNotice(slot, playback) {
   return `<div class="playback-behavior warning" role="status">
     <div class="playback-behavior-copy">
       <strong>这个事件会一直占住动作</strong>
-      <span>${escapeHtml(slot.label)}只要还亮着就持续激活，保持尾帧会让车模一直定格，待机和行驶动作都播不了。建议改成“播放一次后复位”。</span>
+      <span>${escapeHtml(slot.label)}只要还亮着就持续激活，保持尾帧会让车模一直定格，停车和行驶动作都播不了。建议改成“播放一次后复位”。</span>
     </div>
     <button class="btn small" id="bind-playback-use-once" type="button"><i data-lucide="corner-down-right"></i>改为播放一次后复位</button>
   </div>`;
@@ -3166,9 +3177,9 @@ function otherBindingEditor(slot, binding) {
        <section class="other-playback-config" aria-label="播放设置">
          <div class="other-playback-title"><i data-lucide="settings-2"></i><strong>播放设置</strong></div>
          <div class="other-playback-grid">
-           ${slot.id === 'CS_Idle' ? `<div class="field">
-             <label for="bind-trigger-delay">停车后触发</label>
-             <div class="input-suffix"><input id="bind-trigger-delay" type="number" min="0" max="600" step="1" value="${idleDelay}" /><span>秒</span></div>
+           ${slot.id === 'CS_Parked' ? `<div class="field" title="车停下后先播停车动作，静止满这么多秒才触发久停；最少 ${PARKED_DELAY_MIN_SECONDS} 秒">
+             <label for="bind-trigger-delay">停车多久后触发</label>
+             <div class="input-suffix"><input id="bind-trigger-delay" type="number" min="${PARKED_DELAY_MIN_SECONDS}" max="600" step="1" value="${idleDelay}" /><span>秒</span></div>
            </div>` : ''}
             <div class="field">
               <label for="bind-playback-mode">打开时播放方式</label>

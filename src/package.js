@@ -2507,6 +2507,8 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
     times[frame] = duration * frame / (frameCount - 1);
   }
   const timeAccessor = writeAccessor(state, times, 5126, 'SCALAR', { min: [0], max: [duration] });
+  // 起止一样的骨骼只写两帧常量，时间轴单独一条
+  let holdTimeAccessor = null;
   const output = { name, samplers: [], channels: [] };
   const shared = new Map();
   const keys = new Set([...sourcePose.keys(), ...targetPose.keys()]);
@@ -2526,13 +2528,31 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
     }
     const normalizedStart = path === 'rotation' ? quatNormalize(start) : start;
     const normalizedEnd = path === 'rotation' ? quatNormalize(end) : end;
-    // 起止姿态一样的骨骼在过渡期间根本不动，写进去只是白白多一条通道和一个 accessor。
-    // 角色骨架里手指、面部这类末端骨骼大多如此，砍掉能让包体积和车机解析内存都降一大截。
-    if (poseValuesClose(path, normalizedStart, normalizedEnd)) continue;
     // 同一子网格的一组关节副本显隐值完全一样，共用一个采样器
     const shareKey = `${path}|${normalizedStart.join(',')}|${normalizedEnd.join(',')}`;
     if (shared.has(shareKey)) {
       output.channels.push({ sampler: shared.get(shareKey), target: { node: descriptor.node, path } });
+      continue;
+    }
+    // 起止姿态一样的骨骼也必须写进片段：车机对片段没写到的节点会立刻回到模型静态姿态，
+    // 漏掉手指、面部这类末端骨骼就会在过渡期间闪成 T-pose，转向节点漏掉则会归零朝向。
+    // 这类通道只写两帧常量，同值的关节副本共用采样器，开销远小于 6 帧插值。
+    // 常量恰好就是节点静态 TRS 的（骨骼的位移、缩放轨道绝大多数如此）可以不写：引擎复位到静态值和写常量是同一姿态，
+    // 这一条能砍掉过渡片段约七成的通道。
+    if (poseValuesClose(path, normalizedStart, normalizedEnd)) {
+      if (poseValuesClose(path, normalizedEnd, restAnimationValue(node, path))) continue;
+      holdTimeAccessor ??= writeAccessor(state, new Float32Array([0, duration]), 5126, 'SCALAR', { min: [0], max: [duration] });
+      const held = new Float32Array(components * 2);
+      held.set(normalizedEnd, 0);
+      held.set(normalizedEnd, components);
+      const samplerIndex = output.samplers.length;
+      output.samplers.push({
+        input: holdTimeAccessor,
+        output: writeAccessor(state, held, 5126, descriptor.type || (path === 'rotation' ? 'VEC4' : 'VEC3')),
+        interpolation: 'LINEAR',
+      });
+      shared.set(shareKey, samplerIndex);
+      output.channels.push({ sampler: samplerIndex, target: { node: descriptor.node, path } });
       continue;
     }
     const samples = new Float32Array(frameCount * components);
@@ -2553,7 +2573,24 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
     shared.set(shareKey, samplerIndex);
     output.channels.push({ sampler: samplerIndex, target: { node: descriptor.node, path } });
   }
-  return output.channels.length ? output : null;
+  if (!output.channels.length) {
+    // 所有轨道都停在静态姿态（简单模型、首帧就是绑定姿态）时也要留一条占位通道撑起时长，空片段车机没法播
+    const descriptor = [...keys].map((key) => targetPose.get(key) || sourcePose.get(key))
+      .find((item) => item && state.json.nodes?.[item.node]);
+    if (!descriptor) return null;
+    const components = descriptor.path === 'rotation' ? 4 : 3;
+    const value = restAnimationValue(state.json.nodes[descriptor.node], descriptor.path);
+    const held = new Float32Array(components * 2);
+    held.set(value, 0);
+    held.set(value, components);
+    output.samplers.push({
+      input: writeAccessor(state, new Float32Array([0, duration]), 5126, 'SCALAR', { min: [0], max: [duration] }),
+      output: writeAccessor(state, held, 5126, descriptor.type || (components === 4 ? 'VEC4' : 'VEC3')),
+      interpolation: 'LINEAR',
+    });
+    output.channels.push({ sampler: 0, target: { node: descriptor.node, path: descriptor.path } });
+  }
+  return output;
 }
 
 /**
@@ -2632,29 +2669,18 @@ function eventAnimationSet(state, source, slot, binding, variantIndex = 0, reset
  * 选一个真实动作的起手姿态（通常是自然站姿），而不是模型的静态默认姿态——
  * 后者往往是 T-pose，从跑步末帧切过去会非常突兀。
  */
-/** 起止姿态一致时的占位过渡：挑锚点里任意一条轨道写两帧相同姿态，只为撑起时长。 */
+/**
+ * 起止姿态一致时的占位过渡：整段保持这个姿态，只为撑起时长。
+ * 必须把姿态里每一条轨道都写上——车机对片段没写到的节点会回到静态姿态，只写一条会闪成 T-pose。
+ */
 function staticPoseClip(state, pose, name, durationMs) {
-  const duration = Math.max(1 / 60, Number(durationMs) / 1000);
-  const [descriptor] = pose.values();
-  if (!descriptor) return null;
-  const components = descriptor.path === 'rotation' ? 4 : 3;
-  const samples = new Float32Array(components * 2);
-  samples.set(descriptor.value, 0);
-  samples.set(descriptor.value, components);
-  const timeAccessor = writeAccessor(state, new Float32Array([0, duration]), 5126, 'SCALAR', { min: [0], max: [duration] });
-  return {
-    name,
-    samplers: [{
-      input: timeAccessor,
-      output: writeAccessor(state, samples, 5126, descriptor.type || (components === 4 ? 'VEC4' : 'VEC3')),
-      interpolation: 'LINEAR',
-    }],
-    channels: [{ sampler: 0, target: { node: descriptor.node, path: descriptor.path } }],
-  };
+  return poseTransitionClip(state, pose, pose, name, Math.max(1000 / 60, Number(durationMs) || 0));
 }
 
 function anchorRecordOf(eventRecords) {
-  return eventRecords.find((record) => record.slot.id === 'CS_Idle') || eventRecords[0];
+  return eventRecords.find((record) => record.slot.id === 'CS_Idle')
+    || eventRecords.find((record) => record.slot.id === 'CS_Parked')
+    || eventRecords[0];
 }
 
 /** 在 CS_Car 与模型内容之间插一个转向节点，原点放在模型脚下中心（世界原点），转向时原地转不绕圈。 */
@@ -3004,7 +3030,8 @@ async function normalizeAnimatedOtherGlb(
         // 循环类动作每播完当前动画的 rerollCycles 轮重新抽一次；顶层写第 0 条的值给老车机兜底
         ...(spec.onMode === 'loop' ? { reroll: true, rerollCycles: normalizeRerollCycles(target.variants[0].rerollCycles) } : {}),
       } : {}),
-      ...(target.slot.id === 'CS_Idle' ? {
+      // 久停：停车后先播停车动作，静止满这么久车机才启动它；停车（CS_Idle）本身停车即触发，不写延迟
+      ...(target.slot.id === 'CS_Parked' ? {
         triggerDelayMs: normalizeIdleDelaySeconds(target.binding.triggerDelaySeconds) * 1000,
       } : {}),
     };

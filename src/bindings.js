@@ -42,7 +42,8 @@ export const BINDING_SLOTS = [
 
   { id: 'CS_WF', label: '前轮（左右一对）', group: '转动', kind: 'spin', axis: 'z' },
   { id: 'CS_WB', label: '后轮（左右一对）', group: '转动', kind: 'spin', axis: 'z' },
-  { id: 'CS_Idle', label: '待机', group: '移动', kind: 'spin' },
+  { id: 'CS_Idle', label: '停车', group: '移动', kind: 'spin' },
+  { id: 'CS_Parked', label: '久停', group: '移动', kind: 'spin' },
 
   { id: 'CS_LF', label: '左前门', group: '开合', kind: 'hinge', axis: 'y', angle: -45, hinge: 'front' },
   { id: 'CS_RF', label: '右前门', group: '开合', kind: 'hinge', axis: 'y', angle: 45, hinge: 'front' },
@@ -56,7 +57,8 @@ export const SLOT_BY_ID = new Map(BINDING_SLOTS.map((slot) => [slot.id, slot]));
 
 const OTHER_SLOT_PRESENTATION = {
   CS_WF: { label: '前进', group: '移动', trigger: '车辆开始或停止行驶时触发' },
-  CS_Idle: { trigger: '车辆持续静止指定时间后触发，开始行驶时结束' },
+  CS_Idle: { trigger: '车辆停下时立即触发，开始行驶时结束' },
+  CS_Parked: { trigger: '车辆持续静止指定秒数后触发（跳舞、发呆等），开始行驶时结束' },
   CS_LDirection: { trigger: '左转向灯打开时触发' },
   CS_RDirection: { trigger: '右转向灯打开时触发' },
   CS_Emergency: { trigger: '双闪打开时触发' },
@@ -92,6 +94,8 @@ export function slotForMode(slotOrId, modelType = 'vehicle') {
 const OTHER_EVENT_DEFAULTS = {
   // 背景状态：谁来都让位
   CS_Idle: { mode: 'loop', endMode: 'reset', priority: 0 },
+  // 久停压过停车（停够秒数后接管），但一开动就让给前进
+  CS_Parked: { mode: 'loop', endMode: 'reset', priority: 10 },
   CS_WF: { mode: 'loop', endMode: 'reset', priority: 50 },
   CS_WB: { mode: 'loop', endMode: 'reset', priority: 50 },
 
@@ -161,10 +165,13 @@ export function playbackDurationOf(sourceDuration, playback, { cycle = true } = 
   return cycle && normalized.mode === 'pingpong' ? oneWay * 2 : oneWay;
 }
 
+/** 久停事件"停车多久后触发"：最少 5 秒（再短就会立刻盖过停车动作），没填默认 10 秒。 */
+export const PARKED_DELAY_MIN_SECONDS = 5;
+export const PARKED_DELAY_DEFAULT_SECONDS = 10;
 export function normalizeIdleDelaySeconds(value) {
-  if (value === '' || (typeof value === 'string' && value.trim() === '')) return 0;
   const seconds = Number(value);
-  return Number.isFinite(seconds) ? Math.min(600, Math.max(0, Math.round(seconds))) : 0;
+  if (value === '' || value === undefined || value === null || !Number.isFinite(seconds)) return PARKED_DELAY_DEFAULT_SECONDS;
+  return Math.min(600, Math.max(PARKED_DELAY_MIN_SECONDS, Math.round(seconds)));
 }
 
 /**
@@ -175,6 +182,8 @@ export function normalizeIdleDelaySeconds(value) {
  */
 export const EVENT_PRIORITY_LEVELS = [
   { value: 0, label: '最低' },
+  // 久停的默认档：压过停车，但一开动就让给前进
+  { value: 10, label: '次低' },
   { value: 50, label: '较低' },
   { value: 100, label: '普通' },
   { value: 150, label: '较高' },
@@ -321,7 +330,7 @@ const PAGE_HIDDEN_SLOT_IDS = new Set([
 // “其他模型”只需要感知车辆是否正在行驶。地图会同时派发前、后轮事件，
 // 因此统一复用 CS_WF 作为“前进”，隐藏 CS_WB，避免同一骨骼动作被播放两次。
 const OTHER_HIDDEN_SLOT_IDS = new Set(['CS_WB']);
-const OTHER_ONLY_SLOT_IDS = new Set(['CS_Idle']);
+const OTHER_ONLY_SLOT_IDS = new Set(['CS_Idle', 'CS_Parked']);
 
 export function slotGroups(modelType = 'vehicle') {
   const groups = new Map();
