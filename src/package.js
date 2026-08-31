@@ -68,13 +68,14 @@ export async function makeBydCar(options) {
   if (options?.modelType === 'other') return makeAnimatedOtherBydCar(options);
   const {
     sourceBytes, sourceName, transform, stats, bindings, deletions, quality,
-    removeShadow = false, brightness = 1, onProgress,
+    removeShadow = false, brightness = 1, hiddenMaterials = [], onProgress,
   } = options;
   const report = createProgressReporter(onProgress);
   const exportQuality = normalizeExportQuality(quality);
   report(0.02, '正在解析模型');
   await yieldToBrowser();
   const parsed = parseGlb(sourceBytes);
+  dropHiddenSubmeshes(parsed, hiddenMaterials);
   report(0.12, '正在烘焙材质');
   await yieldToBrowser();
   const baked = await bakeMaterialsForVehicle(parsed, brightness);
@@ -168,13 +169,14 @@ export async function makeBydCar(options) {
 
 async function makeAnimatedOtherBydCar({
   sourceBytes, sourceName, transform, stats, bindings, deletions, quality,
-  removeShadow = false, brightness = 1, onProgress,
+  removeShadow = false, brightness = 1, hiddenMaterials = [], onProgress,
 }) {
   const report = createProgressReporter(onProgress);
   const exportQuality = normalizeExportQuality(quality);
   report(0.02, '正在解析模型');
   await yieldToBrowser();
   const parsed = parseGlb(sourceBytes);
+  dropHiddenSubmeshes(parsed, hiddenMaterials);
   if (parsed.json.extensionsRequired?.length) {
     throw new Error(`该模型依赖暂不支持的 glTF 扩展：${parsed.json.extensionsRequired.join(', ')}`);
   }
@@ -2120,10 +2122,14 @@ function bakeCubicSpline(state, sampler, isRotation) {
   const tangentOut = (frame, component) => Number(output.data[(frame * 3 + 2) * components + component]);
 
   const end = times[frameCount - 1];
+  // 固定帧率网格 + 原关键帧时刻（贴得太近的网格点让位给关键帧）
   const grid = [];
-  for (let frame = 0; times[0] + frame / SPLINE_BAKE_FPS < end; frame++) grid.push(times[0] + frame / SPLINE_BAKE_FPS);
-  const sampleTimes = [...grid, ...times].sort((a, b) => a - b)
-    .filter((time, index, list) => index === 0 || time - list[index - 1] > 1e-4);
+  for (let frame = 0; ; frame++) {
+    const time = times[0] + frame / SPLINE_BAKE_FPS;
+    if (time >= end) break;
+    if (times.every((key) => Math.abs(key - time) > 1e-4)) grid.push(time);
+  }
+  const sampleTimes = [...grid, ...times].sort((a, b) => a - b);
 
   const values = new Float32Array(sampleTimes.length * components);
   let segment = 0;
@@ -2321,6 +2327,8 @@ function trimmedAnimationClip(state, source, startRatio, endRatio, speed, name) 
   const start = duration * startRatio;
   const end = duration * endRatio;
   const output = { name, samplers: [], channels: [] };
+  // 子网格显隐这类通道成百条共用一个采样器，裁剪后也要继续共用，否则 accessor 数量会爆
+  const shared = new Map();
   for (const channel of source.channels || []) {
     const target = channel.target || {};
     const sampler = source.samplers?.[channel.sampler];
@@ -2329,6 +2337,11 @@ function trimmedAnimationClip(state, source, startRatio, endRatio, speed, name) 
     const path = target.path;
     if (!sampler || !['translation', 'rotation', 'scale'].includes(path)) {
       throw new Error(`${name}：动画关键帧数据无效`);
+    }
+    const shareKey = `${channel.sampler}|${path}`;
+    if (shared.has(shareKey)) {
+      output.channels.push({ sampler: shared.get(shareKey), target: { node: target.node, path } });
+      continue;
     }
     const expectedComponents = path === 'rotation' ? 4 : 3;
     const normalized = normalizeAnimationSamplerData(
@@ -2365,6 +2378,7 @@ function trimmedAnimationClip(state, source, startRatio, endRatio, speed, name) 
       output: writeAccessor(state, sampled, 5126, values.accessor.type),
       interpolation: sampler.interpolation || 'LINEAR',
     });
+    shared.set(shareKey, samplerIndex);
     output.channels.push({ sampler: samplerIndex, target: { node: target.node, path } });
   }
   return output;
@@ -2488,6 +2502,7 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
   }
   const timeAccessor = writeAccessor(state, times, 5126, 'SCALAR', { min: [0], max: [duration] });
   const output = { name, samplers: [], channels: [] };
+  const shared = new Map();
   const keys = new Set([...sourcePose.keys(), ...targetPose.keys()]);
   for (const key of keys) {
     const source = sourcePose.get(key);
@@ -2508,6 +2523,12 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
     // 起止姿态一样的骨骼在过渡期间根本不动，写进去只是白白多一条通道和一个 accessor。
     // 角色骨架里手指、面部这类末端骨骼大多如此，砍掉能让包体积和车机解析内存都降一大截。
     if (poseValuesClose(path, normalizedStart, normalizedEnd)) continue;
+    // 同一子网格的一组关节副本显隐值完全一样，共用一个采样器
+    const shareKey = `${path}|${normalizedStart.join(',')}|${normalizedEnd.join(',')}`;
+    if (shared.has(shareKey)) {
+      output.channels.push({ sampler: shared.get(shareKey), target: { node: descriptor.node, path } });
+      continue;
+    }
     const samples = new Float32Array(frameCount * components);
     for (let frame = 0; frame < frameCount; frame++) {
       const progress = frame / (frameCount - 1);
@@ -2523,6 +2544,7 @@ function poseTransitionClip(state, sourcePose, targetPose, name, durationMs) {
       output: writeAccessor(state, samples, 5126, descriptor.type || (path === 'rotation' ? 'VEC4' : 'VEC3')),
       interpolation: 'LINEAR',
     });
+    shared.set(shareKey, samplerIndex);
     output.channels.push({ sampler: samplerIndex, target: { node: descriptor.node, path } });
   }
   return output.channels.length ? output : null;
@@ -2641,6 +2663,7 @@ function pickAnchorPose(state, eventRecords) {
  * 因此 manifest 结构和车机状态机都不用改，只是基准姿态从模型默认姿态换成了锚点。
  */
 function buildAnchorClips(state, eventRecords, phases) {
+  if (!eventRecords.length) return [];
   const anchor = pickAnchorPose(state, eventRecords);
   const clips = [];
   for (const record of eventRecords) {
@@ -4022,6 +4045,270 @@ async function applyBindings(state, bindings, sourceRoots, bake) {
   return result;
 }
 
+/** 去掉用户隐藏的子网格（按材质下标），并清理不再被引用的材质。 */
+function dropHiddenSubmeshes(parsed, hiddenMaterials) {
+  const hidden = new Set(hiddenMaterials || []);
+  if (!hidden.size) return;
+  const { json } = parsed;
+  const used = new Set();
+  for (const mesh of json.meshes || []) {
+    mesh.primitives = (mesh.primitives || []).filter((primitive) => !hidden.has(primitive.material));
+    for (const primitive of mesh.primitives) if (Number.isInteger(primitive.material)) used.add(primitive.material);
+  }
+  for (const node of json.nodes || []) {
+    if (Number.isInteger(node.mesh) && json.meshes[node.mesh]?.primitives.length === 0) {
+      delete node.mesh;
+      delete node.skin;
+    }
+  }
+  const remap = new Map();
+  json.materials = (json.materials || []).filter((_, index) => {
+    if (!used.has(index)) return false;
+    remap.set(index, remap.size);
+    return true;
+  });
+  for (const mesh of json.meshes || []) {
+    for (const primitive of mesh.primitives) {
+      if (Number.isInteger(primitive.material)) primitive.material = remap.get(primitive.material);
+    }
+  }
+}
+
+const VISIBILITY_FPS = 30;
+const HIDDEN_SCALE = 0.001;
+
+/**
+ * modelviewer.lol 这类站点导出的 GLB 会把游戏里的子网格显隐规则写在 extras 里：
+ * 材质 extras.visible / hash 是默认显隐与标识，骨架节点 extras.submeshVisibilityEvents
+ * 按动画名列出整段或 [startFrame, endFrame] 帧内要显示/隐藏的子网格（30fps）。
+ * glTF 没有可见性通道，这里把它烘焙成标准 TRS：每个会切换的子网格独占一份关节副本
+ * （副本挂在原关节下、局部变换为单位阵，蒙皮结果不变），隐藏时把副本缩到 0.001。
+ * 预览、导出和车机于是都只看到普通的 scale 动画通道，不需要任何运行时支持。
+ */
+export function bakeSubmeshVisibility(bytes) {
+  const state = parseGlb(bytes);
+  const { json } = state;
+  if (json.asset?.extras?.bydSubmeshVisibility) return bytes;
+  const events = (json.nodes || []).find((node) => node.extras?.submeshVisibilityEvents)
+    ?.extras.submeshVisibilityEvents || {};
+  const materialByHash = new Map();
+  const toggled = new Set();
+  (json.materials || []).forEach((material, index) => {
+    if (Number.isInteger(material.extras?.hash)) materialByHash.set(material.extras.hash, index);
+    if (material.extras?.visible === false) toggled.add(index);
+  });
+  for (const list of Object.values(events)) {
+    for (const event of list) {
+      for (const hash of [...(event.showSubmeshList || []), ...(event.hideSubmeshList || [])]) {
+        if (materialByHash.has(hash)) toggled.add(materialByHash.get(hash));
+      }
+    }
+  }
+  if (!toggled.size) return bytes;
+
+  const targets = splitToggledSubmeshes(state, toggled);
+  for (const [materialIndex, nodes] of targets) {
+    if (json.materials[materialIndex].extras?.visible !== false) continue;
+    for (const nodeIndex of nodes) json.nodes[nodeIndex].scale = [HIDDEN_SCALE, HIDDEN_SCALE, HIDDEN_SCALE];
+  }
+  for (const animation of json.animations || []) {
+    animation.samplers ||= [];
+    animation.channels ||= [];
+    const duration = animationDurationOf(state, animation);
+    for (const [materialIndex, nodes] of targets) {
+      const material = json.materials[materialIndex];
+      const keys = visibilityKeyframes(
+        material.extras?.visible !== false,
+        submeshEvents(events[animation.name], material.extras?.hash),
+        duration,
+      );
+      const times = Float32Array.from(keys.map((key) => key.time));
+      const values = new Float32Array(keys.length * 3);
+      keys.forEach((key, index) => values.fill(key.visible ? 1 : HIDDEN_SCALE, index * 3, index * 3 + 3));
+      const samplerIndex = animation.samplers.length;
+      animation.samplers.push({
+        input: writeAccessor(state, times, 5126, 'SCALAR', { min: [times[0]], max: [times[times.length - 1]] }),
+        output: writeAccessor(state, values, 5126, 'VEC3'),
+        interpolation: 'LINEAR',
+      });
+      for (const nodeIndex of nodes) animation.channels.push({ sampler: samplerIndex, target: { node: nodeIndex, path: 'scale' } });
+    }
+  }
+  json.asset.extras = { ...(json.asset.extras || {}), bydSubmeshVisibility: 1 };
+  return buildGlb(json, state.bin);
+}
+
+/**
+ * 把会切换显隐的 primitive 拆到自己的节点上，返回 材质 → 控制显隐的节点列表。
+ * 蒙皮子网格要能整块缩成一点，必须让它独占整条骨骼祖先链：克隆用到的关节及全部祖先，
+ * 在链顶插一个可见性根节点，缩放这个根节点即可（原网格全部可切换时第一块直接沿用原骨架）。
+ * 非蒙皮子网格直接缩放它自己的节点。
+ */
+function splitToggledSubmeshes(state, toggled) {
+  const { json } = state;
+  const parents = parentMapOf(json);
+  const meshNodes = new Set((json.nodes || []).flatMap((node, index) => (Number.isInteger(node.mesh) ? [index] : [])));
+  const targets = new Map();
+  const handledMeshes = new Set();
+  const nodeCount = json.nodes.length;
+  for (let nodeIndex = 0; nodeIndex < nodeCount; nodeIndex++) {
+    const node = json.nodes[nodeIndex];
+    const mesh = json.meshes?.[node.mesh];
+    if (!mesh || handledMeshes.has(node.mesh)) continue;
+    handledMeshes.add(node.mesh);
+    // 先按站点给的 renderOrder 排好绘制顺序，表情贴片才能压在脸皮上面
+    const orderOf = (primitive) => json.materials?.[primitive.material]?.extras?.renderOrder ?? 0;
+    mesh.primitives = [...(mesh.primitives || [])].sort((a, b) => orderOf(a) - orderOf(b));
+    const skin = json.skins?.[node.skin];
+    const kept = mesh.primitives.filter((primitive) => !toggled.has(primitive.material));
+    const moved = mesh.primitives.filter((primitive) => toggled.has(primitive.material));
+    // 原骨架只有在没人再用时才能直接给第一块可切换子网格独占
+    const skeletonFree = !kept.length
+      && !json.nodes.some((other, index) => index !== nodeIndex && other.skin === node.skin);
+    // 可见性根不能越过网格节点及其祖先，否则会把别的网格一起缩掉
+    const climbLimit = new Set(meshNodes);
+    for (let current = nodeIndex; current !== undefined; current = parents.get(current)) climbLimit.add(current);
+    const siblings = [];
+    moved.forEach((primitive, order) => {
+      const label = json.materials[primitive.material].name || `material${primitive.material}`;
+      const controls = [];
+      let skinIndex = node.skin;
+      if (skin) {
+        const slots = usedJointSlots(state, primitive);
+        const usedJoints = slots.map((slot) => skin.joints[slot]);
+        let roots;
+        if (order === 0 && skeletonFree) {
+          roots = jointRootsBelow(usedJoints, parents, climbLimit);
+        } else {
+          const cloned = cloneSkinSkeleton(json, usedJoints, parents, `·${label}`);
+          duplicateAnimationChannelsForNodeMap(json, cloned.cloneMap);
+          const joints = skin.joints.slice();
+          slots.forEach((slot, index) => { joints[slot] = cloned.joints[index]; });
+          skinIndex = json.skins.length;
+          json.skins.push({ ...skin, joints });
+          roots = [...cloned.cloneMap]
+            .filter(([source]) => !cloned.cloneMap.has(parents.get(source)))
+            .map(([, clone]) => clone);
+        }
+        controls.push(...insertVisibilityRoots(json, roots, label));
+      }
+      const { children: ignoredChildren, mesh: ignoredMesh, skin: ignoredSkin, extras: ignoredExtras, name, ...transform } = node;
+      const sibling = json.nodes.length;
+      json.nodes.push({
+        ...structuredClone(transform),
+        name: `${name || 'node'}·${label}`,
+        mesh: json.meshes.length,
+        ...(Number.isInteger(skinIndex) ? { skin: skinIndex } : {}),
+      });
+      json.meshes.push({ name: `${mesh.name || 'mesh'}·${label}`, primitives: [primitive] });
+      if (!controls.length) controls.push(sibling);
+      siblings.push(sibling);
+      targets.set(primitive.material, [...(targets.get(primitive.material) || []), ...controls]);
+    });
+    mesh.primitives = kept;
+    if (!kept.length) {
+      delete node.mesh;
+      delete node.skin;
+    }
+    attachSiblingNodes(json, nodeIndex, siblings);
+  }
+  return targets;
+}
+
+/** 每根关节沿父链向上爬到不能再爬（越界或到顶）的那个节点，去重后就是这块骨架的根。 */
+function jointRootsBelow(joints, parents, limit) {
+  const roots = new Set();
+  for (const joint of joints) {
+    let current = joint;
+    while (parents.has(current) && !limit.has(parents.get(current))) current = parents.get(current);
+    roots.add(current);
+  }
+  return [...roots];
+}
+
+/** 在这些根节点与它们的父级之间插入一个可见性节点；根若分属不同父级，则每个父级各插一个。 */
+function insertVisibilityRoots(json, roots, label) {
+  const rootSet = new Set(roots);
+  const groups = new Map();
+  const scan = (list) => {
+    const found = list.filter((index) => rootSet.has(index));
+    if (found.length) groups.set(list, found);
+  };
+  for (const node of json.nodes) if (node.children) scan(node.children);
+  for (const scene of json.scenes || []) if (scene.nodes) scan(scene.nodes);
+  const controls = [];
+  for (const [list, found] of groups) {
+    const control = json.nodes.length;
+    json.nodes.push({ name: `${label}·visibility`, children: found });
+    list.splice(list.indexOf(found[0]), 1, control);
+    for (const root of found.slice(1)) list.splice(list.indexOf(root), 1);
+    controls.push(control);
+  }
+  return controls;
+}
+
+/** primitive 实际用到（权重 > 0）的关节槽位，按 JOINTS_n/WEIGHTS_n 全部集合取并集。 */
+function usedJointSlots(state, primitive) {
+  const indices = readAccessorData(state, primitive.indices);
+  const vertexCount = state.json.accessors?.[primitive.attributes?.POSITION]?.count || 0;
+  const vertices = indices ? indices.data : Array.from({ length: vertexCount }, (_, index) => index);
+  const slots = new Set();
+  for (let set = 0; ; set++) {
+    const joints = readAccessorData(state, primitive.attributes?.[`JOINTS_${set}`]);
+    const weights = readAccessorData(state, primitive.attributes?.[`WEIGHTS_${set}`]);
+    if (!joints || !weights) break;
+    for (const vertex of vertices) {
+      for (let component = 0; component < joints.comps; component++) {
+        if (weights.data[vertex * weights.comps + component] > 0) slots.add(joints.data[vertex * joints.comps + component]);
+      }
+    }
+  }
+  return [...slots].sort((a, b) => a - b);
+}
+
+/** 某段动画里与该子网格相关的事件：整段或 [start, end] 帧内显示/隐藏。 */
+function submeshEvents(list, hash) {
+  const result = [];
+  for (const event of list || []) {
+    const show = (event.showSubmeshList || []).includes(hash);
+    const hide = (event.hideSubmeshList || []).includes(hash);
+    if (show !== hide) result.push({ visible: show, start: event.startFrame, end: event.endFrame });
+  }
+  return result;
+}
+
+/**
+ * 帧事件 → 关键帧：默认状态叠加整段事件得到基线，分帧事件在区间内覆盖。
+ * 状态切换用相邻 1ms 的两个关键帧模拟阶跃，LINEAR 插值在任何引擎上都成立。
+ */
+function visibilityKeyframes(defaultVisible, events, duration) {
+  let base = defaultVisible;
+  const timed = [];
+  for (const event of events) {
+    if (!Number.isInteger(event.start)) {
+      base = event.visible;
+      continue;
+    }
+    const start = Math.min(duration, event.start / VISIBILITY_FPS);
+    const end = Number.isInteger(event.end) ? Math.min(duration, (event.end + 1) / VISIBILITY_FPS) : duration;
+    if (end > start) timed.push({ start, end, visible: event.visible });
+  }
+  const stateAt = (time) => timed.reduce(
+    (visible, event) => (time >= event.start && time < event.end ? event.visible : visible),
+    base,
+  );
+  const points = [...new Set(timed.flatMap((event) => [event.start, event.end]))].sort((a, b) => a - b);
+  const keys = [{ time: 0, visible: stateAt(0) }];
+  for (const time of points) {
+    const last = keys[keys.length - 1];
+    const visible = stateAt(time);
+    if (time <= last.time || visible === last.visible) continue;
+    keys.push({ time: Math.max(last.time + 0.0005, time - 0.001), visible: last.visible }, { time, visible });
+  }
+  if (duration > keys[keys.length - 1].time) keys.push({ time: duration, visible: keys[keys.length - 1].visible });
+  return keys;
+}
+
 function parseGlb(bytes) {
   const data = new Uint8Array(bytes);
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -4233,12 +4520,14 @@ export async function makeVehiclePreviewGlb(
   removeShadow = false,
   brightness = 1,
   onProgress = null,
+  hiddenMaterials = [],
 ) {
   const report = createProgressReporter(onProgress);
   const exportQuality = normalizeExportQuality(quality);
   report(0.02, '正在解析模型');
   await yieldToBrowser();
   const parsed = parseGlb(sourceBytes);
+  dropHiddenSubmeshes(parsed, hiddenMaterials);
   report(0.12, '正在烘焙材质');
   await yieldToBrowser();
   const baked = await bakeMaterialsForVehicle(parsed, brightness);

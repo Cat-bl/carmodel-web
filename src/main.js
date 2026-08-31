@@ -1,6 +1,7 @@
 import './style.css';
 import { ModelPreview } from './preview.js';
-import { makeBydCar, makeVehiclePreviewGlb } from './package.js';
+import { bakeSubmeshVisibility, makeBydCar, makeVehiclePreviewGlb } from './package.js';
+import { listSubmeshes, recommendedHiddenSubmeshes } from './submeshes.js';
 import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
 import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
 import {
@@ -268,6 +269,15 @@ app.innerHTML = `
               <button class="btn" id="delete-start" disabled><i data-lucide="trash-2"></i>框选删除区域</button>
               <div id="delete-panel"></div>
             </section>
+            <section class="tool-section" id="submesh-section" hidden>
+              <div class="section-title"><h3>子网格显隐</h3><span id="submesh-summary"></span></div>
+              <p class="hint" id="submesh-hint">取消勾选会把该子网格从预览和导出里剔除；模型自带的按动画显隐规则会自动生效。</p>
+              <div class="submesh-list" id="submesh-list"></div>
+              <div class="quick-row">
+                <button class="btn small" id="submesh-show-all">全部显示</button>
+                <button class="btn small" id="submesh-recommend">恢复推荐</button>
+              </div>
+            </section>
           </div>
         </section>
 
@@ -402,6 +412,7 @@ const ui = Object.fromEntries([
   'mode-web-mobile', 'mode-device-mobile',
   'binding-groups', 'binding-summary', 'binding-editor-host', 'binding-editor-title', 'demo-all', 'other-mode-note',
   'delete-start', 'delete-panel', 'delete-summary', 'undo', 'redo', 'dirty-state',
+  'submesh-section', 'submesh-summary', 'submesh-list', 'submesh-show-all', 'submesh-recommend',
   'workspace-triangles', 'workspace-selection', 'workspace-mode', 'workspace-index',
   'import-progress', 'import-progress-label', 'import-progress-percent', 'import-progress-bar',
   'binding-back', 'quality-summary', 'quality-custom', 'quality-triangles', 'quality-texture-size',
@@ -504,6 +515,9 @@ function resetWorkspaceForTypeSelection() {
   customQuality.textureMaxSize = 4096;
   deletions = [];
   deleteDraft = null;
+  submeshes = [];
+  hiddenSubmeshes = new Set();
+  renderSubmeshPanel();
   bindings.clear();
   bindableAnimations = [];
   openSlot = null;
@@ -919,7 +933,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
     const quality = exportQuality();
     const cacheKey = JSON.stringify({
       modelType, transform, bindings: previewBindings, deletions: previewDeletions,
-      quality, removeShadow, modelBrightness,
+      quality, removeShadow, modelBrightness, hidden: [...hiddenSubmeshes],
     });
     if (device && (!deviceGlbCache || deviceGlbCacheKey !== cacheKey)) {
       ui['mode-device'].textContent = '烘焙中…';
@@ -935,6 +949,7 @@ async function applyPreviewMode(device, requestId, bindingPhase) {
         removeShadow,
         modelBrightness,
         updateImportProgress,
+        [...hiddenSubmeshes],
       );
       if (requestId !== previewModeRequestId) return false;
       deviceGlbCache = nextDeviceGlb;
@@ -1088,6 +1103,8 @@ async function activatePreparedModel(prepared, {
   ui['remove-shadow'].checked = removeShadow;
   preview.setRemoveShadow(removeShadow);
   updateModelTypeUi();
+  // 站点导出的模型自带按动画显隐子网格的规则，先烘成标准动画通道，预览/导出/项目文件才一致
+  prepared = { ...prepared, bytes: bakeSubmeshVisibility(prepared.bytes) };
   const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {
     updateImportProgress({ progress: previewProgressStart + progress * previewProgressScale, label, indeterminate });
   }, { modelType: activeModelType });
@@ -1102,6 +1119,10 @@ async function activatePreparedModel(prepared, {
     modelType: activeModelType,
   };
   bindableAnimations = activeModelType === 'other' ? preview.listBindableAnimations() : [];
+  submeshes = listSubmeshes(preview.gltfJson);
+  // 项目恢复时以项目里存的为准（restoreSnapshot 会覆盖）；新导入按命名规则给默认隐藏
+  hiddenSubmeshes = editorState ? new Set() : recommendedHiddenSubmeshes(submeshes);
+  applyHiddenSubmeshes();
   projectSaved = Boolean(editorState);
   ui['file-name'].textContent = displayName || prepared.name;
   setDirty(false);
@@ -1139,6 +1160,9 @@ async function activatePreparedModel(prepared, {
   validateStats(loaded.stats, loaded.orientation, prepared);
   setDirty(false);
   updateImportProgress({ progress: 1, label: editorState ? '项目恢复完成' : '模型导入完成' });
+  if (!editorState && hiddenSubmeshes.size) {
+    showMessage(`已自动剔除 ${hiddenSubmeshes.size} 个从不显示的子网格，可在「子网格显隐」里恢复`, 'info', { duration: 6000 });
+  }
 }
 
 function beginFileLoad(displayName, label) {
@@ -1304,6 +1328,7 @@ function normalizeProjectState(raw) {
   return {
     bindings: bindingsState,
     deletions: Array.isArray(raw.deletions) ? structuredClone(raw.deletions) : [],
+    hiddenSubmeshes: Array.isArray(raw.hiddenSubmeshes) ? raw.hiddenSubmeshes.filter(Number.isInteger) : [],
     rotation: validNumberArray(raw.rotation, 3) ? raw.rotation.map(Number) : [0, 0, 0],
     targetLength: finiteNumber(raw.targetLength, 5.2),
     heightOffset: finiteNumber(raw.heightOffset, 0),
@@ -1791,6 +1816,7 @@ function captureSnapshot() {
   return {
     bindings: [...bindings.entries()].map(([id, binding]) => [id, structuredClone(binding)]),
     deletions: structuredClone(deletions),
+    hiddenSubmeshes: [...hiddenSubmeshes],
     rotation: ['x', 'y', 'z'].map((axis) => Number(ui[`rotation-${axis}`].value) || 0),
     targetLength: Number(ui['target-length'].value) || 5.2,
     heightOffset: Number(ui['height-offset'].value) || 0,
@@ -1887,6 +1913,8 @@ function restoreSnapshot(snap, { markDirty = true } = {}) {
   bindings.clear();
   for (const [id, binding] of snap.bindings) bindings.set(id, binding);
   deletions = snap.deletions;
+  hiddenSubmeshes = new Set(snap.hiddenSubmeshes || []);
+  applyHiddenSubmeshes();
   ['x', 'y', 'z'].forEach((axis, i) => {
     ui[`rotation-${axis}`].value = snap.rotation[i];
     preview.rotation[axis] = snap.rotation[i];
@@ -1974,6 +2002,54 @@ document.addEventListener('keydown', (event) => {
 /* ---------- 删除多余部分 ---------- */
 
 let deletions = [];
+let submeshes = [];
+let hiddenSubmeshes = new Set();
+
+function applyHiddenSubmeshes() {
+  const known = new Set(submeshes.map((item) => item.materialIndex));
+  hiddenSubmeshes = new Set([...hiddenSubmeshes].filter((index) => known.has(index)));
+  preview.setHiddenMaterials([...hiddenSubmeshes]);
+  renderSubmeshPanel();
+}
+
+function renderSubmeshPanel() {
+  ui['submesh-section'].hidden = submeshes.length < 2;
+  ui['submesh-summary'].textContent = hiddenSubmeshes.size
+    ? `已隐藏 ${hiddenSubmeshes.size} / ${submeshes.length}`
+    : `共 ${submeshes.length} 个`;
+  ui['submesh-list'].innerHTML = submeshes.map((item) => {
+    const hidden = hiddenSubmeshes.has(item.materialIndex);
+    const note = item.defaultVisible ? '' : (item.animated ? '默认隐藏 · 动画中显示' : '默认隐藏 · 没有动画会显示');
+    return `
+      <label class="submesh-row${hidden ? ' hidden' : ''}" data-submesh-row="${item.materialIndex}">
+        <input type="checkbox" data-submesh="${item.materialIndex}"${hidden ? '' : ' checked'} />
+        <span>${escapeHtml(item.name)}${note ? `<em>${note}</em>` : ''}</span><small>${item.triangles.toLocaleString()} 面</small>
+      </label>`;
+  }).join('');
+  ui['submesh-list'].querySelectorAll('[data-submesh-row]').forEach((row) => {
+    const materialIndex = Number(row.dataset.submeshRow);
+    row.querySelector('input').addEventListener('change', (event) => {
+      snapshot({ scope: 'submesh' });
+      if (event.target.checked) hiddenSubmeshes.delete(materialIndex);
+      else hiddenSubmeshes.add(materialIndex);
+      applyHiddenSubmeshes();
+    });
+    row.addEventListener('mouseenter', () => preview.highlightSubmesh(materialIndex));
+    row.addEventListener('mouseleave', () => preview.clearHighlight());
+  });
+}
+
+ui['submesh-show-all'].addEventListener('click', () => {
+  if (!hiddenSubmeshes.size) return;
+  snapshot({ scope: 'submesh' });
+  hiddenSubmeshes.clear();
+  applyHiddenSubmeshes();
+});
+ui['submesh-recommend'].addEventListener('click', () => {
+  snapshot({ scope: 'submesh' });
+  hiddenSubmeshes = recommendedHiddenSubmeshes(submeshes);
+  applyHiddenSubmeshes();
+});
 let deleteDraft = null;
 let deleteMode = 'translate';
 
@@ -3944,6 +4020,7 @@ async function generatePackage() {
       quality,
       removeShadow,
       brightness: modelBrightness,
+      hiddenMaterials: [...hiddenSubmeshes],
       onProgress: updateImportProgress,
     });
     const blob = new Blob([result.bytes], { type: 'application/octet-stream' });

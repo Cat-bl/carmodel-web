@@ -204,6 +204,22 @@ function readFileWithProgress(file, onProgress) {
   });
 }
 
+/**
+ * 游戏模型常把剪切贴图标成 BLEND，three 会因此关掉深度写入：同一节点里后画的面会盖住先画的贴片
+ * （脸皮盖掉眼睛、头发盖掉蝴蝶结）。恢复深度写入并丢弃全透明像素，效果与游戏内一致。
+ */
+function fixTransparentMaterials(root) {
+  root.traverse((child) => {
+    if (!child.isMesh) return;
+    for (const material of Array.isArray(child.material) ? child.material : [child.material]) {
+      if (!material?.transparent) continue;
+      material.depthWrite = true;
+      if (!(material.alphaTest > 0)) material.alphaTest = 0.05;
+      material.needsUpdate = true;
+    }
+  });
+}
+
 export class ModelPreview {
   constructor(canvas, onStats) {
     this.canvas = canvas;
@@ -499,9 +515,12 @@ export class ModelPreview {
     this.disposeModel();
     this.original = bytes.slice(0);
     this.deviceMode = false;
+    this.hiddenMaterials = null;
     this.model = gltf.scene;
     this.loadedAnimations = gltf.animations || [];
     this.model.name = 'CS_Car';
+    this.otherModel = modelType === 'other';
+    if (this.otherModel) fixTransparentMaterials(this.model);
     this.scene.add(this.model);
     this.applyModelBrightness();
     this.syncModelShadowVisibility();
@@ -606,6 +625,50 @@ export class ModelPreview {
    * 多 primitive 的节点会被 GLTFLoader 展开成 Group + 若干子 Mesh，
    * 直接用 isMesh 判断会漏掉它们；这里的口径与导出端 extractPart 一致。
    */
+  /** 隐藏指定材质的子网格（按源 glTF 材质下标）；车机质感预览用的是已剔除的导出结果，不需要再隐藏。 */
+  setHiddenMaterials(materialIndices) {
+    this.hiddenMaterials = new Set(materialIndices || []);
+    this.applyHiddenMaterials();
+  }
+
+  applyHiddenMaterials() {
+    if (!this.model || this.deviceMode || !this.gltfJson) return;
+    for (const [mesh, meta] of this.selectionMeshes) {
+      mesh.visible = !this.hiddenMaterials?.has(this.primitiveOf(meta)?.material);
+    }
+  }
+
+  primitiveOf({ nodeIndex, primitiveIndex }) {
+    const meshIndex = this.gltfJson?.nodes?.[nodeIndex]?.mesh;
+    return this.gltfJson?.meshes?.[meshIndex]?.primitives?.[primitiveIndex];
+  }
+
+  /** 鼠标悬停子网格列表时框出该材质的所有网格。 */
+  highlightSubmesh(materialIndex) {
+    this.clearHighlight();
+    if (!this.model || this.deviceMode || !this.gltfJson) return;
+    this.model.updateMatrixWorld(true);
+    const box = new THREE.Box3();
+    const temp = new THREE.Vector3();
+    for (const [mesh, meta] of this.selectionMeshes) {
+      if (this.primitiveOf(meta)?.material === materialIndex) this.expandByMeshVertices(box, mesh, temp);
+    }
+    this.showHighlightBox(box);
+  }
+
+  /** 游戏模型的各子网格常共用一份顶点缓冲，几何包围盒是全身；只取该网格索引到的顶点，并带上蒙皮变换。 */
+  expandByMeshVertices(box, mesh, point) {
+    const position = mesh.geometry?.attributes?.position;
+    if (!position) return;
+    const index = mesh.geometry.index;
+    const vertices = index ? new Set(index.array) : Array.from({ length: position.count }, (_, i) => i);
+    for (const vertex of vertices) {
+      point.fromBufferAttribute(position, vertex);
+      if (mesh.isSkinnedMesh) mesh.applyBoneTransform(vertex, point);
+      box.expandByPoint(point.applyMatrix4(mesh.matrixWorld));
+    }
+  }
+
   meshesOfNode(index) {
     const object = this.nodeObjects?.[index];
     if (!object) return [];
@@ -1630,6 +1693,10 @@ export class ModelPreview {
     for (const index of nodeIndices || []) {
       for (const mesh of this.meshesOfNode(index)) this.expandByMeshGeometry(box, mesh, temp);
     }
+    this.showHighlightBox(box);
+  }
+
+  showHighlightBox(box) {
     if (box.isEmpty()) return;
     const helper = new THREE.Box3Helper(box, 0x1769e0);
     helper.material.depthTest = false;
@@ -1774,7 +1841,7 @@ export class ModelPreview {
     for (let nodeIndex = 0; nodeIndex < (this.nodeObjects || []).length; nodeIndex++) {
       for (const object of this.meshesOfNode(nodeIndex)) {
         const position = object.geometry?.attributes?.position;
-        if (!position) continue;
+        if (!position || !object.visible) continue;
         const index = object.geometry.index;
         const count = index ? index.count : position.count;
         const matrix = object.matrixWorld;
@@ -2001,6 +2068,7 @@ export class ModelPreview {
     this.model = gltf.scene;
     this.model.name = 'CS_Car';
     this.loadedAnimations = gltf.animations || [];
+    if (this.otherModel) fixTransparentMaterials(this.model);
     if (enabled) {
       this.model.traverse((child) => {
         if (!child.isMesh || !child.material) return;
@@ -2012,6 +2080,7 @@ export class ModelPreview {
           transparent: material.transparent || false,
           opacity: material.opacity ?? 1,
           depthWrite: material.depthWrite !== false,
+          alphaTest: material.alphaTest || 0,
           side: material.side,
         }));
         if (child.material.length === 1) child.material = child.material[0];
@@ -2042,6 +2111,7 @@ export class ModelPreview {
     }
     // 模型换了实例，节点映射必须重建，否则联动预览会指向已废弃的对象
     await this.indexNodes(gltf);
+    this.applyHiddenMaterials();
   }
 
   setRotation(axis, degrees) {
