@@ -2612,11 +2612,15 @@ function eventAnimationSet(state, source, slot, binding, variantIndex = 0, reset
   };
 }
 
-/** 该动画实际驱动到的节点集合；两个事件的集合不相交就能同时播放。 */
-function animationNodeIndices(animation) {
+/** 该事件所有动画驱动到的节点集合；两个事件的集合不相交就能同时播放。 */
+function eventNodeIndices(record) {
   const nodes = new Set();
-  for (const channel of animation?.channels || []) {
-    if (Number.isInteger(channel.target?.node)) nodes.add(channel.target.node);
+  // 必须并上事件下每一条动画的节点：随机播到哪条都可能抢节点，
+  // 只看代表动作会漏判冲突，把本该互斥的两个事件放进不同槽并行。
+  for (const variant of record.variants) {
+    for (const channel of variant.active?.channels || []) {
+      if (Number.isInteger(channel.target?.node)) nodes.add(channel.target.node);
+    }
   }
   return nodes;
 }
@@ -2641,7 +2645,7 @@ function setsIntersect(a, b) {
  * 第一个分量沿用历史槽名 CS_Car，保证单动作模型导出结果与旧版完全一致。
  */
 function assignEventPartSlots(eventRecords) {
-  const nodeSets = eventRecords.map((record) => animationNodeIndices(record.active));
+  const nodeSets = eventRecords.map(eventNodeIndices);
   const parent = eventRecords.map((_, index) => index);
   const find = (index) => {
     let cursor = index;
@@ -2728,15 +2732,27 @@ async function normalizeAnimatedOtherGlb(
       );
       await yieldToBrowser();
     }
-    // 事件间过渡只按第 0 条动画（代表变体）预烘：按变体两两生成会组合爆炸，
-    // 而同一角色各动作的起手姿态本来就接近，切到其它变体最多一点点跳变。
-    eventRecords.push({ slot, binding, variants: built, ...built[0] });
+    // 展开代表变体让后续逻辑照旧按单动画取用；显式字段放最后，免得被同名键覆盖
+    eventRecords.push({ ...built[0], slot, binding, variants: built });
   }
 
   // 互不抢节点的事件分到不同播放槽后可以同时播放，只有同槽事件才需要互相切换。
   const partCount = assignEventPartSlots(eventRecords);
-  const sameSlotPairs = (target) => eventRecords
-    .filter((source) => source.slot.id !== target.slot.id && source.part === target.part);
+
+  /**
+   * 预烘过渡的前提是"这个事件的起止姿态是确定的"，所以两端都必须只挂一条动画。
+   *
+   * 挂了多条时每次随机播哪条并不确定，而过渡只能按其中一条（代表动作）烘：
+   * 作为目标时终点对不上实际抽中的那条，作为来源时起点对不上它正在播的那条，
+   * 都会导致切换瞬间突跳（实测同一角色不同动作的首帧平均能差二十几度）。
+   * 这种事件干脆不写 transitions，车机 transitionFor 找不到就会自动改用
+   * 该变体自己的 ENTER 从默认姿态淡入——稍生硬，但姿态一定接得上。
+   */
+  const canPrebakeTransition = (record) => record.variants.length === 1;
+  const sameSlotPairs = (target) => (canPrebakeTransition(target)
+    ? eventRecords.filter((source) => source.slot.id !== target.slot.id
+      && source.part === target.part && canPrebakeTransition(source))
+    : []);
 
   // 为每一对同槽事件生成切换过渡。过渡时长取目标事件的设置，因此用户
   // 可以单独控制“切入左转”与“恢复前进”的速度。
