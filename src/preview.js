@@ -4,6 +4,10 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { acceleratedRaycast, MeshBVH } from 'three-mesh-bvh';
 import {
+  eventVariantsOf,
+  normalizeYawDegrees,
+  shortestYawDelta,
+  yawTurnMs,
   actionKindOf,
   animationNamesOf,
   buildKeyframes,
@@ -115,6 +119,19 @@ function staticTrackValue(root, track) {
 }
 
 /** 网页质感使用与导出相同的静态姿态 → 动作首帧 smoothstep 过渡。 */
+/** 组合动画尾段的源动画下标（segments 兼容旧的纯下标写法）。 */
+function comboTailIndex(combined) {
+  const last = combined.segments[combined.segments.length - 1];
+  return typeof last === 'number' ? last : last?.index;
+}
+
+/** 组合动画的前奏：合成片段开头 seconds 秒，按播放速度缩放。 */
+function introThreeClip(source, seconds, speed, name) {
+  const tracks = source.tracks.map((track) => trimThreeTrack(track, 0, seconds, speed));
+  const duration = tracks.reduce((max, track) => Math.max(max, Number(track.times[track.times.length - 1]) || 0), 0);
+  return new THREE.AnimationClip(name, duration, tracks);
+}
+
 function enterThreeClip(root, active, transitionMs, name) {
   const duration = Math.max(0, Number(transitionMs) || 0) / 1000;
   if (!(duration > 0)) return null;
@@ -258,6 +275,11 @@ export class ModelPreview {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
 
     this.scene = new THREE.Scene();
+    // 事件转向：模型挂在这个原点处的枢轴下，绕世界竖直轴原地转（与导出的 BYD_YAW 节点一致）
+    this.yawPivot = new THREE.Group();
+    this.yawPivot.name = 'BYD_YAW';
+    this.scene.add(this.yawPivot);
+    this.yaw = { current: 0, from: 0, target: 0, goal: 0, startedAt: 0, durationMs: 0 };
     // 远处路面渐隐进天色，模拟车道级画面的纵深
     this.scene.fog = new THREE.Fog(0xd7e0ea, 38, 110);
     this.camera = new THREE.PerspectiveCamera(38, 1, 0.01, 1000);
@@ -521,7 +543,7 @@ export class ModelPreview {
     this.model.name = 'CS_Car';
     this.otherModel = modelType === 'other';
     if (this.otherModel) fixTransparentMaterials(this.model);
-    this.scene.add(this.model);
+    this.yawPivot.add(this.model);
     this.applyModelBrightness();
     this.syncModelShadowVisibility();
     const isVehicle = modelType !== 'other';
@@ -1221,7 +1243,7 @@ export class ModelPreview {
   }
 
   /** 组合动画弹窗里的试播：按顺序循环播放几段源动画，段间按 blendMs 交叉淡入，随时可停。 */
-  previewAnimationSequence(indices, blendMs = 0) {
+  previewAnimationSequence(indices, blendMs = 0, { loopLast = false } = {}) {
     this.stopBindingPreview();
     const clips = indices.map((index) => this.loadedAnimations[index]).filter((clip) => clip?.duration > 0);
     if (!this.model || !clips.length) return;
@@ -1238,12 +1260,16 @@ export class ModelPreview {
     let cursor = 0;
     const playSegment = (previousAction) => {
       const action = mixer.clipAction(clips[cursor]);
+      const holdLast = loopLast && cursor === clips.length - 1;
       action.reset();
-      action.setLoop(THREE.LoopOnce, 1);
+      action.setLoop(holdLast ? THREE.LoopRepeat : THREE.LoopOnce, holdLast ? Infinity : 1);
       action.clampWhenFinished = true;
       action.play();
-      if (previousAction && fade > 0) previousAction.crossFadeTo(action, fade, false);
-      else previousAction?.stop();
+      // 同一段连播两遍时前后是同一个 action，不能把刚起播的自己停掉
+      if (previousAction && previousAction !== action) {
+        if (fade > 0) previousAction.crossFadeTo(action, fade, false);
+        else previousAction.stop();
+      }
       sequence.currentAction = action;
     };
     const onFinished = (event) => {
@@ -1266,14 +1292,24 @@ export class ModelPreview {
         this.startSourceResetPreview(slot, playback);
         return;
       }
-      const source = this.loadedAnimations[params.sourceAnimationIndex];
+      // 「最后一段循环」的组合动画：前面的段只在进入时播一次（对应车机 ENTER 阶段），循环的是尾段
+      const combined = this.gltfJson?.animations?.[params.sourceAnimationIndex]?.extras?.bydCombined;
+      const whole = this.loadedAnimations[params.sourceAnimationIndex];
+      const tail = combined?.loopTail && combined.introMs > 0 ? this.loadedAnimations[comboTailIndex(combined)] : null;
+      const source = tail || whole;
       if (!source) return;
       const clip = configuredThreeClip(source, playback, { reverse: phase === 'off' && playback.endMode === 'reverse' });
+      const intro = tail && phase === 'on'
+        ? introThreeClip(whole, combined.introMs / 1000, playback.speed, `${whole.name}_INTRO`)
+        : null;
       const previous = phase === 'on' && this.bindingPreview?.sourceEvent
         && this.bindingPreview.eventId !== slot.id && this.mixer
         ? this.bindingPreview
         : null;
       if (!previous) this.stopBindingPreview();
+      // 要放在 stopBindingPreview 之后，否则会被它的"转回 0"覆盖；转向记在每条动画上
+      const variant = eventVariantsOf(params).find((item) => item.index === params.sourceAnimationIndex);
+      this.setPreviewYaw(phase === 'on' ? variant?.yaw : 0, playback.transitionMs);
       if (!this.mixer) this.mixer = new THREE.AnimationMixer(this.model);
       const mixer = this.mixer;
       const action = this.mixer.clipAction(clip);
@@ -1300,6 +1336,33 @@ export class ModelPreview {
         action.play();
         if (action.paused) this.mixer?.update(0);
       };
+      // 进入链：锚点过渡 →（组合动画前奏）→ 正式动作，每一段播完接下一段
+      const playStages = (stages) => {
+        if (!stages.length) {
+          startActive();
+          nextPreview.currentAction = action;
+          nextPreview.currentClip = clip;
+          return null;
+        }
+        const [stage, ...rest] = stages;
+        const stageAction = mixer.clipAction(stage);
+        nextPreview.currentAction = stageAction;
+        nextPreview.currentClip = stage;
+        stageAction.setLoop(THREE.LoopOnce, 1);
+        stageAction.clampWhenFinished = true;
+        const onStageFinished = (event) => {
+          if (event.action !== stageAction || this.mixer !== mixer) return;
+          mixer.removeEventListener('finished', onStageFinished);
+          nextPreview.mixerFinishedHandlers = nextPreview.mixerFinishedHandlers
+            .filter((handler) => handler !== onStageFinished);
+          playStages(rest);
+          stageAction.stop();
+        };
+        mixer.addEventListener('finished', onStageFinished);
+        nextPreview.mixerFinishedHandlers.push(onStageFinished);
+        stageAction.reset().play();
+        return stageAction;
+      };
       if ((phase === 'on' && playback.mode === 'once')
         || (phase === 'off' && playback.endMode === 'reverse')) {
         const onFinished = (event) => {
@@ -1315,10 +1378,10 @@ export class ModelPreview {
       if (previous) {
         for (const handler of previous.mixerFinishedHandlers || []) mixer.removeEventListener('finished', handler);
         previous.mixerFinishedHandlers = [];
-        startActive();
+        const first = playStages(intro ? [intro] : []) || action;
         const duration = Math.max(0, playback.transitionMs) / 1000;
         if (duration > 0 && previous.currentAction) {
-          previous.currentAction.crossFadeTo(action, duration, false);
+          previous.currentAction.crossFadeTo(first, duration, false);
           let timer = null;
           timer = setTimeout(() => {
             previous.currentAction?.stop();
@@ -1333,30 +1396,9 @@ export class ModelPreview {
       }
       this.bindingPreview = nextPreview;
       const enter = phase === 'on'
-        ? enterThreeClip(this.model, clip, playback.transitionMs, `BYD_EVT_${slot.id}_ENTER`)
+        ? enterThreeClip(this.model, intro || clip, playback.transitionMs, `BYD_EVT_${slot.id}_ENTER`)
         : null;
-      if (enter) {
-        const enterAction = mixer.clipAction(enter);
-        nextPreview.currentAction = enterAction;
-        nextPreview.currentClip = enter;
-        enterAction.setLoop(THREE.LoopOnce, 1);
-        enterAction.clampWhenFinished = true;
-        const onFinished = (event) => {
-          if (event.action !== enterAction || this.mixer !== mixer) return;
-          mixer.removeEventListener('finished', onFinished);
-          nextPreview.mixerFinishedHandlers = nextPreview.mixerFinishedHandlers
-            .filter((handler) => handler !== onFinished);
-          startActive();
-          nextPreview.currentAction = action;
-          nextPreview.currentClip = clip;
-          enterAction.stop();
-        };
-        mixer.addEventListener('finished', onFinished);
-        this.bindingPreview.mixerFinishedHandlers.push(onFinished);
-        enterAction.reset().play();
-      } else {
-        startActive();
-      }
+      playStages([enter, intro].filter(Boolean));
       return;
     }
     this.stopBindingPreview();
@@ -1673,6 +1715,7 @@ export class ModelPreview {
   }
 
   stopBindingPreview() {
+    this.setPreviewYaw(0, 200);
     if (this.bindingPreview?.transitionTimer) {
       clearTimeout(this.bindingPreview.transitionTimer);
       this.bindingPreview.transitionTimer = null;
@@ -2125,7 +2168,7 @@ export class ModelPreview {
       await this.loadDeviceLampTextures(lamps);
     }
     if (!enabled) this.applyModelBrightness();
-    this.scene.add(this.model);
+    this.yawPivot.add(this.model);
     this.deviceMode = enabled;
     this.syncModelShadowVisibility();
     this.autoShadow.visible = false;
@@ -2258,8 +2301,32 @@ export class ModelPreview {
     this.camera.updateProjectionMatrix();
   }
 
+  /** 播放事件时让模型原地转向；用时按角度自动拉长，缓入缓出，与导出的过渡一致。 */
+  setPreviewYaw(degrees, transitionMs = 0) {
+    const goal = normalizeYawDegrees(degrees);
+    if (goal === this.yaw.goal) return;
+    // 走最短方向，与导出的四元数插值一致
+    const delta = shortestYawDelta(goal - this.yaw.current);
+    this.yaw.goal = goal;
+    this.yaw.from = this.yaw.current;
+    this.yaw.target = this.yaw.current + delta;
+    this.yaw.startedAt = performance.now();
+    this.yaw.durationMs = Math.max(Math.round(transitionMs / 2), yawTurnMs(delta), 1);
+  }
+
+  updatePreviewYaw() {
+    const yaw = this.yaw;
+    if (yaw.current === yaw.target) return;
+    const progress = Math.min(1, (performance.now() - yaw.startedAt) / yaw.durationMs);
+    const eased = progress * progress * (3 - 2 * progress);
+    yaw.current = progress >= 1 ? yaw.target : yaw.from + (yaw.target - yaw.from) * eased;
+    if (progress >= 1) yaw.current = yaw.target = shortestYawDelta(yaw.target);
+    this.yawPivot.rotation.y = THREE.MathUtils.degToRad(yaw.current);
+  }
+
   animate() {
     this.controls.update();
+    this.updatePreviewYaw();
     if (this.mixer) this.mixer.update(this.clock.getDelta());
     this.renderer.render(this.scene, this.camera);
     this.frame = requestAnimationFrame(this.animate);
@@ -2438,7 +2505,7 @@ export class ModelPreview {
     this.gltfJson = null;
     this.loadedAnimations = [];
     if (!this.model) return;
-    this.scene.remove(this.model);
+    this.model.removeFromParent();
     this.model.traverse((object) => {
       object.geometry?.dispose();
       // 删除区域备份的原始几何也要释放

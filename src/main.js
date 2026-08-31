@@ -1,6 +1,6 @@
 import './style.css';
 import { ModelPreview } from './preview.js';
-import { bakeSubmeshVisibility, combineAnimations, makeBydCar, makeVehiclePreviewGlb, removeAnimation } from './package.js';
+import { bakeSubmeshVisibility, combineAnimations, makeBydCar, makeVehiclePreviewGlb, normalizeComboSegments, removeAnimation } from './package.js';
 import { listSubmeshes, recommendedHiddenSubmeshes } from './submeshes.js';
 import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
 import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
@@ -18,6 +18,8 @@ import {
   isLampSlot,
   isSustainedEvent,
   normalizeEventPriority,
+  normalizeRerollCycles,
+  normalizeYawDegrees,
   normalizeIdleDelaySeconds,
   normalizeVariantWeight,
   variantChances,
@@ -370,33 +372,37 @@ app.innerHTML = `
       </div>
     </div>
   </div>
-  <div class="generate-dialog" id="combo-dialog" role="dialog" aria-modal="true" aria-labelledby="combo-dialog-title" hidden>
+  <div class="generate-dialog" id="combo-dialog" role="dialog" aria-labelledby="combo-dialog-title" hidden>
     <div class="generate-dialog-panel combo-dialog-panel">
       <div class="generate-dialog-header">
         <div><span>模型动画</span><h2 id="combo-dialog-title">组合动画</h2></div>
         <button class="icon-btn" id="combo-dialog-close" type="button" title="关闭"><i data-lucide="x"></i></button>
       </div>
       <div class="generate-dialog-body">
-        <p class="hint combo-intro">把几段动画按顺序首尾相接合成一段新动画（例如「起手 → 循环」），合成后可像模型自带动画一样绑定到事件。</p>
-        <div class="field"><label for="combo-name">名称</label><input id="combo-name" type="text" placeholder="留空则自动命名" /></div>
-        <div class="field">
-          <label>片段顺序</label>
-          <div class="combo-list" id="combo-segments"></div>
-          <div class="combo-row"><select id="combo-add"></select><button class="btn small" id="combo-add-button" type="button">加入片段</button></div>
+        <p class="hint combo-intro">把几段动画首尾相接合成一段新动画，比如「起手 → 循环」。</p>
+        <div class="combo-step"><b>第 1 步</b><span>挑动画：点一下在视口里播放，按 ＋ 加到顺序里</span></div>
+        <div class="combo-list combo-library" id="combo-library"></div>
+        <div class="combo-step"><b>第 2 步</b><span>排顺序：每段可以连播几次，▲▼ 调顺序</span></div>
+        <div class="combo-list" id="combo-segments"></div>
+        <p class="combo-summary" id="combo-summary"></p>
+        <div class="combo-step"><b>第 3 步</b><span>结尾与衔接</span></div>
+        <div class="combo-options">
+          <label class="check-row"><input type="radio" name="combo-ending" value="end" checked />播完最后一段就结束</label>
+          <label class="check-row"><input type="radio" name="combo-ending" value="loop" />最后一段一直循环<small>（前面的段只播一次，适合「起手 → 循环」）</small></label>
+          <label class="check-row"><input type="radio" name="combo-blend" value="cut" checked />段与段直接相接</label>
+          <label class="check-row"><input type="radio" name="combo-blend" value="smooth" />段与段平滑过渡<span class="combo-blend-ms" id="combo-blend-ms" hidden><input id="combo-blend" type="number" min="10" max="1000" step="10" value="150" />毫秒</span></label>
         </div>
-        <div class="field"><label for="combo-blend">段与段之间的过渡（毫秒，0 = 直接相接）</label><input id="combo-blend" type="number" min="0" step="10" value="0" /></div>
+        <div class="combo-step"><b>第 4 步</b><span>起个名字，试播满意后生成</span></div>
+        <div class="field"><input id="combo-name" type="text" placeholder="例如：跳舞（起手 + 循环）" /></div>
+        <p class="combo-status" id="combo-status"></p>
         <div class="combo-section-title">已有的组合动画</div>
         <div class="combo-list" id="combo-existing"></div>
       </div>
       <div class="generate-dialog-actions">
-        <button class="btn" id="combo-dialog-preview" type="button" disabled title="在视口里连续播放当前片段顺序，看完再回来调整"><i data-lucide="play"></i><span>预览</span></button>
+        <button class="btn" id="combo-dialog-preview" type="button" disabled title="按当前顺序从头连播一遍，看衔接效果"><i data-lucide="play"></i><span>试播整段</span></button>
         <button class="btn" id="combo-dialog-cancel" type="button">取消</button>
         <button class="btn primary" id="combo-dialog-confirm" type="button" disabled><i data-lucide="film"></i><span>生成组合动画</span></button>
       </div>
-    </div>
-    <div class="combo-preview-bar" id="combo-preview-bar">
-      <span id="combo-preview-label"></span>
-      <button class="btn small primary" id="combo-preview-stop" type="button">停止预览，返回编辑</button>
     </div>
   </div>
 
@@ -448,9 +454,8 @@ const ui = Object.fromEntries([
   'binding-back', 'quality-summary', 'quality-custom', 'quality-triangles', 'quality-texture-size',
   'quality-metrics', 'generate-dialog', 'generate-dialog-close', 'generate-dialog-cancel',
   'leave-dialog', 'leave-dialog-message', 'leave-dialog-close', 'leave-dialog-cancel', 'leave-dialog-discard', 'leave-dialog-save',
-  'combo-dialog', 'combo-dialog-close', 'combo-dialog-cancel', 'combo-dialog-confirm', 'combo-name', 'combo-segments',
-  'combo-add', 'combo-add-button', 'combo-blend', 'combo-existing',
-  'combo-dialog-preview', 'combo-preview-bar', 'combo-preview-label', 'combo-preview-stop',
+  'combo-dialog', 'combo-dialog-close', 'combo-dialog-cancel', 'combo-dialog-confirm', 'combo-dialog-preview',
+  'combo-name', 'combo-library', 'combo-segments', 'combo-summary', 'combo-status', 'combo-blend', 'combo-blend-ms', 'combo-existing',
   'generate-confirm', 'generate-quality-summary', 'generate-quality-custom',
   'generate-quality-triangles', 'generate-quality-texture-size', 'generate-quality-metrics',
 ].map((id) => [id, document.getElementById(id)]));
@@ -534,6 +539,7 @@ function enterEditorForType(type) {
 }
 
 function resetWorkspaceForTypeSelection() {
+  closeComboDialog();
   stopDemo();
   closePreviewTools();
   preview.disposeModel();
@@ -1626,6 +1632,32 @@ function removeVariantAnimation(slot, index) {
   commitVariants(slot, variants);
 }
 
+/** 改某条动画的转向后立即播它一遍，能直接看到转身效果。 */
+function updateVariantYaw(slot, index, value) {
+  const binding = bindings.get(slot.id);
+  if (!binding) return;
+  const variants = eventVariantsOf(binding);
+  const target = variants.find((item) => item.index === index);
+  const yaw = normalizeYawDegrees(value);
+  if (!target || target.yaw === yaw) return;
+  snapshot({ scope: 'variant-yaw', slotId: slot.id });
+  target.yaw = yaw;
+  commitVariants(slot, variants);
+  playVariant(slot, index);
+}
+
+function updateVariantReroll(slot, index, value) {
+  const binding = bindings.get(slot.id);
+  if (!binding) return;
+  const variants = eventVariantsOf(binding);
+  const target = variants.find((item) => item.index === index);
+  const cycles = normalizeRerollCycles(value);
+  if (!target || target.rerollCycles === cycles) return;
+  snapshot({ scope: 'variant-reroll', slotId: slot.id });
+  target.rerollCycles = cycles;
+  commitVariants(slot, variants);
+}
+
 function updateVariantWeights(slot) {
   const binding = bindings.get(slot.id);
   if (!binding) return;
@@ -2036,6 +2068,16 @@ document.addEventListener('keydown', (event) => {
 /* ---------- 组合动画 ---------- */
 
 let comboDraft = null;
+let comboPlaying = null; // { index }：单段试播；{ sequence: true }：整段试播
+
+function comboLoopTail() {
+  return document.querySelector('input[name="combo-ending"]:checked')?.value === 'loop';
+}
+
+function comboBlendMs() {
+  if (document.querySelector('input[name="combo-blend"]:checked')?.value !== 'smooth') return 0;
+  return Math.min(1000, Math.max(10, Math.round(Number(ui['combo-blend'].value) || 150)));
+}
 
 function isCombinedAnimation(index) {
   return Boolean(preview.gltfJson?.animations?.[index]?.extras?.bydCombined);
@@ -2047,99 +2089,185 @@ function animationLabel(index) {
 
 function openComboDialog() {
   comboDraft = { segments: [] };
+  comboPlaying = null;
   ui['combo-name'].value = '';
-  ui['combo-blend'].value = '0';
+  ui['combo-blend'].value = '150';
+  document.querySelector('input[name="combo-ending"][value="end"]').checked = true;
+  document.querySelector('input[name="combo-blend"][value="cut"]').checked = true;
+  ui['combo-blend-ms'].hidden = true;
   renderComboDialog();
   ui['combo-dialog'].hidden = false;
-  ui['combo-name'].focus();
 }
 
 function closeComboDialog() {
-  stopComboPreview();
+  if (ui['combo-dialog'].hidden) return;
+  stopComboPlayback();
   ui['combo-dialog'].hidden = true;
   comboDraft = null;
-}
-
-function startComboPreview() {
-  if (!comboDraft?.segments.length) return;
-  const blendMs = Math.max(0, Math.round(Number(ui['combo-blend'].value) || 0));
-  ui['combo-preview-label'].textContent = `正在预览：${comboDraft.segments.map(animationLabel).join(' → ')}${blendMs ? `（过渡 ${blendMs} 毫秒）` : ''}`;
-  ui['combo-dialog'].classList.add('previewing');
-  preview.previewAnimationSequence(comboDraft.segments, blendMs);
-}
-
-function stopComboPreview() {
-  if (!ui['combo-dialog'].classList.contains('previewing')) return;
-  ui['combo-dialog'].classList.remove('previewing');
-  preview.stopBindingPreview();
   playCurrentBinding();
 }
 
+/** 点到哪段就在视口里循环播哪段，看清楚再决定加不加。 */
+function playComboClip(index) {
+  comboPlaying = { index };
+  preview.previewAnimationSequence([index], 0);
+  renderComboDialog();
+}
+
+/** 试播/合成共用的展开顺序：每段按重复次数展开，最后一段若无限循环则只展开一次。 */
+function comboEntries(segments, loopTail) {
+  return segments.flatMap((segment, order) => Array.from(
+    { length: loopTail && order === segments.length - 1 ? 1 : segment.repeat },
+    () => segment.index,
+  ));
+}
+
+function toggleComboSequence() {
+  if (comboPlaying?.sequence) {
+    stopComboPlayback();
+    return;
+  }
+  if (!comboDraft?.segments.length) return;
+  comboPlaying = { sequence: true };
+  const loopTail = comboLoopTail();
+  preview.previewAnimationSequence(comboEntries(comboDraft.segments, loopTail), comboBlendMs(), { loopLast: loopTail });
+  renderComboDialog();
+}
+
+function stopComboPlayback() {
+  comboPlaying = null;
+  preview.stopBindingPreview();
+  if (comboDraft) renderComboDialog();
+}
+
+function comboRow(index, { label = animationLabel(index), note = '', controls = '' } = {}) {
+  const active = comboPlaying?.index === index;
+  return `<div class="combo-segment${active ? ' active' : ''}" data-combo-play="${index}" title="${escapeHtml(label)}${note ? `：${escapeHtml(note)}` : ''}">
+    <span>${escapeHtml(label)}${note ? `<em>${escapeHtml(note)}</em>` : ''}</span>${controls}
+  </div>`;
+}
+
+/** 顺序下面的一句话说明：合成后会是什么样、多长。 */
+function comboSummary(segments, loopTail, blendMs) {
+  if (!segments.length) return '';
+  const secondsOf = (index) => sourceAnimationByIndex(index)?.duration || 0;
+  const gaps = Math.max(0, segments.reduce((sum, segment) => sum + segment.repeat, 0) - 1) * blendMs / 1000;
+  if (loopTail) {
+    const intro = segments.slice(0, -1).reduce((sum, segment) => sum + secondsOf(segment.index) * segment.repeat, 0) + gaps;
+    const tail = segments[segments.length - 1];
+    return segments.length === 1
+      ? `合成后：${animationLabel(tail.index)} 一直循环`
+      : `合成后：先播前奏约 ${intro.toFixed(1)} 秒，然后 ${animationLabel(tail.index)} 一直循环，直到车机换下一条动画`;
+  }
+  const total = segments.reduce((sum, segment) => sum + secondsOf(segment.index) * segment.repeat, 0) + gaps;
+  return `合成后共约 ${total.toFixed(1)} 秒，播完就结束`;
+}
+
 function renderComboDialog() {
-  const selectedAdd = ui['combo-add'].value;
-  ui['combo-add'].innerHTML = bindableAnimations
-    .filter((animation) => !isCombinedAnimation(animation.index))
-    .map((animation) => `<option value="${animation.index}">${escapeHtml(animation.name)}${animation.duration ? ` · ${animation.duration.toFixed(2)} 秒` : ''}</option>`)
-    .join('');
-  if (selectedAdd) ui['combo-add'].value = selectedAdd;
   const { segments } = comboDraft;
+  const durationOf = (index) => {
+    const item = sourceAnimationByIndex(index);
+    return item?.duration ? `${item.duration.toFixed(2)} 秒` : '';
+  };
+  // 重绘列表时保住滚动位置，不然每点一下都跳回顶部
+  const scrollTops = ['combo-library', 'combo-segments', 'combo-existing'].map((id) => [id, ui[id].scrollTop]);
+  ui['combo-library'].innerHTML = bindableAnimations
+    .filter((animation) => !isCombinedAnimation(animation.index))
+    .map((animation) => comboRow(animation.index, {
+      note: durationOf(animation.index),
+      controls: `<button class="icon-btn" data-combo-add="${animation.index}" type="button" title="加入片段">＋</button>`,
+    }))
+    .join('');
+  const loopTail = comboLoopTail();
   ui['combo-segments'].innerHTML = segments.length
-    ? segments.map((index, order) => `
-      <div class="combo-segment">
-        <span title="${escapeHtml(animationLabel(index))}">${order + 1}. ${escapeHtml(animationLabel(index))}</span>
+    ? segments.map(({ index, repeat }, order) => {
+      const infinite = loopTail && order === segments.length - 1;
+      return comboRow(index, {
+        label: `${order + 1}. ${animationLabel(index)}`,
+        controls: `
+        ${infinite
+          ? '<span class="combo-repeat combo-repeat-infinite" title="最后一段一直循环">一直循环</span>'
+          : `<span class="combo-repeat" title="这段连播几次">播 <input data-combo-repeat="${order}" type="number" min="1" max="20" value="${repeat}" /> 次</span>`}
         <button class="icon-btn" data-combo-move="${order}:-1" type="button" title="上移"${order === 0 ? ' disabled' : ''}>▲</button>
         <button class="icon-btn" data-combo-move="${order}:1" type="button" title="下移"${order === segments.length - 1 ? ' disabled' : ''}>▼</button>
-        <button class="icon-btn" data-combo-remove="${order}" type="button" title="移除">✕</button>
-      </div>`).join('')
-    : '<p class="hint">还没有片段，从下方选择动画依次加入，播放时按顺序首尾相接。</p>';
+        <button class="icon-btn" data-combo-remove="${order}" type="button" title="移除">✕</button>`,
+      });
+    }).join('')
+    : '<p class="hint">还没有片段：从上面的列表里按 ＋ 加入。</p>';
+  ui['combo-summary'].textContent = comboSummary(segments, loopTail, comboBlendMs());
   const combos = (preview.gltfJson?.animations || [])
     .map((animation, index) => ({ animation, index }))
     .filter(({ animation }) => animation.extras?.bydCombined);
+  const describe = ({ segments: parts, blendMs, loopTail: tailLoops }) => normalizeComboSegments(parts)
+    .map((segment, order, list) => `${animationLabel(segment.index)}${tailLoops && order === list.length - 1 ? '（一直循环）' : segment.repeat > 1 ? ` ×${segment.repeat}` : ''}`)
+    .join(' → ') + (blendMs ? ` · 平滑过渡 ${blendMs} 毫秒` : '');
   ui['combo-existing'].innerHTML = combos.length
-    ? combos.map(({ animation, index }) => `
-      <div class="combo-segment">
-        <span title="${escapeHtml(animation.name)}：${animation.extras.bydCombined.segments.map((segment) => escapeHtml(animationLabel(segment))).join(' → ')}">${escapeHtml(animation.name)}<em>${animation.extras.bydCombined.segments.map((segment) => escapeHtml(animationLabel(segment))).join(' → ')}${animation.extras.bydCombined.blendMs ? ` · 过渡 ${animation.extras.bydCombined.blendMs} 毫秒` : ''}</em></span>
-        <button class="icon-btn" data-combo-delete="${index}" type="button" title="删除这段组合动画">✕</button>
-      </div>`).join('')
+    ? combos.map(({ animation, index }) => comboRow(index, {
+      label: animation.name,
+      note: describe(animation.extras.bydCombined),
+      controls: `<button class="icon-btn" data-combo-delete="${index}" type="button" title="删除这段组合动画">✕</button>`,
+    })).join('')
     : '<p class="hint">当前模型还没有组合动画。</p>';
+  for (const [id, top] of scrollTops) ui[id].scrollTop = top;
+  ui['combo-status'].textContent = comboPlaying?.sequence
+    ? `试播中：${segments.map(({ index }) => animationLabel(index)).join(' → ')}${loopTail ? '（最后一段一直循环）' : ''}`
+    : comboPlaying ? `正在播放：${animationLabel(comboPlaying.index)}` : '点任意动画即可在视口里播放，模型可以随意旋转查看。';
   ui['combo-dialog-confirm'].disabled = segments.length < 2;
   ui['combo-dialog-preview'].disabled = !segments.length;
-  ui['combo-segments'].querySelectorAll('[data-combo-move]').forEach((button) => button.addEventListener('click', () => {
+  ui['combo-dialog-preview'].querySelector('span').textContent = comboPlaying?.sequence ? '停止试播' : '试播整段';
+  const dialog = ui['combo-dialog'];
+  dialog.querySelectorAll('[data-combo-play]').forEach((row) => row.addEventListener('click', (event) => {
+    if (event.target.closest('button')) return;
+    playComboClip(Number(row.dataset.comboPlay));
+  }));
+  dialog.querySelectorAll('[data-combo-add]').forEach((button) => button.addEventListener('click', () => {
+    segments.push({ index: Number(button.dataset.comboAdd), repeat: 1 });
+    playComboClip(Number(button.dataset.comboAdd));
+  }));
+  dialog.querySelectorAll('[data-combo-repeat]').forEach((input) => {
+    input.addEventListener('click', (event) => event.stopPropagation());
+    input.addEventListener('change', () => {
+      segments[Number(input.dataset.comboRepeat)].repeat = normalizeComboSegments([{ index: 0, repeat: input.value }])[0].repeat;
+      renderComboDialog();
+    });
+  });
+  dialog.querySelectorAll('[data-combo-move]').forEach((button) => button.addEventListener('click', () => {
     const [order, delta] = button.dataset.comboMove.split(':').map(Number);
     [segments[order], segments[order + delta]] = [segments[order + delta], segments[order]];
     renderComboDialog();
   }));
-  ui['combo-segments'].querySelectorAll('[data-combo-remove]').forEach((button) => button.addEventListener('click', () => {
+  dialog.querySelectorAll('[data-combo-remove]').forEach((button) => button.addEventListener('click', () => {
     segments.splice(Number(button.dataset.comboRemove), 1);
     renderComboDialog();
   }));
-  ui['combo-existing'].querySelectorAll('[data-combo-delete]').forEach((button) => {
+  dialog.querySelectorAll('[data-combo-delete]').forEach((button) => {
     button.addEventListener('click', () => deleteCombinedAnimation(Number(button.dataset.comboDelete)));
   });
 }
 
-ui['combo-add-button'].addEventListener('click', () => {
-  const index = Number(ui['combo-add'].value);
-  if (!comboDraft || !Number.isInteger(index)) return;
-  comboDraft.segments.push(index);
-  renderComboDialog();
-});
 for (const id of ['combo-dialog-close', 'combo-dialog-cancel']) ui[id].addEventListener('click', closeComboDialog);
 ui['combo-dialog'].addEventListener('keydown', (event) => { if (event.key === 'Escape') closeComboDialog(); });
 ui['combo-dialog-confirm'].addEventListener('click', createCombinedAnimation);
-ui['combo-dialog-preview'].addEventListener('click', startComboPreview);
-ui['combo-preview-stop'].addEventListener('click', stopComboPreview);
+ui['combo-dialog-preview'].addEventListener('click', toggleComboSequence);
+document.querySelectorAll('input[name="combo-ending"], input[name="combo-blend"]').forEach((input) => {
+  input.addEventListener('change', () => {
+    ui['combo-blend-ms'].hidden = document.querySelector('input[name="combo-blend"]:checked')?.value !== 'smooth';
+    if (comboDraft) renderComboDialog();
+  });
+});
+ui['combo-blend'].addEventListener('change', () => { if (comboDraft) renderComboDialog(); });
 
 async function createCombinedAnimation() {
   if (!current || !comboDraft || comboDraft.segments.length < 2) return;
   const existing = (preview.gltfJson?.animations || []).filter((animation) => animation.extras?.bydCombined).length;
   const name = ui['combo-name'].value.trim() || `组合动画 ${existing + 1}`;
-  const blendMs = Math.max(0, Math.round(Number(ui['combo-blend'].value) || 0));
-  const segments = [...comboDraft.segments];
+  const blendMs = comboBlendMs();
+  const loopTail = comboLoopTail();
+  const segments = comboDraft.segments.map((segment) => ({ ...segment }));
   const slotId = openSlot;
   const nextIndex = preview.gltfJson.animations.length;
   closeComboDialog();
-  if (!(await materializeAnimations(() => combineAnimations(current.bytes, { name, segments, blendMs }), '正在生成组合动画'))) return;
+  if (!(await materializeAnimations(() => combineAnimations(current.bytes, { name, segments, blendMs, loopTail }), '正在生成组合动画'))) return;
   // 从哪个事件点开的就挂到哪个事件上，和在下拉里选一个动画的行为一致
   const slot = slotId && activeSlot(slotId);
   if (slot && sourceAnimationByIndex(nextIndex)) {
@@ -2976,7 +3104,10 @@ function playVariant(slot, variantIndex) {
 function variantListHtml(slot, binding) {
   const variants = eventVariantsOf(binding);
   if (variants.length <= 1) {
-    return `<div class="source-animation-bound"><span>已绑定动画</span><strong title="${escapeHtml(variants[0]?.name || '')}">${escapeHtml(variants[0]?.name || '')}</strong></div>`;
+    const only = variants[0];
+    return `<div class="source-animation-bound"><span>已绑定动画</span><strong title="${escapeHtml(only?.name || '')}">${escapeHtml(only?.name || '')}</strong>
+      ${only ? `<div class="variant-controls"><span class="variant-field" title="触发这条动画时模型原地转向：正数向左、负数向右、180 转身；进入和退出时会自动平滑转过去"><span>触发时转向</span><input id="variant-yaw-${only.index}" type="number" min="-180" max="180" step="15" value="${only.yaw}" aria-label="${escapeHtml(only.name)} 的转向角度" /><small>°</small></span></div>` : ''}
+    </div>`;
   }
   const chances = variantChances(variants);
   const active = variants.some((item) => item.index === selectedVariantIndex)
@@ -2988,8 +3119,12 @@ function variantListHtml(slot, binding) {
         <span title="${escapeHtml(variant.name)}">${escapeHtml(variant.name)}</span>
         ${index === 0 ? '<em class="variant-lead" title="代表动作：事件之间的切换过渡按它预烘">代表</em>' : ''}
       </div>
-      <div class="variant-chance"><input id="variant-weight-${variant.index}" type="number" min="1" max="100" step="1" value="${variant.weight}" aria-label="${escapeHtml(variant.name)} 的权重" /><span>${chances[index]}%</span></div>
       <button class="btn small variant-remove" type="button" data-variant-remove="${variant.index}" aria-label="移除 ${escapeHtml(variant.name)}"><i data-lucide="x"></i></button>
+      <div class="variant-controls">
+        <span class="variant-field" title="抽中这条动画的相对权重，右侧是换算后的概率"><span>权重</span><input id="variant-weight-${variant.index}" type="number" min="1" max="100" step="1" value="${variant.weight}" aria-label="${escapeHtml(variant.name)} 的权重" /><small>${chances[index]}%</small></span>
+        <span class="variant-field" title="触发这条动画时模型原地转向：正数向左、负数向右、180 转身"><span>触发时转向</span><input id="variant-yaw-${variant.index}" type="number" min="-180" max="180" step="15" value="${variant.yaw}" aria-label="${escapeHtml(variant.name)} 的转向角度" /><small>°</small></span>
+        <span class="variant-field" title="循环播放时，这条动画至少连着播这么多轮才重新抽；抽到自己会继续循环不打断"><span>至少播</span><input id="variant-reroll-${variant.index}" type="number" min="1" max="99" step="1" value="${variant.rerollCycles}" aria-label="${escapeHtml(variant.name)} 至少循环几轮再换" /><small>轮再换</small></span>
+      </div>
     </div>`).join('');
   return `<section class="variant-list" aria-label="事件动画列表">
     <div class="variant-title"><i data-lucide="dices"></i><strong>随机动作（${variants.length}）</strong><small>点击可单独预览</small></div>
@@ -3548,9 +3683,16 @@ function wireBindingEditor() {
     });
     for (const variant of eventVariantsOf(bindings.get(slot.id))) {
       const input = document.getElementById(`variant-weight-${variant.index}`);
-      if (!input) continue;
-      wireContinuousHistory(input, { scope: 'variant-weight', slotId: slot.id });
-      input.addEventListener('change', () => updateVariantWeights(slot));
+      if (input) {
+        wireContinuousHistory(input, { scope: 'variant-weight', slotId: slot.id });
+        input.addEventListener('change', () => updateVariantWeights(slot));
+      }
+      const yawInput = document.getElementById(`variant-yaw-${variant.index}`);
+      yawInput?.addEventListener('click', (event) => event.stopPropagation());
+      yawInput?.addEventListener('change', () => updateVariantYaw(slot, variant.index, yawInput.value));
+      const rerollInput = document.getElementById(`variant-reroll-${variant.index}`);
+      rerollInput?.addEventListener('click', (event) => event.stopPropagation());
+      rerollInput?.addEventListener('change', () => updateVariantReroll(slot, variant.index, rerollInput.value));
     }
     for (const id of [
       'bind-playback-mode', 'bind-playback-direction', 'bind-playback-end',

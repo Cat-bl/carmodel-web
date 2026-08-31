@@ -198,6 +198,28 @@ export function isSustainedEvent(slotOrId) {
 /** 一个事件最多能挂几个动画；再多导出体积和过渡数量都会失控。 */
 export const MAX_EVENT_VARIANTS = 6;
 
+/** 播放该事件时模型原地转向的角度：正数向左转，负数向右转，±180 转身。 */
+export function normalizeYawDegrees(value) {
+  const degrees = Math.round(Number(value));
+  return Number.isFinite(degrees) ? Math.min(180, Math.max(-180, degrees)) : 0;
+}
+
+/** 转向所需时间：180° 约 0.8 秒，按角度线性缩放，避免过渡太短时"啪"一下转过去。 */
+export function yawTurnMs(degrees) {
+  return Math.round((Math.abs(shortestYawDelta(degrees)) / 180) * 800);
+}
+
+/** 把角度差折到 (-180, 180]：转向总走最短方向，和四元数插值一致。 */
+export function shortestYawDelta(degrees) {
+  return ((((Number(degrees) || 0) % 360) + 540) % 360) - 180;
+}
+
+/** 循环播放且挂了多个动画时，每播完这么多轮才重新抽一条；1 = 每轮都抽。 */
+export function normalizeRerollCycles(value) {
+  const cycles = Math.round(Number(value));
+  return Number.isFinite(cycles) ? Math.min(99, Math.max(1, cycles)) : 1;
+}
+
 export function normalizeVariantWeight(value) {
   const weight = Math.round(Number(value));
   return Number.isFinite(weight) ? Math.min(100, Math.max(1, weight)) : 10;
@@ -220,6 +242,8 @@ export function eventVariantsOf(binding) {
       index: item.index,
       name: item.name || `#${item.index}`,
       weight: normalizeVariantWeight(item.weight),
+      yaw: normalizeYawDegrees(item.yaw),
+      rerollCycles: normalizeRerollCycles(item.rerollCycles),
     });
     if (list.length >= MAX_EVENT_VARIANTS) break;
   }
@@ -229,6 +253,8 @@ export function eventVariantsOf(binding) {
       index: binding.sourceAnimationIndex,
       name: binding.sourceAnimationName || `#${binding.sourceAnimationIndex}`,
       weight: 10,
+      yaw: normalizeYawDegrees(binding.yawDegrees),
+      rerollCycles: normalizeRerollCycles(binding.rerollCycles),
     }];
   }
   return [];

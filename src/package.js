@@ -7,6 +7,9 @@ import {
   eventVariantsOf,
   isLampSlot,
   normalizeEventPriority,
+  normalizeRerollCycles,
+  normalizeYawDegrees,
+  yawTurnMs,
   normalizeIdleDelaySeconds,
   normalizeLampBeam,
   normalizeLampGlow,
@@ -1521,7 +1524,8 @@ function cloneSkinSkeleton(json, sourceJoints, parents, suffix) {
   for (const joint of sourceJoints) {
     let current = joint;
     while (current !== undefined && !sourceSet.has(current)) {
-      if (json.nodes?.[current]?.name === 'CS_Car') break;
+      // 车模根与转向节点不进克隆链：克隆骨架挂回转向节点之下，跟着原节点一起转
+      if (['CS_Car', 'BYD_YAW', 'BYD_YAW_INNER'].includes(json.nodes?.[current]?.name)) break;
       sourceSet.add(current);
       current = parents.get(current);
     }
@@ -2647,9 +2651,53 @@ function staticPoseClip(state, pose, name, durationMs) {
   };
 }
 
-function pickAnchorPose(state, eventRecords) {
-  const idle = eventRecords.find((record) => record.slot.id === 'CS_Idle') || eventRecords[0];
-  return animationPoseAt(state, idle.variants[0].active, 0);
+function anchorRecordOf(eventRecords) {
+  return eventRecords.find((record) => record.slot.id === 'CS_Idle') || eventRecords[0];
+}
+
+/** 在 CS_Car 与模型内容之间插一个转向节点，原点放在模型脚下中心（世界原点），转向时原地转不绕圈。 */
+function addYawPivot(json, sourceRoots, transform) {
+  const centerLocal = worldOriginInCarSpace(transform);
+  const inner = json.nodes.length;
+  json.nodes.push({ name: 'BYD_YAW_INNER', translation: centerLocal.map((value) => -value), children: [...sourceRoots] });
+  const outer = json.nodes.length;
+  json.nodes.push({ name: 'BYD_YAW', translation: centerLocal, children: [inner] });
+  sourceRoots.splice(0, sourceRoots.length, outer);
+  return outer;
+}
+
+/** 世界原点在 CS_Car 局部坐标里的位置（CS_Car 本身带着用户的朝向/缩放/落地变换）。 */
+function worldOriginInCarSpace(transform) {
+  const translation = transform?.translation || [0, 0, 0];
+  const scale = transform?.scale || [1, 1, 1];
+  const inverseRotation = mat4FromNode({ rotation: quatInverse(transform?.rotation || [0, 0, 0, 1]) });
+  const point = transformPoint(inverseRotation, -translation[0], -translation[1], -translation[2]);
+  return point.map((value, axis) => value / (scale[axis] || 1));
+}
+
+/** 绕世界竖直轴转 degrees 的四元数，折算到 CS_Car 局部坐标系。 */
+function yawQuaternion(degrees, transform) {
+  const inverseRotation = mat4FromNode({ rotation: quatInverse(transform?.rotation || [0, 0, 0, 1]) });
+  const axis = quatNormalizeVector(transformPoint(inverseRotation, 0, 1, 0));
+  const half = (degrees * Math.PI) / 360;
+  return quatNormalize([axis[0] * Math.sin(half), axis[1] * Math.sin(half), axis[2] * Math.sin(half), Math.cos(half)]);
+}
+
+function quatNormalizeVector(vector) {
+  const length = Math.hypot(...vector) || 1;
+  return vector.map((value) => value / length);
+}
+
+/** 给片段补一条整段不变的通道（两个关键帧）。 */
+function addConstantChannel(state, clip, node, path, value) {
+  const duration = Math.max(animationDurationOf(state, clip), 1 / 60);
+  const values = new Float32Array([...value, ...value]);
+  clip.samplers.push({
+    input: writeAccessor(state, new Float32Array([0, duration]), 5126, 'SCALAR', { min: [0], max: [duration] }),
+    output: writeAccessor(state, values, 5126, value.length === 4 ? 'VEC4' : 'VEC3'),
+    interpolation: 'LINEAR',
+  });
+  clip.channels.push({ sampler: clip.samplers.length - 1, target: { node, path } });
 }
 
 /**
@@ -2664,26 +2712,40 @@ function pickAnchorPose(state, eventRecords) {
  */
 function buildAnchorClips(state, eventRecords, phases) {
   if (!eventRecords.length) return [];
-  const anchor = pickAnchorPose(state, eventRecords);
+  const anchorRecord = anchorRecordOf(eventRecords);
+  const anchorPose = animationPoseAt(state, anchorRecord.variants[0].active, 0);
   const clips = [];
   for (const record of eventRecords) {
-    const halfMs = Math.round(record.playback.transitionMs / 2);
+    // 过渡只写本事件驱动的节点：并行槽里的灯光事件不能把身体骨骼往锚点/静止姿态拽
+    const nodes = eventNodeIndices(record);
+    const anchor = new Map([...anchorPose].filter(([, descriptor]) => nodes.has(descriptor.node)));
+    const anchorYaw = anchorRecord.variants[0].yaw || 0;
     for (const variant of record.variants) {
-      if (!(halfMs > 0)) continue;
+      // 要转向的动画把进入/退出过渡拉长到转向所需时间，180° 约 0.8 秒，免得"啪"一下转过去
+      const halfMs = Math.max(Math.round(record.playback.transitionMs / 2), yawTurnMs((variant.yaw || 0) - anchorYaw));
+      if (!(halfMs > 0) && !variant.intro) continue;
       // 起止姿态一致（典型是锚点自己那条动画）时过渡会被整段省掉，
       // 这里补一段静态占位，保证车机 ENTER → ON、RST → 下一动作的链路不断
-      const enter = poseTransitionClip(
-        state, anchor, animationPoseAt(state, variant.active, 0), `${variant.base}_IN`, halfMs,
-      ) || staticPoseClip(state, anchor, `${variant.base}_IN`, halfMs);
+      const first = variant.intro || variant.active;
+      const firstPose = animationPoseAt(state, first, 0);
+      const enterIn = halfMs > 0
+        ? poseTransitionClip(state, anchor, firstPose, `${variant.base}_IN`, halfMs)
+          || staticPoseClip(state, firstPose, `${variant.base}_IN`, halfMs)
+        : null;
+      // 组合动画的前奏接在锚点过渡后面，一起作为 ENTER 播一次，然后才进循环的尾段
+      const enter = variant.intro
+        ? concatAnimationClips(state, [enterIn, variant.intro].filter(Boolean), 0.001, `${variant.base}_ENTER`).clip
+        : enterIn;
       clips.push(enter);
       variant.spec.enter = enter.name;
-      variant.spec.enterDurationMs = halfMs;
+      variant.spec.enterDurationMs = Math.round(animationDurationOf(state, enter) * 1000);
+      if (!(halfMs > 0)) continue;
       const outs = phases.map((phase, index) => {
         const cached = EVENT_TRANSITION_PHASES.indexOf(phase);
         const pose = (cached >= 0 ? variant.transitionPoses?.[cached] : null)
           || animationPoseAt(state, variant.active, phase);
         const name = `${variant.base}_OUT_P${index}`;
-        return poseTransitionClip(state, pose, anchor, name, halfMs) || staticPoseClip(state, anchor, name, halfMs);
+        return poseTransitionClip(state, pose, anchor, name, halfMs) || staticPoseClip(state, pose, name, halfMs);
       });
       clips.push(...outs);
       variant.spec.reset = { animations: outs.map((clip) => clip.name), durationMs: halfMs };
@@ -2698,7 +2760,7 @@ function eventNodeIndices(record) {
   // 必须并上事件下每一条动画的节点：随机播到哪条都可能抢节点，
   // 只看代表动作会漏判冲突，把本该互斥的两个事件放进不同槽并行。
   for (const variant of record.variants) {
-    for (const channel of variant.active?.channels || []) {
+    for (const channel of [...(variant.active?.channels || []), ...(variant.intro?.channels || [])]) {
       if (Number.isInteger(channel.target?.node)) nodes.add(channel.target.node);
     }
   }
@@ -2796,10 +2858,19 @@ async function normalizeAnimatedOtherGlb(
     for (let variantIndex = 0; variantIndex < variants.length; variantIndex++) {
       const variant = variants[variantIndex];
       const source = sourceAnimations[variant.index];
-      validateAnimatedOtherClip(state, source, slot);
-      const event = eventAnimationSet(state, source, slot, binding, variantIndex, resetPhases);
+      // 「最后一段循环」的组合动画：尾段才是循环的正式动作，前面几段只在进入时播一次（ENTER 阶段）
+      const combined = source?.extras?.bydCombined;
+      const tail = combined?.loopTail && combined.introMs > 0
+        ? sourceAnimations[normalizeComboSegments(combined.segments).at(-1)?.index]
+        : null;
+      validateAnimatedOtherClip(state, tail || source, slot);
+      const event = eventAnimationSet(state, tail || source, slot, binding, variantIndex, resetPhases);
+      if (tail) {
+        const introRatio = combined.introMs / 1000 / animationDurationOf(state, source);
+        event.intro = trimmedAnimationClip(state, source, 0, Math.min(1, introRatio), event.playback.speed, `${event.base}_INTRO`);
+      }
       outputAnimations.push(...event.animations);
-      built.push({ ...event, weight: variant.weight });
+      built.push({ ...event, weight: variant.weight, yaw: variant.yaw, rerollCycles: variant.rerollCycles });
       onProgress?.(
         requestedBindings.length
           ? ((bindingIndex + (variantIndex + 1) / variants.length) / requestedBindings.length) * 0.32
@@ -2817,6 +2888,26 @@ async function normalizeAnimatedOtherGlb(
   // 互不抢节点的事件分到不同播放槽后可以同时播放，只有同槽事件才需要互相切换。
   const partCount = assignEventPartSlots(eventRecords);
 
+  // 每条动画自带转向角：同一播放槽里只要有一条要转向，槽内所有动画都写一条转向节点的常量旋转通道
+  // （不转的写 0°），这样切换时总有人把角度写回来；不在该槽里的事件（比如并行的灯光）完全不碰这个节点。
+  const yawParts = new Set(eventRecords
+    .filter((record) => record.variants.some((variant) => normalizeYawDegrees(variant.yaw) !== 0))
+    .map((record) => record.part));
+  if (yawParts.size) {
+    const yawNode = addYawPivot(json, sourceRoots, transform);
+    for (const record of eventRecords) {
+      if (!yawParts.has(record.part)) continue;
+      for (const variant of record.variants) {
+        variant.yaw = normalizeYawDegrees(variant.yaw);
+        const quaternion = yawQuaternion(variant.yaw, transform);
+        for (const clip of [variant.active, variant.intro, ...variant.animations].filter(Boolean)) {
+          addConstantChannel(state, clip, yawNode, 'rotation', quaternion);
+        }
+        variant.transitionPoses = EVENT_TRANSITION_PHASES.map((phase) => animationPoseAt(state, variant.active, phase));
+      }
+    }
+  }
+
   // 所有动作都经由锚点姿态互相衔接，段数只跟变体数成线性，不会随事件对数爆炸。
   onProgress?.(0.4, '正在生成动作衔接过渡');
   await yieldToBrowser();
@@ -2832,8 +2923,9 @@ async function normalizeAnimatedOtherGlb(
       priority: normalizeEventPriority(target.slot, target.binding.priority),
       ...eventSpec,
       ...(multi ? {
-        variants: target.variants.map(({ weight, spec: variantSpec }) => ({
+        variants: target.variants.map(({ weight, rerollCycles, spec: variantSpec }) => ({
           weight,
+          rerollCycles: normalizeRerollCycles(rerollCycles),
           enter: variantSpec.enter,
           on: variantSpec.on,
           off: variantSpec.off,
@@ -2844,8 +2936,8 @@ async function normalizeAnimatedOtherGlb(
           cycleDurationMs: variantSpec.cycleDurationMs,
           ...(variantSpec.reset ? { reset: variantSpec.reset } : {}),
         })),
-        // 循环类动作每播完一轮重新抽一次，站着不会一直重复同一个动作
-        ...(spec.onMode === 'loop' ? { reroll: true } : {}),
+        // 循环类动作每播完当前动画的 rerollCycles 轮重新抽一次；顶层写第 0 条的值给老车机兜底
+        ...(spec.onMode === 'loop' ? { reroll: true, rerollCycles: normalizeRerollCycles(target.variants[0].rerollCycles) } : {}),
       } : {}),
       ...(target.slot.id === 'CS_Idle' ? {
         triggerDelayMs: normalizeIdleDelaySeconds(target.binding.triggerDelaySeconds) * 1000,
@@ -4074,18 +4166,21 @@ function dropHiddenSubmeshes(parsed, hiddenMaterials) {
   }
 }
 
+/** 组合动画的片段描述：{ index, repeat }；旧项目存的是纯下标，按重复 1 次处理。 */
+export function normalizeComboSegments(segments) {
+  return (segments || []).map((segment) => {
+    const index = Number(typeof segment === 'number' ? segment : segment?.index);
+    const repeat = Math.round(Number(segment?.repeat));
+    return { index, repeat: Number.isFinite(repeat) ? Math.min(20, Math.max(1, repeat)) : 1 };
+  }).filter((segment) => Number.isInteger(segment.index) && segment.index >= 0);
+}
+
 /**
- * 把几段动画按顺序首尾相接拼成一段新动画：各段时间轴依次平移；某段没有驱动的节点沿用上一段的末帧
- * （第一段就用节点静止姿态）；过渡为 0 时用 1ms 硬切保证时间轴严格递增。
- * 合成信息记在 extras.bydCombined，界面据此列出与删除。
+ * 把 state 里的几段动画首尾相接：各段时间轴依次平移；某段没有驱动的节点沿用上一段的末帧
+ * （第一段就用节点静止姿态）；相邻两段之间留 gap 秒做线性过渡（1ms 即硬切）。
  */
-export function combineAnimations(bytes, { name, segments, blendMs = 0 }) {
-  const state = parseGlb(bytes);
+function concatAnimationClips(state, clips, gap, name) {
   const { json } = state;
-  bakeAnimationSources(state);
-  const clips = segments.map((index) => json.animations?.[index]);
-  if (clips.length < 2 || clips.some((clip) => !clip)) throw new Error('组合动画至少需要两段有效动画');
-  const gap = Math.max(0.001, (Number(blendMs) || 0) / 1000);
   const starts = [];
   let cursor = 0;
   clips.forEach((clip, order) => {
@@ -4095,12 +4190,7 @@ export function combineAnimations(bytes, { name, segments, blendMs = 0 }) {
   const channelMaps = clips.map((clip) => new Map((clip.channels || [])
     .filter((channel) => Number.isInteger(channel.target?.node) && ['translation', 'rotation', 'scale'].includes(channel.target.path))
     .map((channel) => [`${channel.target.node}|${channel.target.path}`, channel])));
-  const output = {
-    name,
-    samplers: [],
-    channels: [],
-    extras: { bydCombined: { segments: [...segments], blendMs: Math.max(0, Math.round(Number(blendMs) || 0)) } },
-  };
+  const output = { name, samplers: [], channels: [] };
   const shared = new Map();
   for (const key of new Set(channelMaps.flatMap((map) => [...map.keys()]))) {
     const [nodeText, path] = key.split('|');
@@ -4150,7 +4240,36 @@ export function combineAnimations(bytes, { name, segments, blendMs = 0 }) {
     }
     output.channels.push({ sampler: samplerIndex, target: { node, path } });
   }
-  json.animations.push(output);
+  return { clip: output, starts };
+}
+
+/**
+ * 把几段动画按顺序拼成一段新动画写进模型。每段可重复若干次；loopTail 表示最后一段要无限循环：
+ * 合成的片段只含"前奏 + 尾段一遍"，并记下前奏时长 introMs，导出时前奏进 ENTER 阶段、尾段作为循环段。
+ * 合成信息记在 extras.bydCombined，界面据此列出、删除与试播。
+ */
+export function combineAnimations(bytes, { name, segments, blendMs = 0, loopTail = false }) {
+  const state = parseGlb(bytes);
+  const { json } = state;
+  bakeAnimationSources(state);
+  const plan = normalizeComboSegments(segments);
+  const entries = plan.flatMap((segment, order) => Array.from(
+    { length: loopTail && order === plan.length - 1 ? 1 : segment.repeat },
+    () => segment.index,
+  ));
+  const clips = entries.map((index) => json.animations?.[index]);
+  if (entries.length < 2 || clips.some((clip) => !clip)) throw new Error('组合动画至少需要两段有效动画');
+  const gap = Math.max(0.001, (Number(blendMs) || 0) / 1000);
+  const { clip, starts } = concatAnimationClips(state, clips, gap, name);
+  clip.extras = {
+    bydCombined: {
+      segments: plan,
+      blendMs: Math.max(0, Math.round(Number(blendMs) || 0)),
+      loopTail: Boolean(loopTail),
+      ...(loopTail ? { introMs: Math.round(starts[starts.length - 1] * 1000) } : {}),
+    },
+  };
+  json.animations.push(clip);
   return buildGlb(json, state.bin);
 }
 
