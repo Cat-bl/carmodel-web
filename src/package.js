@@ -2444,6 +2444,8 @@ function holdAnimationClip(state, source, name) {
 
 // 固定四个来源相位，地图端无需读取原生动画进度也能选择最接近的一段。
 const EVENT_TRANSITION_PHASES = [0, 1 / 3, 2 / 3, 1];
+// 同一事件里最多这么多条动画时才两两生成直切过渡（段数 N×(N−1)），再多就退回锚点中转，控制包体和车机 JSON 体积。
+const MAX_DIRECT_SWITCH_VARIANTS = 9;
 function restAnimationValue(node, path) {
   if (path === 'translation') return Array.from(node?.translation || [0, 0, 0], Number);
   if (path === 'rotation') return quatNormalize(Array.from(node?.rotation || [0, 0, 0, 1], Number));
@@ -2710,19 +2712,23 @@ function addConstantChannel(state, clip, node, path, value) {
  * 复用车机既有的 ENTER / RST 两个阶段：ENTER 从锚点进入动作，RST 从动作退回锚点，
  * 因此 manifest 结构和车机状态机都不用改，只是基准姿态从模型默认姿态换成了锚点。
  */
-function buildAnchorClips(state, eventRecords, phases) {
+function buildAnchorClips(state, eventRecords, phases, yawNode = null) {
   if (!eventRecords.length) return [];
   const anchorRecord = anchorRecordOf(eventRecords);
   const anchorPose = animationPoseAt(state, anchorRecord.variants[0].active, 0);
+  // 锚点朝向固定为模型初始朝向 0°：每条动画的转向角都是相对初始朝向的绝对角度，
+  // 首次进入待机也要从 0° 平滑转到位；若锚点顶着待机自己的角度，进入时就没有转向过渡而是直接跳过去
+  for (const [key, descriptor] of anchorPose) {
+    if (descriptor.node === yawNode && descriptor.path === 'rotation') anchorPose.set(key, { ...descriptor, value: [0, 0, 0, 1] });
+  }
   const clips = [];
   for (const record of eventRecords) {
     // 过渡只写本事件驱动的节点：并行槽里的灯光事件不能把身体骨骼往锚点/静止姿态拽
     const nodes = eventNodeIndices(record);
     const anchor = new Map([...anchorPose].filter(([, descriptor]) => nodes.has(descriptor.node)));
-    const anchorYaw = anchorRecord.variants[0].yaw || 0;
     for (const variant of record.variants) {
       // 要转向的动画把进入/退出过渡拉长到转向所需时间，180° 约 0.8 秒，免得"啪"一下转过去
-      const halfMs = Math.max(Math.round(record.playback.transitionMs / 2), yawTurnMs((variant.yaw || 0) - anchorYaw));
+      const halfMs = Math.max(Math.round(record.playback.transitionMs / 2), yawTurnMs(variant.yaw || 0));
       if (!(halfMs > 0) && !variant.intro) continue;
       // 起止姿态一致（典型是锚点自己那条动画）时过渡会被整段省掉，
       // 这里补一段静态占位，保证车机 ENTER → ON、RST → 下一动作的链路不断
@@ -2752,6 +2758,58 @@ function buildAnchorClips(state, eventRecords, phases) {
     }
   }
   return clips;
+}
+
+/**
+ * 同一事件内随机换动画的直切过渡：当前动画循环末尾 → 下一条动画首帧，不再绕回锚点。
+ *
+ * 每条动画的转向角都是相对初始朝向的绝对角度，直切时只补两者的角度差：
+ * 角度相同一点不转，180° 换 −160° 只转 20°；经锚点中转则会先转回 0° 再转过去，来回摆。
+ * 重抽固定发生在整轮结束时，所以每对动画只需一段（相位 0）过渡，段数 = N×(N−1)。
+ * 组合动画的前奏单独再导一份，车机播完直切过渡先接前奏、再进循环尾段。
+ * 跨事件切换（待机 ↔ 前进等）仍走锚点中转。
+ */
+function buildVariantSwitchClips(state, eventRecords) {
+  const clips = [];
+  const skipped = [];
+  for (const record of eventRecords) {
+    const { variants } = record;
+    if (variants.length < 2 || record.spec.onMode !== 'loop') continue;
+    if (variants.length > MAX_DIRECT_SWITCH_VARIANTS) {
+      skipped.push(record.slot.label || record.slot.id);
+      continue;
+    }
+    const firstPoses = variants.map((variant) => animationPoseAt(state, variant.intro || variant.active, 0));
+    const endPoses = variants.map((variant) => variant.transitionPoses?.[0] || animationPoseAt(state, variant.active, 0));
+    let switched = false;
+    variants.forEach((variant, index) => {
+      const switches = [];
+      variants.forEach((target, targetIndex) => {
+        if (targetIndex === index) return;
+        // 过渡时长取用户设定与转向所需时间的较大者，角度差越小转得越快；
+        // 过渡时长设为 0 也至少给 1ms，让车机仍走直切链路硬切过去，而不是因为没有过渡退回锚点绕一圈
+        const durationMs = Math.max(record.playback.transitionMs, yawTurnMs((target.yaw || 0) - (variant.yaw || 0)), 1);
+        const name = `${variant.base}_SW${targetIndex}`;
+        // 起止姿态完全一样时补一段静态占位，让车机仍走「直切 → 目标动作」链路而不是退回锚点
+        const clip = poseTransitionClip(state, endPoses[index], firstPoses[targetIndex], name, durationMs)
+          || staticPoseClip(state, firstPoses[targetIndex], name, durationMs);
+        if (!clip) return;
+        clips.push(clip);
+        switches.push({ to: targetIndex, animation: clip.name, durationMs });
+      });
+      if (!switches.length) return;
+      variant.spec.switches = switches;
+      switched = true;
+    });
+    if (!switched) continue;
+    for (const variant of variants) {
+      if (!variant.intro) continue;
+      clips.push(variant.intro);
+      variant.spec.intro = variant.intro.name;
+      variant.spec.introDurationMs = Math.round(animationDurationOf(state, variant.intro) * 1000);
+    }
+  }
+  return { clips, skipped };
 }
 
 /** 该事件所有动画驱动到的节点集合；两个事件的集合不相交就能同时播放。 */
@@ -2893,8 +2951,9 @@ async function normalizeAnimatedOtherGlb(
   const yawParts = new Set(eventRecords
     .filter((record) => record.variants.some((variant) => normalizeYawDegrees(variant.yaw) !== 0))
     .map((record) => record.part));
+  let yawNode = null;
   if (yawParts.size) {
-    const yawNode = addYawPivot(json, sourceRoots, transform);
+    yawNode = addYawPivot(json, sourceRoots, transform);
     for (const record of eventRecords) {
       if (!yawParts.has(record.part)) continue;
       for (const variant of record.variants) {
@@ -2911,7 +2970,10 @@ async function normalizeAnimatedOtherGlb(
   // 所有动作都经由锚点姿态互相衔接，段数只跟变体数成线性，不会随事件对数爆炸。
   onProgress?.(0.4, '正在生成动作衔接过渡');
   await yieldToBrowser();
-  outputAnimations.push(...buildAnchorClips(state, eventRecords, resetPhases));
+  outputAnimations.push(...buildAnchorClips(state, eventRecords, resetPhases, yawNode));
+  // 同一事件内换动画直切，转向只补角度差；动作太多的事件退回锚点中转
+  const variantSwitches = buildVariantSwitchClips(state, eventRecords);
+  outputAnimations.push(...variantSwitches.clips);
 
   for (const target of eventRecords) {
     const spec = target.spec;
@@ -2935,6 +2997,9 @@ async function normalizeAnimatedOtherGlb(
           offDurationMs: variantSpec.offDurationMs,
           cycleDurationMs: variantSpec.cycleDurationMs,
           ...(variantSpec.reset ? { reset: variantSpec.reset } : {}),
+          // 同事件内重抽到别的动画时直切用的过渡，按目标动画序号索引；老车机不认识会照旧退锚点
+          ...(variantSpec.switches ? { switches: variantSpec.switches } : {}),
+          ...(variantSpec.intro ? { intro: variantSpec.intro, introDurationMs: variantSpec.introDurationMs } : {}),
         })),
         // 循环类动作每播完当前动画的 rerollCycles 轮重新抽一次；顶层写第 0 条的值给老车机兜底
         ...(spec.onMode === 'loop' ? { reroll: true, rerollCycles: normalizeRerollCycles(target.variants[0].rerollCycles) } : {}),
@@ -2944,7 +3009,9 @@ async function normalizeAnimatedOtherGlb(
       } : {}),
     };
   }
-  if (resetPhases.length < EVENT_TRANSITION_PHASES.length) {
+  if (variantSwitches.skipped.length) {
+    onProgress?.(0.8, `${variantSwitches.skipped.join('、')} 挂的动画超过 ${MAX_DIRECT_SWITCH_VARIANTS} 条，随机切换改经锚点中转`);
+  } else if (resetPhases.length < EVENT_TRANSITION_PHASES.length) {
     onProgress?.(0.8, `动作较多，衔接过渡已自动精简为 ${resetPhases.length} 相位`);
   } else if (partCount > 1) {
     onProgress?.(0.8, `动作互不冲突，已分成 ${partCount} 组可同时播放`);

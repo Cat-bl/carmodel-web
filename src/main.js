@@ -3106,7 +3106,7 @@ function variantListHtml(slot, binding) {
   if (variants.length <= 1) {
     const only = variants[0];
     return `<div class="source-animation-bound"><span>已绑定动画</span><strong title="${escapeHtml(only?.name || '')}">${escapeHtml(only?.name || '')}</strong>
-      ${only ? `<div class="variant-controls"><span class="variant-field" title="触发这条动画时模型原地转向：正数向左、负数向右、180 转身；进入和退出时会自动平滑转过去"><span>触发时转向</span><input id="variant-yaw-${only.index}" type="number" min="-180" max="180" step="15" value="${only.yaw}" aria-label="${escapeHtml(only.name)} 的转向角度" /><small>°</small></span></div>` : ''}
+      ${only ? `<div class="variant-controls"><span class="variant-field" title="触发这条动画时模型相对初始朝向原地转到的角度：正数向左、负数向右、180 转身；进入时平滑转过去，退出时转回初始朝向"><span>触发时转向</span><input id="variant-yaw-${only.index}" type="number" min="-180" max="180" step="15" value="${only.yaw}" aria-label="${escapeHtml(only.name)} 的转向角度" /><small>°</small></span></div>` : ''}
     </div>`;
   }
   const chances = variantChances(variants);
@@ -3122,7 +3122,7 @@ function variantListHtml(slot, binding) {
       <button class="btn small variant-remove" type="button" data-variant-remove="${variant.index}" aria-label="移除 ${escapeHtml(variant.name)}"><i data-lucide="x"></i></button>
       <div class="variant-controls">
         <span class="variant-field" title="抽中这条动画的相对权重，右侧是换算后的概率"><span>权重</span><input id="variant-weight-${variant.index}" type="number" min="1" max="100" step="1" value="${variant.weight}" aria-label="${escapeHtml(variant.name)} 的权重" /><small>${chances[index]}%</small></span>
-        <span class="variant-field" title="触发这条动画时模型原地转向：正数向左、负数向右、180 转身"><span>触发时转向</span><input id="variant-yaw-${variant.index}" type="number" min="-180" max="180" step="15" value="${variant.yaw}" aria-label="${escapeHtml(variant.name)} 的转向角度" /><small>°</small></span>
+        <span class="variant-field" title="触发这条动画时模型相对初始朝向原地转到的角度：正数向左、负数向右、180 转身；随机换到另一条动画时只补两者的角度差，角度相同就不转"><span>触发时转向</span><input id="variant-yaw-${variant.index}" type="number" min="-180" max="180" step="15" value="${variant.yaw}" aria-label="${escapeHtml(variant.name)} 的转向角度" /><small>°</small></span>
         <span class="variant-field" title="循环播放时，这条动画至少连着播这么多轮才重新抽；抽到自己会继续循环不打断"><span>至少播</span><input id="variant-reroll-${variant.index}" type="number" min="1" max="99" step="1" value="${variant.rerollCycles}" aria-label="${escapeHtml(variant.name)} 至少循环几轮再换" /><small>轮再换</small></span>
       </div>
     </div>`).join('');
