@@ -71,6 +71,10 @@ import { emptySelection, selectionGroupCount, selectionTriangleCount } from './s
 
 const app = document.querySelector('#app');
 
+const GITHUB_REPO_URL = 'https://github.com/Cat-bl/carmodel-web';
+// lucide 1.x 已移除品牌图标，GitHub 标志用内联 SVG
+const GITHUB_MARK_SVG = '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>';
+
 app.innerHTML = `
   <section class="model-type-home" id="model-type-home" aria-labelledby="model-type-title">
     <header class="model-type-homebar">
@@ -116,6 +120,7 @@ app.innerHTML = `
     <footer class="model-type-footer">
       <span>支持 ${MODEL_FORMAT_HINT}</span>
       <span>项目进度可保存为 .bydcarproj</span>
+      <a class="footer-github" href="${GITHUB_REPO_URL}" target="_blank" rel="noopener">${GITHUB_MARK_SVG}<span>开发者：冰凉到通透 · GitHub 开源</span></a>
     </footer>
   </section>
 
@@ -145,6 +150,7 @@ app.innerHTML = `
       </div>
       <div class="command-actions">
         <label class="btn command-import" for="model-file" title="更换当前模型，有未保存的修改时会先提示保存项目"><i data-lucide="upload"></i><span>重新导入模型</span></label>
+        <a class="icon-btn project-action" href="${GITHUB_REPO_URL}" target="_blank" rel="noopener" title="GitHub 开源仓库 · 开发者：冰凉到通透">${GITHUB_MARK_SVG}</a>
         <button class="icon-btn project-action" id="open-project" type="button" title="打开项目"><i data-lucide="folder-open"></i></button>
         <button class="icon-btn project-action" id="save-project" type="button" title="保存项目 (Ctrl+S)" disabled><i data-lucide="save"></i></button>
         <button class="btn command-check" data-panel-target="check"><i data-lucide="check-circle-2"></i><span>检查</span></button>

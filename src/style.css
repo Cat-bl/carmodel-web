@@ -68,7 +68,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, label:focus-vis
 .model-type-option.other .model-type-enter { color: #bba17e; }
 .model-type-enter svg { width: 14px; height: 14px; }
 .home-project-link { display: none; align-items: center; justify-content: center; gap: 7px; min-height: 42px; margin: 22px auto 0; padding: 8px 14px; color: #b7c4c9; border: 1px solid #35434a; border-radius: 5px; background: #151b1f; font-size: 12px; cursor: pointer; }
-.model-type-footer { display: flex; justify-content: space-between; gap: 14px; padding: 13px 30px; color: #68777e; border-top: 1px solid #252f35; background: #0d1114; font-size: 10px; }
+.model-type-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 14px; padding: 13px 30px; color: #68777e; border-top: 1px solid #252f35; background: #0d1114; font-size: 10px; }
+.footer-github { display: inline-flex; align-items: center; gap: 6px; color: #8fa2ab; text-decoration: none; }
+.footer-github:hover { color: #e6eef2; }
+.footer-github svg { width: 13px; height: 13px; }
+a.icon-btn { text-decoration: none; }
 
 .model-type-badge { display: inline-flex; align-items: center; gap: 5px; min-height: 25px; margin-left: 3px; padding: 4px 8px; color: #83d4dc; border: 1px solid #315861; border-radius: 4px; background: #172a2e; font-size: 10px; cursor: pointer; white-space: nowrap; }
 .model-type-badge:hover { color: #fff; border-color: #5cb8c5; background: #204149; }
