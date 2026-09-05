@@ -1,6 +1,6 @@
 import './style.css';
 import { ModelPreview } from './preview.js';
-import { bakeSubmeshVisibility, combineAnimations, makeBydCar, makeVehiclePreviewGlb, normalizeComboSegments, removeAnimation } from './package.js';
+import { bakeSubmeshVisibility, combineAnimations, convertLegacyMaterials, makeBydCar, makeVehiclePreviewGlb, normalizeComboSegments, removeAnimation } from './package.js';
 import { listSubmeshes, recommendedHiddenSubmeshes } from './submeshes.js';
 import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
 import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
@@ -1149,6 +1149,15 @@ async function activatePreparedModel(prepared, {
   ui['remove-shadow'].checked = removeShadow;
   preview.setRemoveShadow(removeShadow);
   updateModelTypeUi();
+  // 旧的 Specular/Glossiness 材质先换算成标准 PBR：three.js 已不认这个扩展（会显示成白模），车机也只认 metallic/roughness
+  const convertedBytes = convertLegacyMaterials(prepared.bytes);
+  if (convertedBytes !== prepared.bytes) {
+    prepared = {
+      ...prepared,
+      bytes: convertedBytes,
+      warnings: [...(prepared.warnings || []), '材质使用了旧的 Specular/Glossiness 工作流，已自动换算为标准 PBR，光泽表现可能与原模型略有差异'],
+    };
+  }
   // 站点导出的模型自带按动画显隐子网格的规则，先烘成标准动画通道，预览/导出/项目文件才一致
   prepared = { ...prepared, bytes: bakeSubmeshVisibility(prepared.bytes) };
   const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {

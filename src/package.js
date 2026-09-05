@@ -4613,6 +4613,80 @@ function visibilityKeyframes(defaultVisible, events, duration) {
   return keys;
 }
 
+const SPEC_GLOSS_EXTENSION = 'KHR_materials_pbrSpecularGlossiness';
+const DIELECTRIC_SPECULAR = 0.04;
+
+/**
+ * 旧的 Specular/Glossiness 材质换算成标准 Metallic/Roughness。
+ *
+ * 常量按 Khronos 参考实现（glTF-Sample-Viewer 的 specular-glossiness → metallic-roughness）反解：
+ * 先由漫反射/高光的感知亮度解出 metallic，再按 metallic² 在"来自漫反射"和"来自高光"两组底色间插值。
+ * 贴图只搬 diffuseTexture → baseColorTexture；specularGlossinessTexture 的逐像素换算需要重采样贴图，
+ * 而车机烘焙只读 metallic/roughness 常量，这里直接丢弃，粗糙度用 1 − glossinessFactor 兜住。
+ * 其余字段（法线、自发光、双面、alphaMode）原样保留。返回是否真的转换了材质。
+ */
+function convertSpecularGlossinessToPbr(json) {
+  let converted = false;
+  for (const material of json.materials || []) {
+    const ext = material.extensions?.[SPEC_GLOSS_EXTENSION];
+    if (!ext) continue;
+    const diffuse = Array.isArray(ext.diffuseFactor) && ext.diffuseFactor.length === 4 ? ext.diffuseFactor.map(Number) : [1, 1, 1, 1];
+    const specular = Array.isArray(ext.specularFactor) && ext.specularFactor.length === 3 ? ext.specularFactor.map(Number) : [1, 1, 1];
+    const glossiness = Number.isFinite(Number(ext.glossinessFactor)) ? Math.min(1, Math.max(0, Number(ext.glossinessFactor))) : 1;
+    const { baseColorFactor, metallicFactor } = specGlossToMetalRough(diffuse, specular);
+    const pbr = { ...material.pbrMetallicRoughness };
+    pbr.baseColorFactor = baseColorFactor;
+    pbr.metallicFactor = metallicFactor;
+    pbr.roughnessFactor = 1 - glossiness;
+    if (ext.diffuseTexture && Number.isInteger(ext.diffuseTexture.index)) pbr.baseColorTexture = { ...ext.diffuseTexture };
+    else delete pbr.baseColorTexture;
+    delete pbr.metallicRoughnessTexture;
+    material.pbrMetallicRoughness = pbr;
+    delete material.extensions[SPEC_GLOSS_EXTENSION];
+    if (!Object.keys(material.extensions).length) delete material.extensions;
+    converted = true;
+  }
+  for (const key of ['extensionsUsed', 'extensionsRequired']) {
+    if (!Array.isArray(json[key]) || !json[key].includes(SPEC_GLOSS_EXTENSION)) continue;
+    json[key] = json[key].filter((name) => name !== SPEC_GLOSS_EXTENSION);
+    if (!json[key].length) delete json[key];
+    converted = true;
+  }
+  return converted;
+}
+
+function specGlossToMetalRough(diffuse, specular) {
+  const perceived = (color) => Math.sqrt(0.299 * color[0] ** 2 + 0.587 * color[1] ** 2 + 0.114 * color[2] ** 2);
+  const oneMinusSpecularStrength = 1 - Math.max(specular[0], specular[1], specular[2]);
+  const diffuseBrightness = perceived(diffuse);
+  const specularBrightness = perceived(specular);
+  let metallic = 0;
+  if (specularBrightness >= DIELECTRIC_SPECULAR) {
+    const a = DIELECTRIC_SPECULAR;
+    const b = diffuseBrightness * oneMinusSpecularStrength / (1 - DIELECTRIC_SPECULAR) + specularBrightness - 2 * DIELECTRIC_SPECULAR;
+    const c = DIELECTRIC_SPECULAR - specularBrightness;
+    const discriminant = Math.max(b * b - 4 * a * c, 0);
+    metallic = Math.min(1, Math.max(0, (-b + Math.sqrt(discriminant)) / (2 * a)));
+  }
+  const epsilon = 1e-4;
+  const blend = metallic * metallic;
+  const baseColor = [0, 1, 2].map((axis) => {
+    const fromDiffuse = diffuse[axis] * oneMinusSpecularStrength / (1 - DIELECTRIC_SPECULAR) / Math.max(1 - metallic, epsilon);
+    const fromSpecular = (specular[axis] - DIELECTRIC_SPECULAR * (1 - metallic)) / Math.max(metallic, epsilon);
+    return Math.min(1, Math.max(0, fromDiffuse * (1 - blend) + fromSpecular * blend));
+  });
+  return { baseColorFactor: [...baseColor, Math.min(1, Math.max(0, diffuse[3]))], metallicFactor: metallic };
+}
+
+/**
+ * 导入时把旧的 Specular/Glossiness 材质换算成标准 PBR，预览、项目文件、导出看到的是同一份模型。
+ * three.js 0.15x 起不再支持该扩展（会显示成白模），车机也只认 metallic/roughness。已是标准 PBR 的原样返回。
+ */
+export function convertLegacyMaterials(bytes) {
+  const state = parseGlb(bytes);
+  return state.legacyMaterials ? buildGlb(state.json, state.bin) : bytes;
+}
+
 function parseGlb(bytes) {
   const data = new Uint8Array(bytes);
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -4634,7 +4708,9 @@ function parseGlb(bytes) {
   const json = JSON.parse(new TextDecoder().decode(chunks[0].bytes).replace(/[\u0000 ]+$/, ''));
   if (json.asset?.version !== '2.0') throw new Error('只支持 glTF 2.0');
   const bin = chunks.find((chunk) => chunk.type === 'BIN\0')?.bytes || new Uint8Array();
-  return { json, bin };
+  // 所有解析入口统一换算旧的 Specular/Glossiness 材质，导出、组合动画、显隐烘焙都不会再撞上这个扩展
+  const legacyMaterials = convertSpecularGlossinessToPbr(json);
+  return { json, bin, legacyMaterials };
 }
 
 async function extractMainTexture({ json, bin }) {
