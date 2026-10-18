@@ -1,6 +1,6 @@
 import './style.css';
 import { ModelPreview } from './preview.js';
-import { bakeSubmeshVisibility, combineAnimations, convertLegacyMaterials, makeBydCar, makeVehiclePreviewGlb, normalizeComboSegments, removeAnimation } from './package.js';
+import { bakeSubmeshVisibility, combineAnimations, convertLegacyMaterials, decodeDracoMeshes, makeBydCar, makeVehiclePreviewGlb, normalizeComboSegments, removeAnimation } from './package.js';
 import { listSubmeshes, recommendedHiddenSubmeshes } from './submeshes.js';
 import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
 import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
@@ -1158,6 +1158,13 @@ async function activatePreparedModel(prepared, {
       warnings: [...(prepared.warnings || []), '材质使用了旧的 Specular/Glossiness 工作流，已自动换算为标准 PBR，光泽表现可能与原模型略有差异'],
     };
   }
+  // Draco 压缩的网格先解压回普通 accessor：预览不必挂解码器，显隐烘焙、导出管线和车机都只认未压缩数据
+  prepared = {
+    ...prepared,
+    bytes: await decodeDracoMeshes(prepared.bytes, (ratio) => updateImportProgress({
+      progress: previewProgressStart, label: `正在解压 Draco 网格 ${Math.round(ratio * 100)}%`, indeterminate: true,
+    })),
+  };
   // 站点导出的模型自带按动画显隐子网格的规则，先烘成标准动画通道，预览/导出/项目文件才一致
   prepared = { ...prepared, bytes: bakeSubmeshVisibility(prepared.bytes) };
   const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {

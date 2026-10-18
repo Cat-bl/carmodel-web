@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import { MeshoptSimplifier } from 'meshoptimizer';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import {
   SLOT_BY_ID,
   animationNamesOf,
@@ -4685,6 +4686,157 @@ function specGlossToMetalRough(diffuse, specular) {
 export function convertLegacyMaterials(bytes) {
   const state = parseGlb(bytes);
   return state.legacyMaterials ? buildGlb(state.json, state.bin) : bytes;
+}
+
+const DRACO_EXTENSION = 'KHR_draco_mesh_compression';
+const DRACO_DECODER_PATH = './draco/';
+const INDEX_COMPONENT_LIMITS = { 5121: 0xff, 5123: 0xffff };
+
+/**
+ * 导入时把 Draco 压缩的网格解压回普通 accessor，预览、项目文件、导出看到的是同一份模型。
+ * 导出管线直接读写 accessor 数据，车机也不认这个扩展；只声明未使用的扩展同样要摘掉，否则 GLTFLoader 会直接报错。
+ * 解码复用 three 的 DRACOLoader（解码器放在 public/draco），写回沿用原 accessor 的分量类型与 normalized，
+ * 索引超出原类型范围时升为 Uint32；压缩数据所在的 bufferView 随后丢弃。没有 Draco 的原样返回。
+ */
+export async function decodeDracoMeshes(bytes, onProgress = null) {
+  const state = parseGlb(bytes);
+  const { json } = state;
+  const primitives = (json.meshes || []).flatMap((mesh) => mesh.primitives || [])
+    .filter((primitive) => primitive.extensions?.[DRACO_EXTENSION]);
+  const declared = ['extensionsUsed', 'extensionsRequired'].some((key) => json[key]?.includes?.(DRACO_EXTENSION));
+  if (!primitives.length && !declared) return bytes;
+
+  if (primitives.length) {
+    const loader = new DRACOLoader().setDecoderPath(DRACO_DECODER_PATH);
+    try {
+      // 同一份几何的多个实例共用压缩 bufferView，只解一次
+      const tasks = new Map();
+      let finished = 0;
+      onProgress?.(0);
+      for (const primitive of primitives) {
+        const ext = primitive.extensions[DRACO_EXTENSION];
+        if (tasks.has(ext.bufferView)) continue;
+        tasks.set(ext.bufferView, decodeDracoPrimitive(loader, state, primitive).then((geometry) => {
+          onProgress?.(++finished / tasks.size);
+          return geometry;
+        }));
+      }
+      const geometries = new Map(await Promise.all([...tasks].map(async ([key, task]) => [key, await task])));
+      // 按 primitive 顺序写回，同一模型每次导入得到的字节一致
+      const written = new Set();
+      for (const primitive of primitives) {
+        const ext = primitive.extensions[DRACO_EXTENSION];
+        const geometry = geometries.get(ext.bufferView);
+        for (const name of Object.keys(ext.attributes || {})) {
+          const accessorIndex = primitive.attributes[name];
+          if (written.has(accessorIndex)) continue;
+          written.add(accessorIndex);
+          const accessor = json.accessors[accessorIndex];
+          const { array } = geometry.getAttribute(name);
+          writeDecodedAccessor(state, accessor, array, VEHICLE_ARRAY_BUFFER);
+          if (name === 'POSITION') Object.assign(accessor, positionBounds(array));
+        }
+        const index = geometry.index?.array;
+        if (index) {
+          if (!Number.isInteger(primitive.indices)) {
+            json.accessors.push({ componentType: 5125, type: 'SCALAR', count: 0 });
+            primitive.indices = json.accessors.length - 1;
+          }
+          if (!written.has(primitive.indices)) {
+            written.add(primitive.indices);
+            const accessor = json.accessors[primitive.indices];
+            let max = 0;
+            for (const value of index) if (value > max) max = value;
+            if (max > (INDEX_COMPONENT_LIMITS[accessor.componentType] ?? -1)) accessor.componentType = 5125;
+            const output = accessor.componentType === 5125 ? index : new COMPONENT_INFO[accessor.componentType].Array(index);
+            writeDecodedAccessor(state, accessor, output, VEHICLE_ELEMENT_ARRAY_BUFFER);
+          }
+        }
+        delete primitive.extensions[DRACO_EXTENSION];
+        if (!Object.keys(primitive.extensions).length) delete primitive.extensions;
+      }
+    } finally {
+      loader.dispose();
+    }
+  }
+
+  for (const key of ['extensionsUsed', 'extensionsRequired']) {
+    if (!Array.isArray(json[key]) || !json[key].includes(DRACO_EXTENSION)) continue;
+    json[key] = json[key].filter((name) => name !== DRACO_EXTENSION);
+    if (!json[key].length) delete json[key];
+  }
+  if (primitives.length) dropUnreferencedBufferViews(state);
+  return buildGlb(json, state.bin);
+}
+
+/**
+ * 丢掉不再被 accessor/图片引用的 bufferView（解压后的 Draco 数据），其余视图逐个原样搬运。
+ * 不走 repackBin：它会把顶点视图合并成一个无 byteStride 的大视图，导入阶段的模型应保持合法布局。
+ */
+function dropUnreferencedBufferViews(state) {
+  const { json } = state;
+  const referenced = new Set();
+  for (const accessor of json.accessors || []) {
+    for (const index of [accessor.bufferView, accessor.sparse?.indices?.bufferView, accessor.sparse?.values?.bufferView]) {
+      if (Number.isInteger(index)) referenced.add(index);
+    }
+  }
+  for (const image of json.images || []) {
+    if (Number.isInteger(image.bufferView)) referenced.add(image.bufferView);
+  }
+  const remap = new Map();
+  const views = [];
+  const copies = [];
+  let total = 0;
+  json.bufferViews.forEach((view, index) => {
+    if (!referenced.has(index)) return;
+    total = (total + 3) & ~3;
+    remap.set(index, views.length);
+    copies.push({ from: view.byteOffset || 0, length: view.byteLength, to: total });
+    views.push({ ...view, buffer: 0, byteOffset: total });
+    total += view.byteLength;
+  });
+  const bin = new Uint8Array(total);
+  for (const copy of copies) bin.set(state.bin.subarray(copy.from, copy.from + copy.length), copy.to);
+  json.bufferViews = views;
+  for (const accessor of json.accessors || []) {
+    if (Number.isInteger(accessor.bufferView)) accessor.bufferView = remap.get(accessor.bufferView);
+    if (Number.isInteger(accessor.sparse?.indices?.bufferView)) accessor.sparse.indices.bufferView = remap.get(accessor.sparse.indices.bufferView);
+    if (Number.isInteger(accessor.sparse?.values?.bufferView)) accessor.sparse.values.bufferView = remap.get(accessor.sparse.values.bufferView);
+  }
+  for (const image of json.images || []) {
+    if (Number.isInteger(image.bufferView)) image.bufferView = remap.get(image.bufferView);
+  }
+  state.bin = bin;
+  delete state[BIN_STORAGE];
+  if (json.buffers?.[0]) json.buffers[0].byteLength = bin.byteLength;
+}
+
+async function decodeDracoPrimitive(loader, state, primitive) {
+  const { json, bin } = state;
+  const ext = primitive.extensions[DRACO_EXTENSION];
+  const view = json.bufferViews?.[ext.bufferView];
+  if (!view || view.buffer !== 0) throw new Error('Draco 压缩数据的 bufferView 无效');
+  const offset = view.byteOffset || 0;
+  if (offset + view.byteLength > bin.byteLength) throw new Error('Draco 压缩数据越界');
+  const attributeIDs = {};
+  const attributeTypes = {};
+  for (const [name, id] of Object.entries(ext.attributes || {})) {
+    const info = COMPONENT_INFO[json.accessors?.[primitive.attributes?.[name]]?.componentType];
+    if (!info) throw new Error(`Draco 属性 ${name} 缺少有效的 accessor`);
+    attributeIDs[name] = id;
+    attributeTypes[name] = info.Array.name;
+  }
+  // 解码在 worker 里进行，缓冲会被转移，必须切出独立副本
+  const buffer = bin.slice(offset, offset + view.byteLength).buffer;
+  return loader.decodeGeometry(buffer, { attributeIDs, attributeTypes, useUniqueIDs: true });
+}
+
+function writeDecodedAccessor(state, accessor, array, target) {
+  accessor.bufferView = appendImageToBin(state, new Uint8Array(array.buffer, array.byteOffset, array.byteLength));
+  state.json.bufferViews[accessor.bufferView].target = target;
+  accessor.byteOffset = 0;
+  accessor.count = array.length / TYPE_COMPONENTS[accessor.type];
 }
 
 function parseGlb(bytes) {
