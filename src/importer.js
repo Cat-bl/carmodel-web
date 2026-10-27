@@ -2,10 +2,10 @@ import * as THREE from 'three';
 import JSZip from 'jszip';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { TGALoader } from 'three/addons/loaders/TGALoader.js';
+import { packGltfAsGlb } from './package.js';
 
 const WHITE_PIXEL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgQIAKpWnWQAAAABJRU5ErkJggg==';
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tga']);
@@ -45,9 +45,13 @@ export async function prepareModelImport(file, onProgress = null) {
     if (!primary) throw new Error('ZIP 中没有找到 .gltf、.fbx 或 .obj 主模型');
     modelName = baseName(primary.path);
     if (primary.extension === 'gltf') {
-      sourceFormat = 'gltf';
-      report(0.5, '正在解析 glTF 与关联资源', true);
-      ({ scene, animations } = await parseGltf(primary, archive));
+      // glTF 直接打包成 GLB，压缩、扩展和旧材质都交给 GLB 导入时的统一规范化处理
+      report(0.5, '正在打包 glTF 与关联资源', true);
+      const bytes = packGltf(primary, archive);
+      report(0.98, '格式转换完成');
+      return {
+        bytes, name: `${modelName}.glb`, sourceName: file.name, sourceFormat: 'gltf', formatLabel: FORMAT_LABELS.gltf, warnings,
+      };
     } else if (primary.extension === 'fbx') {
       sourceFormat = 'fbx-zip';
       report(0.5, '正在解析 FBX 与关联贴图', true);
@@ -76,7 +80,7 @@ export async function prepareModelImport(file, onProgress = null) {
   };
 }
 
-async function parseGltf(primary, archive) {
+function packGltf(primary, archive) {
   let json;
   try {
     json = JSON.parse(new TextDecoder().decode(primary.bytes));
@@ -84,20 +88,11 @@ async function parseGltf(primary, archive) {
     throw new Error('ZIP 中的 glTF JSON 无法解析');
   }
   const root = directoryOf(primary.path);
-  for (const buffer of json.buffers || []) {
-    if (!buffer.uri || isEmbeddedUri(buffer.uri)) continue;
-    const resource = resolveArchiveEntry(archive, buffer.uri, root);
-    if (!resource) throw new Error(`glTF 缺少缓冲文件：${buffer.uri}`);
-    buffer.uri = bytesToDataUri(resource.bytes, 'application/octet-stream');
-  }
-  for (const image of json.images || []) {
-    if (!image.uri || isEmbeddedUri(image.uri)) continue;
-    const resource = resolveArchiveEntry(archive, image.uri, root);
-    if (!resource) throw new Error(`glTF 缺少贴图：${image.uri}`);
-    image.uri = bytesToDataUri(resource.bytes, mimeTypeFor(resource.path));
-  }
-  const gltf = await new GLTFLoader().parseAsync(JSON.stringify(json), '');
-  return { scene: gltf.scene, animations: gltf.animations || [] };
+  return packGltfAsGlb(json, (uri, kind) => {
+    const resource = resolveArchiveEntry(archive, uri, root);
+    if (!resource) throw new Error(kind === 'buffer' ? `glTF 缺少缓冲文件：${uri}` : `glTF 缺少贴图：${uri}`);
+    return { bytes: resource.bytes, mimeType: mimeTypeFor(resource.path) };
+  });
 }
 
 async function parseFbx(bytes, archive, basePath, warnings) {
@@ -336,15 +331,6 @@ function mimeTypeFor(path) {
     png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
     bmp: 'image/bmp', tga: 'image/x-tga', bin: 'application/octet-stream',
   }[fileExtension(path)] || 'application/octet-stream';
-}
-
-function bytesToDataUri(bytes, mimeType) {
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-  }
-  return `data:${mimeType};base64,${btoa(binary)}`;
 }
 
 function toArrayBuffer(bytes) { return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength); }

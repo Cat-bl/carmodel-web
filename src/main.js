@@ -1,6 +1,6 @@
 import './style.css';
 import { ModelPreview } from './preview.js';
-import { bakeSubmeshVisibility, combineAnimations, convertLegacyMaterials, decodeDracoMeshes, makeBydCar, makeVehiclePreviewGlb, normalizeComboSegments, removeAnimation } from './package.js';
+import { bakeSubmeshVisibility, combineAnimations, convertLegacyMaterials, decodeDracoMeshes, decodeMeshoptBuffers, embedGlbResources, makeBydCar, makeVehiclePreviewGlb, normalizeComboSegments, normalizeGltfExtensions, removeAnimation } from './package.js';
 import { listSubmeshes, recommendedHiddenSubmeshes } from './submeshes.js';
 import { MODEL_FILE_ACCEPT, MODEL_FORMAT_HINT, prepareModelImport } from './importer.js';
 import { PROJECT_FILE_ACCEPT, makeProjectFile, readProjectFile } from './project.js';
@@ -1158,13 +1158,20 @@ async function activatePreparedModel(prepared, {
       warnings: [...(prepared.warnings || []), '材质使用了旧的 Specular/Glossiness 工作流，已自动换算为标准 PBR，光泽表现可能与原模型略有差异'],
     };
   }
-  // Draco 压缩的网格先解压回普通 accessor：预览不必挂解码器，显隐烘焙、导出管线和车机都只认未压缩数据
+  // data URI 内嵌的缓冲/贴图先并进 BIN，后面的解压与导出都只认 bufferView
+  prepared = { ...prepared, bytes: embedGlbResources(prepared.bytes) };
+  // meshopt / Draco 压缩的网格先解压回普通 accessor：预览不必挂解码器，显隐烘焙、导出管线和车机都只认未压缩数据
+  prepared = { ...prepared, bytes: await decodeMeshoptBuffers(prepared.bytes) };
   prepared = {
     ...prepared,
     bytes: await decodeDracoMeshes(prepared.bytes, (ratio) => updateImportProgress({
       progress: previewProgressStart, label: `正在解压 Draco 网格 ${Math.round(ratio * 100)}%`, indeterminate: true,
     })),
   };
+  // 量化/稀疏数据、GPU 实例化、KTX2/WebP 等贴图、贴图平铺偏移都还原成基础 glTF，导出管线按原样读写才不会出错。
+  // 提示会随项目文件保存，重新打开时规范化还会再报一次，合并时去重
+  const normalized = await normalizeGltfExtensions(prepared.bytes);
+  prepared = { ...prepared, bytes: normalized.bytes, warnings: [...new Set([...(prepared.warnings || []), ...normalized.warnings])] };
   // 站点导出的模型自带按动画显隐子网格的规则，先烘成标准动画通道，预览/导出/项目文件才一致
   prepared = { ...prepared, bytes: bakeSubmeshVisibility(prepared.bytes) };
   const loaded = await preview.load(prepared, ({ progress, label, indeterminate }) => {

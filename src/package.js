@@ -1,6 +1,8 @@
 import JSZip from 'jszip';
-import { MeshoptSimplifier } from 'meshoptimizer';
+import { MeshoptDecoder, MeshoptSimplifier } from 'meshoptimizer';
+import { RGBAFormat, UnsignedByteType } from 'three';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import {
   SLOT_BY_ID,
   animationNamesOf,
@@ -4837,6 +4839,617 @@ function writeDecodedAccessor(state, accessor, array, target) {
   state.json.bufferViews[accessor.bufferView].target = target;
   accessor.byteOffset = 0;
   accessor.count = array.length / TYPE_COMPONENTS[accessor.type];
+}
+
+// KHR_meshopt_compression 是 EXT 版标准化后的名字，数据格式兼容，同一个解码器都能解
+const MESHOPT_EXTENSIONS = ['EXT_meshopt_compression', 'KHR_meshopt_compression'];
+
+function meshoptExtensionOf(target) {
+  return MESHOPT_EXTENSIONS.map((name) => target?.extensions?.[name]).find(Boolean);
+}
+
+/**
+ * 导入时把 meshopt 压缩（gltfpack 常见）的 bufferView 解压回普通数据，和 Draco 一样预览、导出都不必挂解码器。
+ * 压缩数据在 BIN chunk 里，解压目标是一个没有 uri 的 fallback 缓冲；这里按 bufferView 原顺序重排成单一 BIN，
+ * 视图编号不变，只被扩展引用的压缩数据随之丢弃，fallback 缓冲与扩展声明一并摘掉。没有 meshopt 的原样返回。
+ */
+export async function decodeMeshoptBuffers(bytes) {
+  const state = parseGlb(bytes);
+  const { json } = state;
+  const views = json.bufferViews || [];
+  const compressed = views.some((view) => meshoptExtensionOf(view));
+  const declared = MESHOPT_EXTENSIONS.some((name) => isExtensionDeclared(json, name));
+  if (!compressed && !declared) return bytes;
+
+  if (compressed) {
+    await MeshoptDecoder.ready;
+    const layout = [];
+    let total = 0;
+    for (const view of views) {
+      const ext = meshoptExtensionOf(view);
+      const source = ext ? { buffer: ext.buffer, offset: ext.byteOffset || 0, length: ext.byteLength } : { buffer: view.buffer, offset: view.byteOffset || 0, length: view.byteLength };
+      if (source.buffer !== 0) throw new Error(ext ? 'meshopt 压缩数据不在 GLB 内' : 'bufferView 引用了 GLB 以外的缓冲');
+      if (source.offset + source.length > state.bin.byteLength) throw new Error('bufferView 数据越界');
+      total = (total + 3) & ~3;
+      layout.push({ view, ext, source, to: total });
+      total += ext ? ext.count * ext.byteStride : view.byteLength;
+    }
+    const bin = new Uint8Array(total);
+    json.bufferViews = layout.map(({ view, ext, source, to }) => {
+      const input = state.bin.subarray(source.offset, source.offset + source.length);
+      const byteLength = ext ? ext.count * ext.byteStride : view.byteLength;
+      if (ext) {
+        MeshoptDecoder.decodeGltfBuffer(bin.subarray(to, to + byteLength), ext.count, ext.byteStride, input, ext.mode, ext.filter);
+      } else {
+        bin.set(input, to);
+      }
+      const next = { ...view, buffer: 0, byteOffset: to, byteLength };
+      if (ext) {
+        next.extensions = { ...view.extensions };
+        for (const name of MESHOPT_EXTENSIONS) deleteExtension(next, name);
+      }
+      return next;
+    });
+    json.buffers = [{ byteLength: bin.byteLength }];
+    state.bin = bin;
+  }
+
+  for (const name of MESHOPT_EXTENSIONS) dropExtensionDeclaration(json, name);
+  return buildGlb(json, state.bin);
+}
+
+function isExtensionDeclared(json, name) {
+  return ['extensionsUsed', 'extensionsRequired'].some((key) => json[key]?.includes?.(name));
+}
+
+function dropExtensionDeclaration(json, name) {
+  for (const key of ['extensionsUsed', 'extensionsRequired']) {
+    if (!Array.isArray(json[key]) || !json[key].includes(name)) continue;
+    json[key] = json[key].filter((item) => item !== name);
+    if (!json[key].length) delete json[key];
+  }
+}
+
+function deleteExtension(target, name) {
+  if (!target?.extensions || !(name in target.extensions)) return;
+  delete target.extensions[name];
+  if (!Object.keys(target.extensions).length) delete target.extensions;
+}
+
+/**
+ * GLB 里用 data URI 内嵌的缓冲和贴图并进 BIN chunk；引用外部文件的 GLB 无从读取，直接提示打包成 ZIP。
+ * 后续的解压、导出都只认 buffer 0 上的 bufferView。没有这类数据的原样返回。
+ */
+export function embedGlbResources(bytes) {
+  const state = parseGlb(bytes);
+  const embedded = embedExternalResources(state, (uri) => {
+    throw new Error(`GLB 引用了外部文件 ${resourceLabel(uri)}，请把模型和资源一起压缩为 ZIP 后导入`);
+  });
+  return embedded ? buildGlb(state.json, state.bin) : bytes;
+}
+
+/**
+ * glTF ZIP 直接打包成 GLB（不经 three 解析再导出），和 GLB 走同一套导入规范化，压缩、扩展、旧材质都只处理一处。
+ * readUri(uri, kind) 负责从压缩包里取外部文件，返回 { bytes, mimeType }；data URI 在这里自行解码。
+ */
+export function packGltfAsGlb(json, readUri) {
+  if (json?.asset?.version !== '2.0') throw new Error('只支持 glTF 2.0');
+  const state = { json, bin: new Uint8Array() };
+  embedExternalResources(state, readUri);
+  if (!state.json.buffers?.length) state.json.buffers = [{ byteLength: state.bin.byteLength }];
+  return buildGlb(state.json, state.bin);
+}
+
+/**
+ * 把所有带 uri 的缓冲和贴图并进单一 BIN：缓冲按原顺序首尾相接（4 字节对齐），bufferView 与 meshopt 扩展里的
+ * buffer/byteOffset 随之改写；贴图追加成新的 bufferView。meshopt 的 fallback 缓冲不读取，
+ * 原样保留给 decodeMeshoptBuffers 摘掉。没有需要内嵌的数据时返回 false。
+ */
+function embedExternalResources(state, readUri) {
+  const { json } = state;
+  const buffers = json.buffers || [];
+  // fallback 缓冲即使带 uri（gltfpack -cf）也不读：压缩数据完整，解压后整个缓冲都会被替换
+  const isFallback = (buffer) => Boolean(meshoptExtensionOf(buffer)?.fallback);
+  const pending = buffers.some((buffer, index) => !isFallback(buffer) && (buffer.uri !== undefined || index > 0))
+    || (json.images || []).some((image) => image.uri !== undefined);
+  if (!pending) return false;
+
+  const read = (uri, kind) => decodeDataUri(uri) || readUri(uri, kind);
+  const placement = buffers.map((buffer, index) => {
+    if (isFallback(buffer)) return { fallback: buffer };
+    if (buffer.uri !== undefined) {
+      const { bytes } = read(buffer.uri, 'buffer');
+      if (bytes.byteLength < (buffer.byteLength || 0)) throw new Error(`glTF 第 ${index + 1} 个缓冲数据不完整`);
+      return { bytes };
+    }
+    if (index === 0) return { bytes: state.bin };
+    throw new Error(`glTF 第 ${index + 1} 个缓冲缺少数据`);
+  });
+  const nextBuffers = [{ byteLength: 0 }];
+  let total = 0;
+  for (const entry of placement) {
+    if (entry.fallback) {
+      entry.buffer = nextBuffers.length;
+      nextBuffers.push(entry.fallback);
+      continue;
+    }
+    total = (total + 3) & ~3;
+    entry.buffer = 0;
+    entry.base = total;
+    total += entry.bytes.byteLength;
+  }
+  const bin = new Uint8Array(total);
+  for (const entry of placement) if (!entry.fallback) bin.set(entry.bytes, entry.base);
+  const relocate = (target) => {
+    const entry = placement[target.buffer];
+    if (!entry) throw new Error('bufferView 引用了不存在的缓冲');
+    target.buffer = entry.buffer;
+    if (!entry.fallback) target.byteOffset = entry.base + (target.byteOffset || 0);
+  };
+  for (const view of json.bufferViews || []) {
+    const ext = meshoptExtensionOf(view);
+    if (ext) relocate(ext);
+    relocate(view);
+  }
+  nextBuffers[0].byteLength = total;
+  json.buffers = nextBuffers;
+  state.bin = bin;
+  delete state[BIN_STORAGE];
+
+  for (const image of json.images || []) {
+    if (image.uri === undefined) continue;
+    const { bytes, mimeType } = read(image.uri, 'image');
+    image.bufferView = appendImageToBin(state, bytes);
+    image.mimeType = IMAGE_MIME_TYPES[sniffImageFormat(bytes)] || image.mimeType || mimeType || 'image/png';
+    delete image.uri;
+  }
+  return true;
+}
+
+function decodeDataUri(uri) {
+  const match = /^data:([^,]*?)(;base64)?,/i.exec(String(uri || ''));
+  if (!match) return null;
+  const payload = uri.slice(match[0].length);
+  const binary = match[2]
+    ? atob(payload)
+    : payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return { bytes, mimeType: match[1].split(';')[0] };
+}
+
+function resourceLabel(uri) {
+  const value = String(uri || '未知资源');
+  return value.length > 100 ? `${value.slice(0, 97)}...` : value;
+}
+
+const IMAGE_MIME_TYPES = {
+  png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp', avif: 'image/avif',
+  ktx2: 'image/ktx2', gif: 'image/gif', bmp: 'image/bmp', dds: 'image/vnd-ms.dds',
+};
+
+/** 按文件头识别贴图格式，mimeType 缺失或写错的模型也能拿到真实格式 */
+function sniffImageFormat(bytes) {
+  const ascii = (offset, length) => (bytes.byteLength >= offset + length ? readAscii(bytes, offset, length) : '');
+  if (bytes[0] === 0x89 && ascii(1, 3) === 'PNG') return 'png';
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'jpeg';
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return 'webp';
+  if (ascii(4, 4) === 'ftyp' && ascii(8, Math.min(24, bytes.byteLength - 8)).includes('avi')) return 'avif';
+  if (bytes[0] === 0xab && ascii(1, 6) === 'KTX 20') return 'ktx2';
+  if (ascii(0, 4) === 'DDS ') return 'dds';
+  if (ascii(0, 3) === 'GIF') return 'gif';
+  if (ascii(0, 2) === 'BM') return 'bmp';
+  return null;
+}
+
+const QUANTIZATION_EXTENSION = 'KHR_mesh_quantization';
+const INSTANCING_EXTENSION = 'EXT_mesh_gpu_instancing';
+const TEXTURE_TRANSFORM_EXTENSION = 'KHR_texture_transform';
+// 与 three 相同的优先级：KTX2 > WebP > AVIF > texture.source
+const TEXTURE_SOURCE_EXTENSIONS = ['KHR_texture_basisu', 'EXT_texture_webp', 'EXT_texture_avif'];
+const BASIS_TRANSCODER_PATH = './basis/';
+
+/**
+ * 导入时把只有 three 能看懂、导出管线却按基础 glTF 直接读写的写法还原掉，预览、项目文件、导出看到同一份数据：
+ * 稀疏 accessor 写实；量化的顶点属性与动画关键帧转成 float；GPU 实例化展开成普通节点；
+ * KTX2/WebP/AVIF 等贴图转成 PNG；KHR_texture_transform 烘进 UV；没写材质的网格补上默认材质。
+ * 没有需要处理的内容时原样返回。
+ */
+export async function normalizeGltfExtensions(bytes) {
+  const state = parseGlb(bytes);
+  const warnings = [];
+  const changes = [
+    densifySparseAccessors(state),
+    dequantizeAccessors(state),
+    expandMeshInstancing(state),
+    await convertTextureImages(state, warnings),
+    bakeTextureTransforms(state, warnings),
+    assignDefaultMaterial(state),
+  ];
+  if (!changes.some(Boolean)) return { bytes, warnings };
+  // 被替换掉的原始数据（量化顶点、KTX2/WebP 原图等）不再被引用，丢掉免得项目文件白白变大
+  dropUnreferencedBufferViews(state);
+  return { bytes: buildGlb(state.json, state.bin), warnings };
+}
+
+/** 没写 material 的网格补上规范默认材质（白色、metallic/roughness 为 1，与 three 预览一致）：导出时按材质烘焙底色和阴影 */
+function assignDefaultMaterial(state) {
+  const { json } = state;
+  const primitives = (json.meshes || []).flatMap((mesh) => mesh.primitives || [])
+    .filter((primitive) => !Number.isInteger(primitive.material));
+  if (!primitives.length) return false;
+  if (!Array.isArray(json.materials)) json.materials = [];
+  json.materials.push({ name: 'Default' });
+  for (const primitive of primitives) primitive.material = json.materials.length - 1;
+  return true;
+}
+
+/** 读 accessor 并转成 Float32：只有 normalized 的整型才按分母换算，量化坐标这类非归一化整数保持原值 */
+function readAccessorAsFloat(state, accessorIndex) {
+  const raw = readAccessorData(state, accessorIndex);
+  if (!raw) return null;
+  if (raw.data instanceof Float32Array) return raw.data;
+  const scale = raw.accessor.normalized ? NORMALIZED_SCALE[raw.accessor.componentType] : 0;
+  const output = new Float32Array(raw.data.length);
+  for (let i = 0; i < output.length; i++) output[i] = scale ? Math.max(raw.data[i] / scale, -1) : raw.data[i];
+  return output;
+}
+
+function readTightlyPacked(state, ref, componentType, length) {
+  const info = COMPONENT_INFO[componentType];
+  const view = state.json.bufferViews?.[ref?.bufferView];
+  if (!info || !view) throw new Error('稀疏 accessor 数据无效');
+  const base = (view.byteOffset || 0) + (ref.byteOffset || 0);
+  if (base + length * info.size > state.bin.byteLength) throw new Error('稀疏 accessor 数据越界');
+  const dataView = new DataView(state.bin.buffer, state.bin.byteOffset, state.bin.byteLength);
+  const output = new info.Array(length);
+  for (let i = 0; i < length; i++) output[i] = readComponent(dataView, base + i * info.size, componentType);
+  return output;
+}
+
+/** 导出管线读 accessor 时不看 sparse，先把稀疏补丁写进一份完整数据 */
+function densifySparseAccessors(state) {
+  let changed = false;
+  for (const [index, accessor] of (state.json.accessors || []).entries()) {
+    const { sparse } = accessor;
+    if (!sparse) continue;
+    const raw = readAccessorData(state, index);
+    if (!raw) continue;
+    const count = sparse.count || 0;
+    const targets = readTightlyPacked(state, sparse.indices, sparse.indices?.componentType, count);
+    const values = readTightlyPacked(state, sparse.values, accessor.componentType, count * raw.comps);
+    for (let i = 0; i < count; i++) {
+      const at = targets[i] * raw.comps;
+      if (at + raw.comps > raw.data.length) throw new Error('稀疏 accessor 索引越界');
+      raw.data.set(values.subarray(i * raw.comps, (i + 1) * raw.comps), at);
+    }
+    accessor.bufferView = appendImageToBin(state, new Uint8Array(raw.data.buffer));
+    accessor.byteOffset = 0;
+    delete accessor.sparse;
+    changed = true;
+  }
+  return changed;
+}
+
+// 基础 glTF 里 POSITION/NORMAL/TANGENT 只能是 float，TEXCOORD/COLOR 还可以是归一化的 ubyte/ushort，其余整型写法都来自 KHR_mesh_quantization
+function isCoreAttributeLayout(name, accessor) {
+  if (accessor.componentType === 5126) return true;
+  if (/^(TEXCOORD|COLOR)_\d+$/.test(name)) {
+    return accessor.normalized === true && (accessor.componentType === 5121 || accessor.componentType === 5123);
+  }
+  return !/^(POSITION|NORMAL|TANGENT)$/.test(name);
+}
+
+/**
+ * 量化的顶点属性（含变形目标）转成 float，摘掉 KHR_mesh_quantization；
+ * 动画关键帧也一并转成 float（gltfpack 默认把旋转压成 int16 归一化），导出管线按原始数值读关键帧。
+ */
+function dequantizeAccessors(state) {
+  const { json } = state;
+  const converted = new Set();
+  const convert = (accessorIndex, isPosition) => {
+    const accessor = json.accessors?.[accessorIndex];
+    if (!accessor || converted.has(accessorIndex)) return;
+    const data = readAccessorAsFloat(state, accessorIndex);
+    if (!data) return;
+    converted.add(accessorIndex);
+    accessor.bufferView = appendImageToBin(state, new Uint8Array(data.buffer));
+    accessor.byteOffset = 0;
+    accessor.componentType = 5126;
+    delete accessor.normalized;
+    if (isPosition) {
+      Object.assign(accessor, positionBounds(data));
+    } else {
+      delete accessor.min;
+      delete accessor.max;
+    }
+  };
+  for (const mesh of json.meshes || []) {
+    for (const primitive of mesh.primitives || []) {
+      for (const attributes of [primitive.attributes, ...(primitive.targets || [])]) {
+        for (const [name, accessorIndex] of Object.entries(attributes || {})) {
+          const accessor = json.accessors?.[accessorIndex];
+          if (accessor && !isCoreAttributeLayout(name, accessor)) convert(accessorIndex, name === 'POSITION');
+        }
+      }
+    }
+  }
+  for (const animation of json.animations || []) {
+    for (const sampler of animation.samplers || []) {
+      const accessor = json.accessors?.[sampler.output];
+      if (accessor && accessor.componentType !== 5126) convert(sampler.output, false);
+    }
+  }
+  const declared = isExtensionDeclared(json, QUANTIZATION_EXTENSION);
+  dropExtensionDeclaration(json, QUANTIZATION_EXTENSION);
+  return converted.size > 0 || declared;
+}
+
+/**
+ * EXT_mesh_gpu_instancing 展开成普通子节点：每个实例一个节点挂原网格，实例变换写在子节点上，
+ * 父节点的变换照常叠加（与扩展定义一致）。新节点追加在末尾，已有节点编号不变。
+ */
+function expandMeshInstancing(state) {
+  const { json } = state;
+  const nodes = json.nodes || [];
+  let changed = false;
+  const originalCount = nodes.length;
+  for (let index = 0; index < originalCount; index++) {
+    const node = nodes[index];
+    const ext = node.extensions?.[INSTANCING_EXTENSION];
+    if (!ext) continue;
+    deleteExtension(node, INSTANCING_EXTENSION);
+    changed = true;
+    const attributes = ext.attributes || {};
+    const read = (name) => (Number.isInteger(attributes[name]) ? readAccessorAsFloat(state, attributes[name]) : null);
+    const channels = [['translation', read('TRANSLATION'), 3], ['rotation', read('ROTATION'), 4], ['scale', read('SCALE'), 3]]
+      .filter(([, data]) => data);
+    if (!Number.isInteger(node.mesh) || !channels.length) continue;
+    const count = Math.min(...channels.map(([, data, size]) => data.length / size));
+    const children = [...(node.children || [])];
+    for (let instance = 0; instance < count; instance++) {
+      const child = { name: `${node.name || 'Instance'}_${instance + 1}`, mesh: node.mesh };
+      for (const [path, data, size] of channels) child[path] = Array.from(data.subarray(instance * size, (instance + 1) * size));
+      if (node.weights) child.weights = [...node.weights];
+      children.push(nodes.length);
+      nodes.push(child);
+    }
+    node.children = children;
+    delete node.mesh;
+    delete node.weights;
+  }
+  if (isExtensionDeclared(json, INSTANCING_EXTENSION)) {
+    dropExtensionDeclaration(json, INSTANCING_EXTENSION);
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * 贴图统一换成 PNG/JPEG：KTX2/WebP/AVIF 扩展里的图源转成 PNG 后写回 texture.source，
+ * GIF/BMP 等浏览器能解的格式也转成 PNG，mimeType 缺失或写错的按文件头改正。
+ * 优先用扩展图源（与 three 预览一致），转不了再退回原 source；都不行的保留并提示。
+ */
+async function convertTextureImages(state, warnings) {
+  const { json } = state;
+  let changed = false;
+  let ktx2Loader = null;
+  const usable = new Map();
+  const ensureUsable = async (imageIndex) => {
+    if (usable.has(imageIndex)) return usable.get(imageIndex);
+    const image = json.images?.[imageIndex];
+    const raw = imageBytesOf(state, imageIndex);
+    let ok = false;
+    if (image && raw) {
+      const format = sniffImageFormat(raw.bytes);
+      if (format === 'png' || format === 'jpeg') {
+        if (image.mimeType !== IMAGE_MIME_TYPES[format]) {
+          image.mimeType = IMAGE_MIME_TYPES[format];
+          changed = true;
+        }
+        ok = true;
+      } else {
+        try {
+          let png;
+          if (format === 'ktx2') {
+            ktx2Loader ||= createKtx2Loader();
+            png = await transcodeKtx2ToPng(ktx2Loader, raw.bytes);
+          } else {
+            png = await transcodeToPng(raw.bytes, IMAGE_MIME_TYPES[format] || image.mimeType || '');
+          }
+          image.bufferView = appendImageToBin(state, png);
+          image.mimeType = 'image/png';
+          changed = true;
+          ok = true;
+        } catch (error) {
+          console.warn('贴图转换失败', error);
+          warnings.push(`贴图「${image.name || `#${imageIndex + 1}`}」是 ${format ? format.toUpperCase() : '无法识别的'} 格式，转换失败，预览和导出时会缺失`);
+        }
+      }
+    }
+    usable.set(imageIndex, ok);
+    return ok;
+  };
+  try {
+    for (const texture of json.textures || []) {
+      const candidates = [...TEXTURE_SOURCE_EXTENSIONS.map((name) => texture.extensions?.[name]?.source), texture.source]
+        .filter(Number.isInteger);
+      let chosen;
+      for (const candidate of candidates) {
+        if (await ensureUsable(candidate)) {
+          chosen = candidate;
+          break;
+        }
+      }
+      chosen ??= Number.isInteger(texture.source) ? texture.source : candidates[0];
+      if (chosen !== undefined && texture.source !== chosen) {
+        texture.source = chosen;
+        changed = true;
+      }
+      for (const name of TEXTURE_SOURCE_EXTENSIONS) {
+        if (!texture.extensions?.[name]) continue;
+        deleteExtension(texture, name);
+        changed = true;
+      }
+    }
+  } finally {
+    ktx2Loader?.dispose();
+  }
+  for (const name of TEXTURE_SOURCE_EXTENSIONS) {
+    if (!isExtensionDeclared(json, name)) continue;
+    dropExtensionDeclaration(json, name);
+    changed = true;
+  }
+  return changed;
+}
+
+function createKtx2Loader() {
+  const loader = new KTX2Loader().setTranscoderPath(BASIS_TRANSCODER_PATH);
+  // 不挂渲染器：把所有 GPU 压缩格式都标成不支持，转码器就会输出 8 位 RGBA，正好编码成 PNG
+  loader.workerConfig = {
+    astcSupported: false, astcHDRSupported: false, etc1Supported: false, etc2Supported: false,
+    dxtSupported: false, bptcSupported: false, pvrtcSupported: false,
+  };
+  return loader;
+}
+
+async function transcodeKtx2ToPng(loader, bytes) {
+  const texture = await new Promise((resolve, reject) => loader.parse(bytes.slice().buffer, resolve, reject));
+  try {
+    const level = texture.mipmaps?.[0] || texture.image;
+    if (texture.format !== RGBAFormat || texture.type !== UnsignedByteType || !level?.data) {
+      throw new Error('KTX2 贴图不是 8 位 RGBA');
+    }
+    const { width, height, data } = level;
+    const canvas = makeCanvas(width, height);
+    const pixels = new ImageData(new Uint8ClampedArray(data.buffer, data.byteOffset, width * height * 4), width, height);
+    canvas.getContext('2d').putImageData(pixels, 0, 0);
+    return await encodeCanvasPng(canvas);
+  } finally {
+    texture.dispose();
+  }
+}
+
+function collectTextureInfos(value, output = []) {
+  for (const [key, child] of Object.entries(value || {})) {
+    if (!child || typeof child !== 'object') continue;
+    if (/Texture$/.test(key) && Number.isInteger(child.index)) output.push(child);
+    else collectTextureInfos(child, output);
+  }
+  return output;
+}
+
+function textureTransformOf(ext) {
+  const offset = ext?.offset || [];
+  const scale = ext?.scale || [];
+  return {
+    offset: [Number(offset[0] ?? 0), Number(offset[1] ?? 0)],
+    rotation: Number(ext?.rotation ?? 0),
+    scale: [Number(scale[0] ?? 1), Number(scale[1] ?? 1)],
+  };
+}
+
+function textureTransformKey(transform) {
+  return JSON.stringify([...transform.offset, transform.rotation, ...transform.scale]);
+}
+
+/** 按 three 的 Texture#updateMatrix（center 为 0）计算：uv' = S·R·uv + offset，烘焙后的预览与原来一致 */
+function applyTextureTransform(uv, { offset, rotation, scale }) {
+  const c = Math.cos(rotation);
+  const s = Math.sin(rotation);
+  const output = new Float32Array(uv.length);
+  for (let i = 0; i < uv.length; i += 2) {
+    const u = uv[i];
+    const v = uv[i + 1];
+    output[i] = scale[0] * (c * u + s * v) + offset[0];
+    output[i + 1] = scale[1] * (-s * u + c * v) + offset[1];
+  }
+  return output;
+}
+
+/** 旋转相同时 transform 相对 base 的变换只剩缩放和偏移：S·Sb⁻¹·(uv' - ob) + o */
+function relativeTextureTransform(transform, base) {
+  const scale = [transform.scale[0] / base.scale[0], transform.scale[1] / base.scale[1]];
+  return {
+    offset: [transform.offset[0] - scale[0] * base.offset[0], transform.offset[1] - scale[1] * base.offset[1]],
+    rotation: 0,
+    scale,
+  };
+}
+
+/**
+ * KHR_texture_transform 烘进 UV：导出时底色会和金属度/AO/自发光逐像素合成成新纹理，扩展随之丢失。
+ * 每套 UV 以底色贴图（没有就取第一张）的变换为准烘进顶点，其余贴图改写成相对它的变换，预览保持不变；
+ * 旋转不同的无法这样表达，保留原扩展。导出时参与合成的贴图仍有相对变换、或无法烘焙时提示可能错位。
+ * 同一份 UV 被不同变换的材质共用时各自生成新的 accessor。
+ */
+function bakeTextureTransforms(state, warnings) {
+  const { json } = state;
+  const identity = textureTransformKey(textureTransformOf(null));
+  const baked = new Map();
+  let changed = false;
+  for (const [materialIndex, material] of (json.materials || []).entries()) {
+    const infos = collectTextureInfos(material);
+    if (!infos.some((info) => info.extensions?.[TEXTURE_TRANSFORM_EXTENSION])) continue;
+    const groups = new Map();
+    for (const info of infos) {
+      const ext = info.extensions?.[TEXTURE_TRANSFORM_EXTENSION];
+      const uvSet = ext?.texCoord ?? info.texCoord ?? 0;
+      if (!groups.has(uvSet)) groups.set(uvSet, []);
+      groups.get(uvSet).push({ info, transform: textureTransformOf(ext) });
+    }
+    const baseColor = material.pbrMetallicRoughness?.baseColorTexture;
+    const mergedOnExport = new Set([
+      material.pbrMetallicRoughness?.metallicRoughnessTexture, material.occlusionTexture, material.emissiveTexture,
+    ]);
+    let misaligned = false;
+    for (const [uvSet, members] of groups) {
+      const base = members.find(({ info }) => info === baseColor) || members[0];
+      const baseKey = textureTransformKey(base.transform);
+      if (baseKey === identity) {
+        misaligned ||= members.some(({ info, transform }) => mergedOnExport.has(info) && textureTransformKey(transform) !== identity);
+        continue;
+      }
+      if (base.transform.scale.includes(0) || members.some(({ transform }) => transform.rotation !== base.transform.rotation)) {
+        misaligned = true;
+        continue;
+      }
+      for (const mesh of json.meshes || []) {
+        for (const primitive of mesh.primitives || []) {
+          const name = `TEXCOORD_${uvSet}`;
+          const source = primitive.attributes?.[name];
+          if (primitive.material !== materialIndex || !Number.isInteger(source)) continue;
+          const cacheKey = `${source}|${baseKey}`;
+          if (!baked.has(cacheKey)) {
+            const uv = readAccessorAsFloat(state, source);
+            if (!uv) continue;
+            baked.set(cacheKey, writeAccessor(state, applyTextureTransform(uv, base.transform), 5126, 'VEC2'));
+          }
+          primitive.attributes[name] = baked.get(cacheKey);
+        }
+      }
+      for (const { info, transform } of members) {
+        const relative = relativeTextureTransform(transform, base.transform);
+        deleteExtension(info, TEXTURE_TRANSFORM_EXTENSION);
+        if (uvSet) info.texCoord = uvSet;
+        else delete info.texCoord;
+        if (textureTransformKey(relative) === identity) continue;
+        info.extensions = { ...info.extensions, [TEXTURE_TRANSFORM_EXTENSION]: { offset: relative.offset, scale: relative.scale } };
+        misaligned ||= mergedOnExport.has(info);
+      }
+      changed = true;
+    }
+    if (misaligned) {
+      warnings.push(`材质「${material.name || `#${materialIndex + 1}`}」的几张贴图平铺/偏移不一致，导出后部分贴图可能错位`);
+    }
+  }
+  const remaining = (json.materials || []).some((material) => collectTextureInfos(material)
+    .some((info) => info.extensions?.[TEXTURE_TRANSFORM_EXTENSION]));
+  if (!remaining && isExtensionDeclared(json, TEXTURE_TRANSFORM_EXTENSION)) {
+    dropExtensionDeclaration(json, TEXTURE_TRANSFORM_EXTENSION);
+    changed = true;
+  }
+  return changed;
 }
 
 function parseGlb(bytes) {
