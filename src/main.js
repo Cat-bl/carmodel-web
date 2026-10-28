@@ -2720,12 +2720,13 @@ function mirrorBindingInto(slot) {
 
 /**
  * 选部件绑定的镜像：把对侧每块部件的包围盒沿 z=0 翻过来，
- * 在未占用的部件里找中心最近、尺寸相当的那块（Door_FL ↔ Door_FR 这类对称结构一找一个准）。
+ * 在部件里找中心最近、尺寸相当的那块（Door_FL ↔ Door_FR 这类对称结构一找一个准）。
+ * 优先挑未被其他槽位绑定的部件；对侧实在没有空闲的对称件时才复用已绑定的部件。
  */
 function mirrorNodeBindingInto(slot, source) {
   const claimed = claimedByOthers(slot);
   const sourceSet = new Set(source.nodeIndices || []);
-  const candidates = parts.filter((part) => !claimed.has(part.nodeIndex) && !sourceSet.has(part.nodeIndex));
+  const candidates = parts.filter((part) => !sourceSet.has(part.nodeIndex));
   const matched = new Set();
   for (const index of source.nodeIndices || []) {
     const part = parts.find((item) => item.nodeIndex === index);
@@ -2746,7 +2747,9 @@ function mirrorNodeBindingInto(slot, source) {
       const distance = Math.hypot(...center.map((v, i) => v - cCenter[i]));
       const sizeDiff = Math.hypot(...size.map((v, i) => v - cSize[i]));
       if (distance > diag * 0.5 || sizeDiff > diag * 0.35) continue;
-      const score = distance + sizeDiff;
+      // 未占用的部件排前面：同等匹配度下优先复用空闲部件，找不到才轮到已绑定的
+      const occupiedPenalty = claimed.has(candidate.nodeIndex) ? diag : 0;
+      const score = distance + sizeDiff + occupiedPenalty;
       if (score < bestScore) {
         bestScore = score;
         best = candidate;
@@ -2823,13 +2826,16 @@ function stopDemo() {
   ui['binding-summary'].textContent = count ? `已配置 ${count} 项` : '未配置';
 }
 
-/** 被其他槽位（非框选）占用的叶子 → 槽位名，占用的部位不能重复绑定 */
+/** 被其他槽位（非框选）占用的叶子 → 槽位名。部件允许重复绑定，这里只用于展示归属提示。 */
 function claimedByOthers(slot) {
   const claimed = new Map();
   for (const [id, other] of bindings) {
     if (id === slot.id || other.region) continue;
     const label = activeSlot(id)?.label || id;
-    for (const nodeIndex of other.nodeIndices || []) claimed.set(nodeIndex, label);
+    for (const nodeIndex of other.nodeIndices || []) {
+      if (!claimed.has(nodeIndex)) claimed.set(nodeIndex, label);
+      else claimed.set(nodeIndex, `${claimed.get(nodeIndex)}、${label}`);
+    }
   }
   return claimed;
 }
@@ -2906,16 +2912,16 @@ function partTreeHtml(slot, binding) {
       ? group.leaves
       : group.leaves.filter((leaf) => leaf.name.toLowerCase().includes(query));
     if (leaves.length === 0) continue;
-    const free = group.leaves.filter((leaf) => !claimed.has(leaf.nodeIndex));
-    const pickedCount = free.filter((leaf) => selected.has(leaf.nodeIndex)).length;
-    const allPicked = free.length > 0 && pickedCount === free.length;
+    // 部件可以重复绑定（同一块尾灯既能跟刹车灯亮，也能跟着尾门开合），占用只做提示不禁用
+    const pickedCount = group.leaves.filter((leaf) => selected.has(leaf.nodeIndex)).length;
+    const allPicked = pickedCount === group.leaves.length;
     const somePicked = pickedCount > 0 && !allPicked;
     const expanded = expandedGroups.has(group.key) || (query && !groupHit);
     const single = group.leaves.length === 1;
     rows.push(`
       <div class="pt-group">
-        <div class="pt-row${allPicked || (single && pickedCount) ? ' picked' : ''}" data-group-row="${group.key}"${single ? ` data-node-index="${group.leaves[0].nodeIndex}"` : ''} data-hover="${group.leaves.map((l) => l.nodeIndex).join(',')}">
-          <input type="checkbox" data-group="${group.key}"${allPicked ? ' checked' : ''}${somePicked ? ' data-mixed="1"' : ''}${free.length === 0 ? ' disabled' : ''} aria-label="选择 ${escapeHtml(group.name)}" />
+        <div class="pt-row${allPicked ? ' picked' : ''}" data-group-row="${group.key}"${single ? ` data-node-index="${group.leaves[0].nodeIndex}"` : ''} data-hover="${group.leaves.map((l) => l.nodeIndex).join(',')}">
+          <input type="checkbox" data-group="${group.key}"${allPicked ? ' checked' : ''}${somePicked ? ' data-mixed="1"' : ''} aria-label="选择 ${escapeHtml(group.name)}" />
           ${single ? '<span class="pt-toggle"></span>'
             : `<button type="button" class="pt-toggle" data-toggle="${group.key}" aria-label="展开">${expanded ? '▾' : '▸'}</button>`}
           <span class="pt-name">${escapeHtml(group.name)}</span>
@@ -2926,10 +2932,10 @@ function partTreeHtml(slot, binding) {
           const usedBy = claimed.get(leaf.nodeIndex);
           return `
           <div class="pt-row leaf${selected.has(leaf.nodeIndex) ? ' picked' : ''}" data-node-index="${leaf.nodeIndex}" data-hover="${leaf.nodeIndex}">
-            <input type="checkbox" data-leaf="${leaf.nodeIndex}"${selected.has(leaf.nodeIndex) ? ' checked' : ''}${usedBy ? ' disabled' : ''} aria-label="选择 ${escapeHtml(leaf.name)}" />
+            <input type="checkbox" data-leaf="${leaf.nodeIndex}"${selected.has(leaf.nodeIndex) ? ' checked' : ''} aria-label="选择 ${escapeHtml(leaf.name)}" />
             <span class="pt-name">${escapeHtml(leaf.name)}</span>
             ${leaf.place ? `<span class="pt-tag">${leaf.place}</span>` : ''}
-            <span class="pt-meta">${usedBy ? `已用于${usedBy}` : `${leaf.triangles.toLocaleString()} 面`}</span>
+            <span class="pt-meta">${usedBy ? `已用于${usedBy}（可复用）` : `${leaf.triangles.toLocaleString()} 面`}</span>
           </div>`;
         }).join('')}</div>` : ''}
       </div>`);
@@ -2997,10 +3003,8 @@ function wirePartTree(slot) {
     input.addEventListener('change', () => {
       const group = partGroups.find((item) => item.key === input.dataset.group);
       if (!group) return;
-      const claimed = claimedByOthers(slot);
-      const free = group.leaves.filter((leaf) => !claimed.has(leaf.nodeIndex));
       const next = new Set(selected);
-      for (const leaf of free) {
+      for (const leaf of group.leaves) {
         if (input.checked) next.add(leaf.nodeIndex);
         else next.delete(leaf.nodeIndex);
       }
@@ -3044,26 +3048,14 @@ function togglePickMode(slot) {
 function onPickNode(slot, nodeIndex) {
   const binding = bindings.get(slot.id);
   if (binding?.region) return;
-  const claimed = claimedByOthers(slot);
+  // 部件允许重复绑定：即使整组已被其他槽位绑定（比如尾灯已绑刹车灯），
+  // 也可以整组选进来（尾门开合时尾灯部件跟着门一起动）
   const group = partGroups.find((item) => item.leaves.some((leaf) => leaf.nodeIndex === nodeIndex));
   const all = group ? group.leaves : parts.filter((part) => part.nodeIndex === nodeIndex);
-  const leaves = all.filter((leaf) => !claimed.has(leaf.nodeIndex));
-  if (leaves.length === 0) {
-    // 整组都被别的槽位占走（比如整盏灯已绑刹车）：自动转框选，从对方几何上切一块出来
-    if (all.length === 0) return;
-    const owner = claimed.get(nodeIndex) || claimed.get(all[0].nodeIndex) || '其他联动';
-    const region = constrainRegionToSlotSide(slot, padBounds(mergeBounds(all.map((leaf) => leaf.bounds))));
-    if (!region) return;
-    createRegionBinding(slot, region);
-    const sideText = modelType === 'vehicle' && LATERAL_SLOT_SIDE[slot.id]
-      ? `并限制在车身${LATERAL_SLOT_SIDE[slot.id] === 'left' ? '左' : '右'}半边`
-      : '';
-    showMessage(`「${group?.name || all[0].name}」已整体绑给「${owner}」。已自动切换为框选${sideText}，请确认蓝框只套住本槽位区域。`, 'warning');
-    return;
-  }
+  if (all.length === 0) return;
   const selected = new Set(binding && !binding.region ? binding.nodeIndices : []);
-  const allIn = leaves.every((leaf) => selected.has(leaf.nodeIndex));
-  for (const leaf of leaves) {
+  const allIn = all.every((leaf) => selected.has(leaf.nodeIndex));
+  for (const leaf of all) {
     if (allIn) selected.delete(leaf.nodeIndex);
     else selected.add(leaf.nodeIndex);
   }
@@ -3322,7 +3314,7 @@ function bindingEditor(slot) {
     if (!binding) {
       rows.push(`<p class="hint" style="margin:8px 0 0">${modelType === 'other'
         ? '可以勾选任意数量的模型部件，也可以点“在模型上点选”后直接点击 3D 模型。一个事件可以同时驱动多个部位。'
-        : '车门这类多块的部件直接勾整组（内饰会跟着动）；也可以点“在模型上点选”后直接点击 3D 模型。点到已被其他联动占用的部件（比如同一盏灯）会自动转为框选，从它上面切一块出来。'}</p>`);
+        : '车门这类多块的部件直接勾整组（内饰会跟着动）；也可以点“在模型上点选”后直接点击 3D 模型。同一块部件可以绑给多个槽位（比如尾灯既跟刹车灯亮，又跟着尾门开合），列表里会标注“已用于×××（可复用）”。'}</p>`);
       return `<div class="binding-editor">${rows.join('')}</div>`;
     }
   }
